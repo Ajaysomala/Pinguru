@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 10080
     BASE_URL: str = "http://localhost:8000"
+    FRONTEND_URL: str = ""
+    STRIPE_PRICE_FREE: str = "price_FREE"
+    STRIPE_PRICE_STARTER_199: str = "price_STARTER_199"
+    STRIPE_PRICE_PRO_399: str = "price_PRO_399"
+    ENCRYPTION_KEY: str
+    ADMIN_EMAIL: str = ""
+    ADMIN_PASSWORD_HASH: str = ""
     ENVIRONMENT: str = "development"
 
 

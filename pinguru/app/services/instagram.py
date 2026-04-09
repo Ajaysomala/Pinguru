@@ -1,4 +1,5 @@
 import httpx
+from cryptography.fernet import Fernet, InvalidToken
 from app.config import settings
 import logging
 
@@ -9,8 +10,29 @@ BASE = f"https://graph.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSION}"
 class InstagramService:
 
     @staticmethod
+    def _fernet() -> Fernet:
+        return Fernet(settings.ENCRYPTION_KEY.encode("utf-8"))
+
+    @staticmethod
+    def encrypt_access_token(access_token: str) -> str:
+        if not access_token:
+            return ""
+        return InstagramService._fernet().encrypt(access_token.encode("utf-8")).decode("utf-8")
+
+    @staticmethod
+    def decrypt_access_token(encrypted_access_token: str) -> str:
+        if not encrypted_access_token:
+            return ""
+        try:
+            return InstagramService._fernet().decrypt(encrypted_access_token.encode("utf-8")).decode("utf-8")
+        except InvalidToken:
+            # Backward compatibility: allow pre-hardening plain-text tokens.
+            return encrypted_access_token
+
+    @staticmethod
     async def send_dm(access_token: str, recipient_ig_id: str, message: str) -> dict:
         """Send a DM to an Instagram user via Graph API."""
+        access_token = InstagramService.decrypt_access_token(access_token)
         url = f"{BASE}/me/messages"
         payload = {
             "recipient": {"id": recipient_ig_id},
@@ -21,7 +43,7 @@ class InstagramService:
             resp = await client.post(url, json=payload)
             data = resp.json()
             if resp.status_code != 200:
-                logger.error(f"DM failed: {data}")
+                logger.error("DM failed with non-200 response from Instagram API")
                 return {"success": False, "error": data}
             return {"success": True, "data": data}
 

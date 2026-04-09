@@ -74,6 +74,7 @@ After deploying to DO, you get a URL like:
 `https://pinguru-backend-xxxxx.ondigitalocean.app`
 
 Go to Meta Developer → Your App → Instagram → Webhooks:
+
 - Callback URL: `https://your-do-url/webhook/instagram`
 - Verify Token: whatever you set in `META_WEBHOOK_VERIFY_TOKEN`
 - Subscribe to: `messages`, `comments`
@@ -82,29 +83,30 @@ Go to Meta Developer → Your App → Instagram → Webhooks:
 
 ## 💰 Plans
 
-| Plan    | Price | DMs/month | Rules |
-|---------|-------|-----------|-------|
-| Free    | $0    | 50        | 1     |
-| Starter | $9    | 500       | 5     |
-| Pro     | $29   | 5,000     | 20    |
-| Agency  | $79   | Unlimited | 100   |
+| Plan    | Price | DMs/month | Rules     |
+| ------- | ----- | --------- | --------- |
+| Free    | ₹0    | 200       | 1         |
+| Starter | ₹199  | 3,000     | 5         |
+| Pro     | ₹399  | 15,000    | Unlimited |
+
+Starter and Pro use flat-rate billing. Pro includes unlimited automation rules.
 
 ---
 
 ## 📡 Key API Endpoints
 
-| Method | Route | Description |
-|--------|-------|-------------|
-| GET | /health | Health check |
-| POST | /auth/register | Create account |
-| POST | /auth/login | Login |
-| GET | /auth/instagram/callback | Instagram OAuth |
-| POST | /automation/rules | Create DM rule |
-| GET | /automation/rules | List rules |
-| PATCH | /automation/rules/{id}/toggle | Enable/disable |
-| GET | /dashboard/stats | DM stats |
-| GET | /dashboard/dm-logs | DM history |
-| GET | /plans | Available plans |
-| POST | /plans/checkout/{plan} | Stripe checkout |
-| GET | /webhook/instagram | Meta verification |
-| POST | /webhook/instagram | Meta events |
+| Method | Route                         | Description       |
+| ------ | ----------------------------- | ----------------- |
+| GET    | /health                       | Health check      |
+| POST   | /auth/register                | Create account    |
+| POST   | /auth/login                   | Login             |
+| GET    | /auth/instagram/callback      | Instagram OAuth   |
+| POST   | /automation/rules             | Create DM rule    |
+| GET    | /automation/rules             | List rules        |
+| PATCH  | /automation/rules/{id}/toggle | Enable/disable    |
+| GET    | /dashboard/stats              | DM stats          |
+| GET    | /dashboard/dm-logs            | DM history        |
+| GET    | /plans                        | Available plans   |
+| POST   | /plans/checkout/{plan}        | Stripe checkout   |
+| GET    | /webhook/instagram            | Meta verification |
+| POST   | /webhook/instagram            | Meta events       |

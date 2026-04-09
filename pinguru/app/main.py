@@ -1,8 +1,13 @@
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+from app.config import settings
 from app.database import connect_db, disconnect_db
-from app.routes import webhook, auth, automation, dashboard, plans
+from app.routes import webhook, auth, automation, dashboard, plans, admin
+from app.security import limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -23,19 +28,45 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request, exc):
+    return JSONResponse(status_code=429, content={"detail": "Too many requests, slow down"})
+
+
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Content-Security-Policy"] = "default-src 'self'"
+    return response
+
+environment = settings.ENVIRONMENT.lower()
+allowed_origins = (
+    [settings.FRONTEND_URL] if environment == "production" and settings.FRONTEND_URL else ["http://localhost:3000", "http://127.0.0.1:3000"]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in production
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(SlowAPIMiddleware)
 
 app.include_router(webhook.router,    prefix="/webhook",    tags=["Webhook"])
 app.include_router(auth.router,       prefix="/auth",       tags=["Auth"])
 app.include_router(automation.router, prefix="/automation", tags=["Automation"])
 app.include_router(dashboard.router,  prefix="/dashboard",  tags=["Dashboard"])
 app.include_router(plans.router,      prefix="/plans",      tags=["Plans"])
+app.include_router(admin.router,      prefix="/admin",      tags=["Admin"])
 
 @app.get("/")
 async def root():

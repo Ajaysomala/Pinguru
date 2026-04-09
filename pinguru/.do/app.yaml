@@ -10,7 +10,7 @@ services:
     run_command: uvicorn app.main:app --host 0.0.0.0 --port 8080
     http_port: 8080
     instance_count: 1
-    instance_size_slug: basic-xxs   # cheapest — free with DO credits
+    instance_size_slug: basic-xxs # cheapest — free with DO credits
     envs:
       - key: MONGODB_URI
         value: YOUR_MONGODB_ATLAS_URI
@@ -21,11 +21,33 @@ services:
         value: YOUR_META_APP_SECRET
         type: SECRET
       - key: META_WEBHOOK_VERIFY_TOKEN
-        value: pinguru_webhook_2024   # change this to anything secret
+        value: pinguru_webhook_2024 # change this to anything secret
       - key: JWT_SECRET
         value: YOUR_RANDOM_JWT_SECRET
         type: SECRET
+      - key: ENCRYPTION_KEY
+        value: YOUR_FERNET_ENCRYPTION_KEY
+        type: SECRET
+      - key: ADMIN_EMAIL
+        value: admin@example.com
+      - key: ADMIN_PASSWORD_HASH
+        value: YOUR_BCRYPT_HASH
+        type: SECRET
+      - key: STRIPE_SECRET_KEY
+        value: YOUR_STRIPE_SECRET_KEY
+        type: SECRET
+      - key: STRIPE_WEBHOOK_SECRET
+        value: YOUR_STRIPE_WEBHOOK_SECRET
+        type: SECRET
+      - key: STRIPE_PRICE_FREE
+        value: price_FREE
+      - key: STRIPE_PRICE_STARTER_199
+        value: price_STARTER_199
+      - key: STRIPE_PRICE_PRO_399
+        value: price_PRO_399
       - key: BASE_URL
         value: https://pinguru-backend-XXXX.ondigitalocean.app
+      - key: FRONTEND_URL
+        value: https://your-frontend-domain.com
       - key: ENVIRONMENT
         value: production

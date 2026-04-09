@@ -1,13 +1,88 @@
-from fastapi import APIRouter, Request, Query, HTTPException
+import hashlib
+import hmac
+import logging
+import re
+
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, HTTPException, Query, Request
 from app.config import settings
 from app.database import get_db
+from app.models.models import DMLog, PlanType, TriggerType, get_plan_limits, get_plan_type
 from app.services.instagram import InstagramService
-from app.models.models import DMLog, TriggerType
-from datetime import datetime
-import logging
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _normalize_text(value: str) -> str:
+    value = value.lower()
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def hinglish_keyword_match(message: str, keywords: list[str]) -> bool:
+    # PinGuru Pro — Smart Hinglish Trigger (unique feature)
+    message_clean = _normalize_text(message)
+    if not message_clean or not keywords:
+        return False
+
+    variants_by_root = {
+        "link": [
+            "link do",
+            "bhai link",
+            "link bhejo",
+            "link chahiye",
+            "send link",
+            "link please",
+            "link dena",
+            "link de",
+            "lnk",
+        ],
+        "price": [
+            "price btao",
+            "kitna hai",
+            "rate kya hai",
+            "cost kya hai",
+            "kitne ka",
+        ],
+        "join": [
+            "join karna",
+            "join kaise",
+            "kaise join",
+            "join krna",
+            "join chahiye",
+        ],
+    }
+
+    phrase_candidates: set[str] = set()
+    root_candidates: set[str] = set()
+
+    for keyword in keywords:
+        normalized_keyword = _normalize_text(keyword)
+        if not normalized_keyword:
+            continue
+
+        phrase_candidates.add(normalized_keyword)
+        for token in normalized_keyword.split():
+            if len(token) >= 3:
+                root_candidates.add(token)
+
+        for root, variants in variants_by_root.items():
+            if root in normalized_keyword or normalized_keyword in root:
+                root_candidates.add(root)
+                phrase_candidates.update(_normalize_text(v) for v in variants)
+
+    for phrase in phrase_candidates:
+        if phrase and phrase in message_clean:
+            return True
+
+    message_tokens = message_clean.split()
+    for root in root_candidates:
+        if any(token.startswith(root) or root.startswith(token) for token in message_tokens):
+            return True
+
+    return False
 
 # ── Meta Webhook Verification (GET) ──────────────────────────────────────────
 
@@ -26,12 +101,29 @@ async def verify_webhook(
 
 @router.post("/instagram")
 async def handle_webhook(request: Request):
+    signature = request.headers.get("X-Hub-Signature-256")
+    raw_body = await request.body()
+
+    if not signature or not signature.startswith("sha256="):
+        raise HTTPException(status_code=403, detail="Missing signature")
+
+    expected_signature = hmac.new(
+        settings.META_APP_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    provided_signature = signature.removeprefix("sha256=")
+    if not hmac.compare_digest(expected_signature, provided_signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
     body = await request.json()
-    logger.info(f"Webhook received: {body}")
+    entries = body.get("entry", [])
+    logger.info(f"Webhook received: {len(raw_body)} bytes, {len(entries)} entries")
 
     db = get_db()
 
-    for entry in body.get("entry", []):
+    for entry in entries:
         ig_id = entry.get("id")  # Instagram Business Account ID
 
         # --- Direct Messages ---
@@ -59,9 +151,12 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
     if not user:
         return
 
+    user_plan = get_plan_type(user.get("plan", PlanType.Free))
+
     # Check DM limit
-    if user.get("dm_count_this_month", 0) >= user.get("dm_limit", 50):
-        logger.warning(f"DM limit reached for user {user['_id']}")
+    plan_limits = get_plan_limits(user_plan)
+    if user.get("dm_count_this_month", 0) >= plan_limits["dm_limit"]:
+        logger.warning("DM limit reached")
         return
 
     # Find matching keyword automation rule
@@ -73,7 +168,16 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
 
     for rule in rules:
         keywords = [k.lower() for k in rule.get("keywords", [])]
-        if any(kw in message_text for kw in keywords):
+        match_mode = str(rule.get("match_mode", "exact")).lower()
+        use_hinglish = match_mode == "hinglish" and user_plan == PlanType.Pro
+
+        if use_hinglish:
+            is_match = hinglish_keyword_match(message_text, keywords)
+        else:
+            # Free/Starter silently fall back to exact matching.
+            is_match = any(kw in message_text for kw in keywords)
+
+        if is_match:
             # Replace template variables
             reply = rule["reply_message"].replace("{{username}}", sender_id)
 
@@ -91,7 +195,7 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
                 "message_sent": reply,
                 "trigger_type": TriggerType.KEYWORD,
                 "status": "sent" if result["success"] else "failed",
-                "sent_at": datetime.utcnow(),
+                "sent_at": datetime.now(timezone.utc),
             }
             await db.dm_logs.insert_one(log)
 

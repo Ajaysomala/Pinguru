@@ -1,7 +1,12 @@
-from fastapi import APIRouter, Header, HTTPException, Request, Depends
+import json
+from datetime import datetime, timezone
+
+from bson import ObjectId
+from bson.errors import InvalidId
+from fastapi import APIRouter, Depends, HTTPException, Request
 from app.database import get_db
 from app.routes.auth import get_current_user
-from app.models.models import PLAN_LIMITS, PlanType
+from app.models.models import PLAN_LIMITS, PlanType, get_plan_limits, get_plan_type
 from app.config import settings
 import stripe
 import logging
@@ -12,10 +17,9 @@ logger = logging.getLogger(__name__)
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
 STRIPE_PRICE_IDS = {
-    # Replace with your actual Stripe price IDs after creating products
-    PlanType.STARTER: "price_STARTER_ID_HERE",
-    PlanType.PRO:     "price_PRO_ID_HERE",
-    PlanType.AGENCY:  "price_AGENCY_ID_HERE",
+    PlanType.Free: settings.STRIPE_PRICE_FREE,
+    PlanType.Starter: settings.STRIPE_PRICE_STARTER_199,
+    PlanType.Pro: settings.STRIPE_PRICE_PRO_399,
 }
 
 # ── Get All Plans ─────────────────────────────────────────────────────────────
@@ -25,10 +29,10 @@ async def get_plans():
     return {
         "plans": [
             {
-                "name": plan.value,
-                "price_usd": limits["price"],
+                "name": plan.name,
+                "price_inr": limits["price_inr"],
                 "dm_limit": limits["dm_limit"],
-                "rule_limit": limits["rules"],
+                "rule_limit": "Unlimited" if limits["rules"] is None else limits["rules"],
             }
             for plan, limits in PLAN_LIMITS.items()
         ]
@@ -39,14 +43,10 @@ async def get_plans():
 @router.post("/checkout/{plan}")
 async def create_checkout(
     plan: PlanType,
-    authorization: str = Header(...),
-    db=Depends(get_db)
+    user=Depends(get_current_user),
 ):
-    if plan == PlanType.FREE:
+    if plan == PlanType.Free:
         raise HTTPException(status_code=400, detail="Cannot checkout free plan")
-
-    token = authorization.replace("Bearer ", "")
-    user = await get_current_user(token, db)
 
     price_id = STRIPE_PRICE_IDS.get(plan)
     if not price_id:
@@ -71,35 +71,57 @@ async def stripe_webhook(request: Request, db=Depends(get_db)):
     sig = request.headers.get("stripe-signature")
 
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig, settings.STRIPE_WEBHOOK_SECRET
+        stripe.WebhookSignature.verify_header(
+            payload.decode("utf-8"), sig, settings.STRIPE_WEBHOOK_SECRET
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+
+    event = json.loads(payload)
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
+        session_id = session.get("id")
+
+        if session_id:
+            already_processed = await db.stripe_webhook_events.find_one({"session_id": session_id})
+            if already_processed:
+                return {"status": "ok"}
+
         user_id = session["metadata"]["user_id"]
         plan = session["metadata"]["plan"]
-        plan_enum = PlanType(plan)
+        plan_enum = get_plan_type(plan)
+
+        try:
+            user_object_id = ObjectId(user_id)
+        except InvalidId:
+            raise HTTPException(status_code=400, detail="Invalid user ID in Stripe metadata")
 
         await db.users.update_one(
-            {"_id": user_id},
+            {"_id": user_object_id},
             {"$set": {
                 "plan": plan_enum,
-                "dm_limit": PLAN_LIMITS[plan_enum]["dm_limit"],
+                "dm_limit": get_plan_limits(plan_enum)["dm_limit"],
                 "stripe_customer_id": session.get("customer"),
                 "stripe_subscription_id": session.get("subscription"),
             }}
         )
-        logger.info(f"User {user_id} upgraded to {plan}")
+
+        if session_id:
+            await db.stripe_webhook_events.insert_one(
+                {
+                    "session_id": session_id,
+                    "event_type": event["type"],
+                    "processed_at": datetime.now(timezone.utc),
+                }
+            )
 
     elif event["type"] == "customer.subscription.deleted":
         # Downgrade to free on cancel
         customer_id = event["data"]["object"]["customer"]
         await db.users.update_one(
             {"stripe_customer_id": customer_id},
-            {"$set": {"plan": PlanType.FREE, "dm_limit": PLAN_LIMITS[PlanType.FREE]["dm_limit"]}}
+            {"$set": {"plan": PlanType.Free, "dm_limit": get_plan_limits(PlanType.Free)["dm_limit"]}}
         )
 
     return {"status": "ok"}
