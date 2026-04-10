@@ -30,10 +30,10 @@ class InstagramService:
             return encrypted_access_token
 
     @staticmethod
-    async def send_dm(access_token: str, recipient_ig_id: str, message: str) -> dict:
+    async def send_dm(access_token: str, recipient_ig_id: str, message: str, ig_user_id: str) -> dict:
         """Send a DM to an Instagram user via Graph API."""
         access_token = InstagramService.decrypt_access_token(access_token)
-        url = f"{BASE}/me/messages"
+        url = f"{BASE}/{ig_user_id}/messages"
         payload = {
             "recipient": {"id": recipient_ig_id},
             "message": {"text": message},
@@ -52,7 +52,7 @@ class InstagramService:
         """Get Instagram business account info."""
         url = f"{BASE}/me"
         params = {
-            "fields": "id,name,username,profile_picture_url,followers_count",
+            "fields": "id,name",
             "access_token": access_token,
         }
         async with httpx.AsyncClient() as client:

@@ -1,16 +1,19 @@
-# Environment - NEVER push this
+# Environment and local config
 .env
+.env.*
 
-# Python
-venv/
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
+# Frontend dependencies and build outputs
+node_modules/
+dist/
+build/
 
-# VS Code
+# Logs
+*.log
+
+# IDE/editor
 .vscode/
+.idea/
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db

@@ -25,7 +25,10 @@ app = FastAPI(
     title="PinGuru API",
     description="Instagram DM Automation SaaS Backend",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url="/docs" if settings.ENVIRONMENT.lower() == "development" else None,
+    redoc_url="/redoc" if settings.ENVIRONMENT.lower() == "development" else None,
+    openapi_url="/openapi.json" if settings.ENVIRONMENT.lower() == "development" else None,
 )
 
 app.state.limiter = limiter
@@ -43,7 +46,17 @@ async def add_security_headers(request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
-    response.headers["Content-Security-Policy"] = "default-src 'self'"
+    if request.url.path in {"/docs", "/redoc", "/openapi.json"}:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "img-src 'self' data: https://fastapi.tiangolo.com; "
+            "font-src 'self' data: https://cdn.jsdelivr.net; "
+            "connect-src 'self'"
+        )
+    else:
+        response.headers["Content-Security-Policy"] = "default-src 'self'"
     return response
 
 environment = settings.ENVIRONMENT.lower()

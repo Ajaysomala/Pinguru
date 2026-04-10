@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta, timezone
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
+from passlib.exc import UnknownHashError
 from pydantic import BaseModel, EmailStr
 import jwt
 
@@ -10,8 +12,9 @@ from app.config import settings
 from app.database import get_db
 
 router = APIRouter()
-admin_bearer = HTTPBearer()
+admin_bearer = HTTPBearer(auto_error=False)
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+logger = logging.getLogger(__name__)
 
 
 class AdminLoginRequest(BaseModel):
@@ -25,7 +28,10 @@ def _create_admin_token(email: str) -> str:
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
 
-async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(admin_bearer)):
+async def get_admin_user(credentials: HTTPAuthorizationCredentials | None = Depends(admin_bearer)):
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
     token = credentials.credentials
     try:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
@@ -38,7 +44,8 @@ async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(adm
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
     email = payload.get("sub")
-    if not email or email != settings.ADMIN_EMAIL:
+    admin_email = settings.ADMIN_EMAIL.strip().lower()
+    if not email or email.strip().lower() != admin_email:
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
     return {"email": email}
@@ -48,14 +55,22 @@ async def get_admin_user(credentials: HTTPAuthorizationCredentials = Depends(adm
 async def admin_login(data: AdminLoginRequest):
     email = data.email.strip().lower()
     password = data.password
+    admin_email = settings.ADMIN_EMAIL.strip().lower()
+    admin_password_hash = settings.ADMIN_PASSWORD_HASH.strip()
 
-    if not settings.ADMIN_EMAIL or not settings.ADMIN_PASSWORD_HASH:
+    if not admin_email or not admin_password_hash:
         raise HTTPException(status_code=503, detail="Admin credentials are not configured")
 
-    if email != settings.ADMIN_EMAIL:
+    if email != admin_email:
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
-    if not pwd_ctx.verify(password, settings.ADMIN_PASSWORD_HASH):
+    try:
+        password_valid = pwd_ctx.verify(password, admin_password_hash)
+    except UnknownHashError:
+        logger.error("ADMIN_PASSWORD_HASH is not a recognized hash format")
+        raise HTTPException(status_code=503, detail="Admin credentials are misconfigured")
+
+    if not password_valid:
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
     token = _create_admin_token(email)

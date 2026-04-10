@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from app.database import get_db
 from app.models.models import UserCreate, PlanType, PLAN_LIMITS, get_plan_type
 from app.config import settings
@@ -16,6 +18,10 @@ import jwt
 router = APIRouter()
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer()
+
+
+class InstagramTokenRequest(BaseModel):
+    access_token: str
 
 def hash_password(pw: str) -> str:
     return pwd_ctx.hash(pw)
@@ -166,3 +172,48 @@ async def instagram_callback(
         }}
     )
     return {"status": "Instagram connected ✅", "profile": profile}
+
+
+@router.post("/instagram/token")
+async def save_instagram_token(
+    data: InstagramTokenRequest,
+    db=Depends(get_db),
+    user=Depends(get_current_user),
+):
+    access_token = data.access_token.strip()
+    if not access_token:
+        raise HTTPException(status_code=400, detail="access_token is required")
+
+    url = (
+        "https://graph.facebook.com/v19.0/me/accounts"
+        f"?fields=instagram_business_account&access_token={access_token}"
+    )
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=400, detail="Invalid or expired access token")
+        profile = response.json()
+
+    ig_user_id = None
+    for account in profile.get("data", []):
+        instagram_business_account = account.get("instagram_business_account") or {}
+        ig_user_id = instagram_business_account.get("id")
+        if ig_user_id:
+            break
+
+    if not ig_user_id:
+        raise HTTPException(status_code=400, detail="Failed to fetch Instagram user ID from token")
+
+    encrypted_access_token = InstagramService.encrypt_access_token(access_token)
+    result = await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {
+            "instagram_access_token": encrypted_access_token,
+            "instagram_user_id": ig_user_id,
+            "instagram_connected": True
+        }}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {"status": "Instagram token saved ✅", "instagram_user_id": ig_user_id}

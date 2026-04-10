@@ -5,7 +5,8 @@ from pathlib import Path
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=str(Path(__file__).parent.parent / ".env"),
-        env_file_encoding="utf-8"
+        env_file_encoding="utf-8",
+        extra="ignore",
     )
 
     MONGODB_URI: str
@@ -28,6 +29,7 @@ class Settings(BaseSettings):
     ADMIN_EMAIL: str = ""
     ADMIN_PASSWORD_HASH: str = ""
     ENVIRONMENT: str = "development"
+    DISABLE_WEBHOOK_SIGNATURE: bool = False
 
 
 settings = Settings()

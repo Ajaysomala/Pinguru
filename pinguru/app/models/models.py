@@ -15,7 +15,6 @@ class TriggerType(str, Enum):
     STORY_REPLY = "story_reply"
     POST_COMMENT = "post_comment"
     REEL_COMMENT = "reel_comment"
-    NEW_FOLLOWER = "new_follower"
 
 # ── User ──────────────────────────────────────────────────────────────────────
 

@@ -1,26 +1,41 @@
+# Environment and secrets
 .env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache and bytecode
 __pycache__/
 *.pyc
 *.pyo
-.DS_Store
-.venv/
-venv/
+*.pyd
+*.py[cod]
+
+# Python tooling caches and outputs
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging / build
 dist/
 build/
 *.egg-info/
-# Environment - NEVER push this
-.env
 
-# Python
-venv/
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
+# Logs
+*.log
 
-# VS Code
+# IDE/editor
 .vscode/
+.idea/
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
