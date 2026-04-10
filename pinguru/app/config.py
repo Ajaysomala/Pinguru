@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     STRIPE_PRICE_STARTER_199: str = "price_STARTER_199"
     STRIPE_PRICE_PRO_399: str = "price_PRO_399"
     ENCRYPTION_KEY: str
+    admin_api_key: str = ""
     ADMIN_EMAIL: str = ""
     ADMIN_PASSWORD_HASH: str = ""
     ENVIRONMENT: str = "development"

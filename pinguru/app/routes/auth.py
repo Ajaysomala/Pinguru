@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from app.database import get_db
@@ -178,8 +178,11 @@ async def instagram_callback(
 async def save_instagram_token(
     data: InstagramTokenRequest,
     db=Depends(get_db),
-    user=Depends(get_current_user),
+    x_admin_key: str = Header(None),
 ):
+    if x_admin_key != settings.admin_api_key:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     access_token = data.access_token.strip()
     if not access_token:
         raise HTTPException(status_code=400, detail="access_token is required")
@@ -206,14 +209,13 @@ async def save_instagram_token(
 
     encrypted_access_token = InstagramService.encrypt_access_token(access_token)
     result = await db.users.update_one(
-        {"_id": user["_id"]},
+        {"instagram_user_id": ig_user_id},
         {"$set": {
             "instagram_access_token": encrypted_access_token,
             "instagram_user_id": ig_user_id,
             "instagram_connected": True
-        }}
+        }},
+        upsert=True,
     )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="User not found")
 
     return {"status": "Instagram token saved ✅", "instagram_user_id": ig_user_id}
