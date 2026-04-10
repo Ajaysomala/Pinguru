@@ -7,8 +7,10 @@ services:
       branch: main
       deploy_on_push: true
     build_command: pip install -r requirements.txt
-    run_command: uvicorn app.main:app --host 0.0.0.0 --port 8080
-    http_port: 8080
+    run_command: uvicorn app.main:app --host 0.0.0.0 --port ${PORT}
+    http_port: 8000
+    health_check:
+      http_path: /health
     instance_count: 1
     instance_size_slug: basic-xxs # cheapest — free with DO credits
     envs:
