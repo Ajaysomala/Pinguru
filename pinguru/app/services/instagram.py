@@ -44,6 +44,7 @@ class InstagramService:
             data = resp.json()
             if resp.status_code != 200:
                 logger.error("DM failed with non-200 response from Instagram API")
+                logger.error(f"DM error response: {resp.text}")
                 return {"success": False, "error": data}
             return {"success": True, "data": data}
 
