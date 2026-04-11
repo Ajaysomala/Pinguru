@@ -211,9 +211,13 @@ async def save_instagram_token(
     update_filter = None
     if data.user_id:
         try:
-            update_filter = {"_id": ObjectId(data.user_id)}
+            user_object_id = ObjectId(data.user_id)
+            user_exists = await db.users.find_one({"_id": user_object_id})
+            if not user_exists:
+                raise HTTPException(status_code=404, detail=f"User {data.user_id} not found in database")
+            update_filter = {"_id": user_object_id}
         except InvalidId:
-            raise HTTPException(status_code=400, detail="Invalid user_id")
+            raise HTTPException(status_code=400, detail="Invalid user_id format")
     else:
         linked_user = await db.users.find_one({"instagram_user_id": ig_user_id})
         if linked_user:
@@ -236,6 +240,6 @@ async def save_instagram_token(
     )
 
     if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=404, detail="Update failed: User not found after verification")
 
     return {"status": "Instagram token saved ✅", "instagram_user_id": ig_user_id}
