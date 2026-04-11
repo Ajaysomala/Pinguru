@@ -371,13 +371,14 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         logger.warning("DM limit reached")
         return
 
-    rules = await db.automation_rules.find(
-        {
-            "user_id": str(user["_id"]),
-            "is_active": True,
-            "trigger_type": TriggerType.KEYWORD,
-        }
-    ).to_list(100)
+    dm_rules_query = {
+        "user_id": str(user["_id"]),
+        "is_active": True,
+        "trigger_type": TriggerType.KEYWORD,
+    }
+    logger.info(f"DM rules Mongo query: {json.dumps(dm_rules_query, default=str)}")
+
+    rules = await db.automation_rules.find(dm_rules_query).to_list(100)
 
     logger.info(
         f"DM rules fetched: count={len(rules)}, sender_id={sender_id}, rule_ids={[str(rule.get('_id')) for rule in rules]}"
