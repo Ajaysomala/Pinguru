@@ -194,8 +194,10 @@ async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) ->
 
     for entry in entries:
         ig_id = entry.get("id")
+        messaging_events = entry.get("messaging") or []
+        change_events = entry.get("changes") or []
 
-        for messaging in entry.get("messaging", []):
+        for messaging in messaging_events:
             event_key = _event_key_for_messaging(ig_id, messaging)
             if not await _mark_event_if_new(db, event_key, "messaging"):
                 deduped_events += 1
@@ -203,7 +205,7 @@ async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) ->
             await handle_messaging_event(db, ig_id, messaging)
             processed_events += 1
 
-        for change in entry.get("changes", []):
+        for change in change_events:
             event_key = _event_key_for_change(ig_id, change)
             if not await _mark_event_if_new(db, event_key, "change"):
                 deduped_events += 1
