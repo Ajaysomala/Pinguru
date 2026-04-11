@@ -202,6 +202,14 @@ async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) ->
             if not await _mark_event_if_new(db, event_key, "messaging"):
                 deduped_events += 1
                 continue
+
+            sender_id = (messaging.get("sender") or {}).get("id")
+            recipient_id = (messaging.get("recipient") or {}).get("id") or ig_id
+            message_text = (messaging.get("message") or {}).get("text")
+            logger.info(
+                f"Messaging webhook event: sender_id={sender_id}, recipient_id={recipient_id}, message_text={message_text}"
+            )
+
             await handle_messaging_event(db, ig_id, messaging)
             processed_events += 1
 
