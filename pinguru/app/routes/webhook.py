@@ -187,6 +187,7 @@ async def _send_rule_reply(db, user: dict[str, Any], recipient_id: str, rule: di
 async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) -> dict[str, int]:
     entries = body.get("entry", [])
     logger.info(f"Webhook received: {len(raw_body)} bytes, {len(entries)} entries")
+    logger.info(f"Webhook payload: {body}")
 
     processed_events = 0
     deduped_events = 0
