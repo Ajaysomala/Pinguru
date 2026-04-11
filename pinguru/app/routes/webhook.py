@@ -352,6 +352,8 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
     if not sender_id or not message_text:
         return
 
+    logger.info(f"DM processing started: sender_id={sender_id}, message_text={message_text}")
+
     if sender_id == ig_account_id:
         return
 
@@ -377,15 +379,27 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         }
     ).to_list(100)
 
+    logger.info(
+        f"DM rules fetched: count={len(rules)}, sender_id={sender_id}, rule_ids={[str(rule.get('_id')) for rule in rules]}"
+    )
+
     for rule in rules:
         keywords = [k.lower() for k in rule.get("keywords", [])]
         match_mode = str(rule.get("match_mode", "exact")).lower()
         use_hinglish = match_mode == "hinglish" and user_plan == PlanType.Pro
 
+        logger.info(
+            f"DM keyword match run: sender_id={sender_id}, rule_id={rule.get('_id')}, match_mode={match_mode}, use_hinglish={use_hinglish}, keywords={keywords}"
+        )
+
         if use_hinglish:
             is_match = hinglish_keyword_match(message_text, keywords)
         else:
             is_match = any(kw in message_text for kw in keywords)
+
+        logger.info(
+            f"DM keyword match result: sender_id={sender_id}, rule_id={rule.get('_id')}, is_match={is_match}"
+        )
 
         if is_match:
             await _send_rule_reply(db, user, sender_id, rule, TriggerType.KEYWORD)
