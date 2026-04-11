@@ -39,6 +39,7 @@ class InstagramService:
             "message": {"text": message},
             "access_token": access_token,
         }
+        logger.info(f"DM request payload: {payload}")
         async with httpx.AsyncClient() as client:
             resp = await client.post(url, json=payload)
             data = resp.json()
