@@ -22,6 +22,7 @@ bearer_scheme = HTTPBearer()
 
 class InstagramTokenRequest(BaseModel):
     access_token: str
+    user_id: str | None = None
 
 def hash_password(pw: str) -> str:
     return pwd_ctx.hash(pw)
@@ -207,15 +208,34 @@ async def save_instagram_token(
     if not ig_user_id:
         raise HTTPException(status_code=400, detail="Failed to fetch Instagram user ID from token")
 
+    update_filter = None
+    if data.user_id:
+        try:
+            update_filter = {"_id": ObjectId(data.user_id)}
+        except InvalidId:
+            raise HTTPException(status_code=400, detail="Invalid user_id")
+    else:
+        linked_user = await db.users.find_one({"instagram_user_id": ig_user_id})
+        if linked_user:
+            update_filter = {"_id": linked_user["_id"]}
+
+    if not update_filter:
+        raise HTTPException(
+            status_code=400,
+            detail="No matching user found. Provide user_id to link token to an existing account.",
+        )
+
     encrypted_access_token = InstagramService.encrypt_access_token(access_token)
     result = await db.users.update_one(
-        {"instagram_user_id": ig_user_id},
+        update_filter,
         {"$set": {
             "instagram_access_token": encrypted_access_token,
             "instagram_user_id": ig_user_id,
             "instagram_connected": True
         }},
-        upsert=True,
     )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
 
     return {"status": "Instagram token saved ✅", "instagram_user_id": ig_user_id}
