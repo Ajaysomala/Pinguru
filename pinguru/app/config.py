@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     admin_api_key: str = ""
     ADMIN_EMAIL: str = ""
     ADMIN_PASSWORD_HASH: str = ""
+    GOOGLE_CLIENT_ID: str = ""
+    DEFAULT_OAUTH_PASSWORD: str = "TempOAuth2024!"
     ENVIRONMENT: str = "development"
     DISABLE_WEBHOOK_SIGNATURE: bool = False
 

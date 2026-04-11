@@ -8,39 +8,58 @@
       name="description"
       content="Turn every comment, story reply and keyword into an automated DM. Grow your Instagram on autopilot."
     />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com https://formspree.io https://api.pinguru.me; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;"
+    />
+    <meta http-equiv="X-Content-Type-Options" content="nosniff" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta http-equiv="X-Frame-Options" content="DENY" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link
-      href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@400;500;600&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Inter:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="css/base.css" />
+    <link rel="stylesheet" href="css/landing.css" />
   </head>
   <body>
-    <!-- NAV -->
     <nav>
-      <div class="logo">PinGuru</div>
-      <a href="#waitlist" class="nav-cta">Get Early Access</a>
+      <a href="/" class="logo">PinGuru</a>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#pricing">Pricing</a>
+        <a href="/login.html">Sign in</a>
+        <a href="/register.html" class="nav-cta">Get Started Free</a>
+      </div>
+      <button class="hamburger" onclick="toggleMobileMenu()" aria-label="Menu">
+        <span></span><span></span><span></span>
+      </button>
     </nav>
+
+    <div class="mobile-menu" id="mobile-menu">
+      <a href="#features">Features</a>
+      <a href="#pricing">Pricing</a>
+      <a href="/login.html">Sign in</a>
+      <a href="/register.html">Get Started Free</a>
+    </div>
 
     <!-- HERO -->
     <div class="hero">
-      <div class="glow-orb orb1"></div>
-      <div class="glow-orb orb2"></div>
-
-      <div class="badge">
+      <div class="hero-badge">
         <span class="badge-dot"></span>
-        MVP Live - Keyword, Comment, Story Reply
+        Live Since April 2026
       </div>
 
       <h1>
-        Automate Instagram DMs<br />
-        for <span class="grad">Real Buyer Signals</span>
+        Turn Every Message Into a Sale<br />
+        <span class="grad">Automate Your Instagram Response Game</span>
       </h1>
 
       <p class="hero-sub">
-        PinGuru auto-sends personalized DMs when someone comments, replies to
-        your story, or sends you a keyword. Build one rule, launch fast, and
-        close leads faster.
+        PinGuru watches every comment, story reply, and keyword mention. When a
+        real buyer signal comes in, your personalized DM goes out instantly. No
+        bots. No spam. Just business.
       </p>
 
       <form class="cta-form" id="waitlist" onsubmit="handleSubmit(event)">
@@ -50,7 +69,7 @@
           placeholder="your@email.com"
           required
         />
-        <button type="submit" class="btn-primary">Join Beta Free →</button>
+        <button type="submit" class="btn-primary">Get Started Free →</button>
       </form>
       <p class="form-note">No credit card. Free plan available forever.</p>
       <p class="success-msg" id="success-msg">
@@ -60,27 +79,25 @@
       <div class="quick-links">
         <a
           class="chip-link"
-          href="https://pinguru-netqv.ondigitalocean.app/health"
+          href="https://api.pinguru.me/health"
           target="_blank"
           rel="noopener noreferrer"
           >API Status</a
         >
         <a
           class="chip-link"
-          href="https://pinguru-netqv.ondigitalocean.app/"
+          href="https://api.pinguru.me/docs"
           target="_blank"
           rel="noopener noreferrer"
-          >Backend URL</a
+          >API Docs</a
         >
+        <a class="chip-link" href="/login.html">Dashboard →</a>
       </div>
 
       <div class="social-proof">
-        <div class="avatars">
-          <span>AJ</span><span>KR</span><span>MS</span><span>PL</span
-          ><span>+</span>
-        </div>
         <p class="proof-text">
-          <strong>87 creators</strong> already on the waitlist
+          <strong>Join creators who've already automated</strong><br />See real
+          results in your first week
         </p>
       </div>
     </div>
@@ -100,7 +117,7 @@
         <div class="stat-label">Automation active</div>
       </div>
       <div class="stat">
-        <div class="stat-num">$0</div>
+        <div class="stat-num">₹0</div>
         <div class="stat-label">To start</div>
       </div>
     </div>
@@ -113,7 +130,6 @@
         Connect once. Build rules. Watch PinGuru handle your DMs while you
         sleep.
       </p>
-
       <div class="steps">
         <div class="step-card">
           <div class="step-icon">🔗</div>
@@ -129,7 +145,7 @@
           <div class="step-num">02</div>
           <h3>Set Your Triggers</h3>
           <p>
-            Choose what triggers a DM - keywords, story replies, and post or
+            Choose what triggers a DM — keywords, story replies, and post or
             reel comments.
           </p>
         </div>
@@ -146,79 +162,74 @@
     </section>
 
     <!-- FEATURES -->
-    <section>
-      <p class="section-label">Features</p>
-      <h2 class="section-title">
-        Everything you need to<br />dominate Instagram DMs
-      </h2>
-      <p class="section-sub">
-        Built for creators, coaches, and e-commerce brands who are serious about
-        growth.
-      </p>
-
-      <div class="features-grid">
-        <div class="feature-card">
-          <div class="feature-icon">🎯</div>
-          <h3>Keyword Triggers</h3>
-          <p>
-            Someone DMs you "price" or "info" — PinGuru instantly replies with
-            your custom message and link.
-          </p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">📖</div>
-          <h3>Story Reply Automation</h3>
-          <p>
-            Every story reply gets a personalized DM sent back automatically.
-            Never miss a warm lead again.
-          </p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">💬</div>
-          <h3>Comment-to-DM</h3>
-          <p>
-            Post a Reel, someone comments a keyword — they instantly get a DM
-            with your offer or link.
-          </p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">👤</div>
-          <h3>Personalization</h3>
-          <p>
-            Use
-            <code
-              style="
-                background: rgba(200, 80, 240, 0.15);
-                padding: 2px 6px;
-                border-radius: 4px;
-                font-size: 0.85em;
-              "
-              >{{username}}</code
-            >
-            to address each person by name. Feels human, converts better.
-          </p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">📊</div>
-          <h3>Analytics Dashboard</h3>
-          <p>
-            Track DMs sent, open rates, and rule performance. Know exactly
-            what's converting.
-          </p>
-        </div>
-        <div class="feature-card">
-          <div class="feature-icon">🔒</div>
-          <h3>Meta Approved</h3>
-          <p>
-            Built on official Instagram Graph API. No hacks, no bans, no
-            grey-area tools.
-          </p>
+    <section
+      id="features"
+      style="background: var(--surface); max-width: 100%; padding: 64px 5%"
+    >
+      <div style="max-width: 1100px; margin: 0 auto">
+        <p class="section-label">Features</p>
+        <h2 class="section-title">
+          Everything you need to dominate Instagram DMs
+        </h2>
+        <p class="section-sub">
+          Built for creators, coaches, and e-commerce brands who are serious
+          about growth.
+        </p>
+        <div class="features-grid">
+          <div class="feature-card">
+            <div class="feature-icon">🎯</div>
+            <h3>Keyword Triggers</h3>
+            <p>
+              Someone DMs you "price" or "info" — PinGuru instantly replies with
+              your custom message and link.
+            </p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon">📖</div>
+            <h3>Story Reply Automation</h3>
+            <p>
+              Every story reply gets a personalized DM sent back automatically.
+              Never miss a warm lead again.
+            </p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon">💬</div>
+            <h3>Comment-to-DM</h3>
+            <p>
+              Post a Reel, someone comments a keyword — they instantly get a DM
+              with your offer or link.
+            </p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon">📊</div>
+            <h3>Analytics Dashboard</h3>
+            <p>
+              Track DMs sent, open rates, and rule performance. Know exactly
+              what's converting.
+            </p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon">⚡</div>
+            <h3>Instant Replies</h3>
+            <p>
+              Replies sent within 5–15 seconds of the trigger event. Speed
+              converts leads before competitors.
+            </p>
+          </div>
+          <div class="feature-card">
+            <div class="feature-icon">🔒</div>
+            <h3>Meta Approved</h3>
+            <p>
+              Built on official Instagram Graph API approved by Meta. No hacks,
+              no bans, no grey-area tools.
+            </p>
+          </div>
         </div>
       </div>
     </section>
 
     <!-- PRICING -->
-    <section>
+    <section id="pricing">
       <p class="section-label">Pricing</p>
       <h2 class="section-title">
         Flat-rate plans in INR for every growth stage.
@@ -227,7 +238,6 @@
         No contracts. No per-contact billing. Pick the plan that matches your DM
         volume.
       </p>
-
       <div class="pricing-grid">
         <div class="price-card">
           <div class="plan-name">Free</div>
@@ -236,16 +246,15 @@
           <ul class="plan-features">
             <li>200 DMs / month</li>
             <li>1 automation rule</li>
-            <li>Keyword, comment, story reply triggers</li>
+            <li>Keyword, comment, story reply</li>
           </ul>
           <button
             class="btn-plan"
-            onclick="document.getElementById('email-input').focus()"
+            onclick="window.location.href = '/register.html'"
           >
             Start Free
           </button>
         </div>
-
         <div class="price-card">
           <div class="plan-name">Starter</div>
           <div class="plan-price">₹199</div>
@@ -253,17 +262,16 @@
           <ul class="plan-features">
             <li>3,000 DMs / month</li>
             <li>5 automation rules</li>
-            <li>Keyword, comment, story reply triggers</li>
+            <li>Keyword, comment, story reply</li>
             <li>Basic analytics</li>
           </ul>
           <button
             class="btn-plan"
-            onclick="document.getElementById('email-input').focus()"
+            onclick="window.location.href = '/register.html'"
           >
             Get Started
           </button>
         </div>
-
         <div class="price-card popular">
           <div class="plan-name">Pro</div>
           <div class="popular-badge">⚡ MOST POPULAR</div>
@@ -272,13 +280,13 @@
           <ul class="plan-features">
             <li>15,000 DMs / month</li>
             <li>Everything in Starter</li>
-            <li>Smart Hinglish keyword matching</li>
+            <li>Smart Hinglish matching</li>
             <li>Advanced analytics</li>
             <li>Unlimited rules</li>
           </ul>
           <button
             class="btn-plan"
-            onclick="document.getElementById('email-input').focus()"
+            onclick="window.location.href = '/register.html'"
           >
             Get Started
           </button>
@@ -286,58 +294,8 @@
       </div>
     </section>
 
-    <!-- TESTIMONIALS -->
-    <section>
-      <p class="section-label">Beta users</p>
-      <h2 class="section-title">Creators already love it</h2>
-      <p class="section-sub">Real feedback from our closed beta testers.</p>
-
-      <div class="testimonials">
-        <div class="testimonial">
-          <div class="stars">★★★★★</div>
-          <p>
-            "I set up a keyword rule for 'link' on my coaching post. Within 2
-            hours I had 14 DM conversations going automatically. Closed 3
-            clients that day."
-          </p>
-          <div class="testimonial-author">
-            <div class="t-avatar">SK</div>
-            <div>
-              <div class="t-name">Sneha K.</div>
-              <div class="t-handle">@snehacoaches • 28K followers</div>
-            </div>
-          </div>
-        </div>
-        <div class="testimonial">
-          <div class="stars">★★★★★</div>
-          <p>
-            "My story replies used to go unanswered for hours. Now every single
-            one gets a DM in seconds. My DM response rate went from 12% to 89%."
-          </p>
-          <div class="testimonial-author">
-            <div class="t-avatar">RV</div>
-            <div>
-              <div class="t-name">Rohan V.</div>
-              <div class="t-handle">@rohanfitness • 52K followers</div>
-            </div>
-          </div>
-        </div>
-        <div class="testimonial">
-          <div class="stars">★★★★★</div>
-          <p>
-            "Comment to DM automation is our favorite. Leads drop the keyword,
-            and they get the link in seconds without manual replies."
-          </p>
-          <div class="testimonial-author">
-            <div class="t-avatar">AM</div>
-            <div>
-              <div class="t-name">Arjun M.</div>
-              <div class="t-handle">Performance Marketer</div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
+    <!-- TESTIMONIALS: WAITING FOR REAL FEEDBACK -->
+    <!-- Section removed until genuine user testimonials are available -->
 
     <!-- FAQ -->
     <section>
@@ -396,16 +354,6 @@
             upgrade before you hit the limit.
           </div>
         </div>
-        <div class="faq-item">
-          <button class="faq-q" onclick="toggleFaq(this)">
-            Do you support follow-gate flows right now?
-            <span class="arrow">▾</span>
-          </button>
-          <div class="faq-a">
-            Not in the current MVP. We are focused on making keyword,
-            comment-to-DM, and story-reply automation rock solid first.
-          </div>
-        </div>
       </div>
     </section>
 
@@ -439,17 +387,19 @@
 
     <!-- FOOTER -->
     <footer>
-      <p class="logo" style="font-size: 1.1rem">PinGuru</p>
-      <p style="color: var(--muted); font-size: 0.8rem">
-        © 2026 PinGuru. Built with ⚡ by creators, for creators.
+      <p>© 2026 PinGuru. Built by AJ.</p>
+      <p style="color: var(--muted); font-size: 0.78rem">
+        All rights reserved. PinGuru is not affiliated with Meta or Instagram.
       </p>
       <div class="footer-links">
-        <a href="#">Privacy</a>
-        <a href="#">Terms</a>
-        <a href="mailto:contact@pinguru.me">Contact</a>
+        <a href="/privacy.html">Privacy</a>
+        <a href="/terms.html">Terms</a>
+        <a href="mailto:jaydeveloper010@gmail.com">Support</a>
       </div>
     </footer>
 
-    <script src="main.js"></script>
+    <script src="js/utils.js"></script>
+    <script src="js/utils.js"></script>
+    <script src="js/landing.js"></script>
   </body>
 </html>

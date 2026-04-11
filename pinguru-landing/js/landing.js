@@ -1,6 +1,5 @@
 const FORMSPREE_URL = 'https://formspree.io/f/mykbvqoj';
 
-// FAQ Toggle
 function toggleFaq(btn) {
   const item = btn.closest('.faq-item');
   const isOpen = item.classList.contains('open');
@@ -8,7 +7,6 @@ function toggleFaq(btn) {
   if (!isOpen) item.classList.add('open');
 }
 
-// Email Waitlist Submit
 async function handleSubmit(e) {
   e.preventDefault();
   const emailInputs = [
@@ -23,11 +21,9 @@ async function handleSubmit(e) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, source: 'pinguru-landing' })
     });
-
     if (resp.ok) {
       document.getElementById('success-msg').style.display = 'block';
       emailInputs.forEach(el => { if (el) el.value = ''; });
-
       const count = document.querySelector('.proof-text strong');
       if (count) {
         const n = parseInt(count.textContent) + 1;
@@ -40,19 +36,27 @@ async function handleSubmit(e) {
   }
 }
 
-// Entrance Animations
-const observer = new IntersectionObserver((entries) => {
-  entries.forEach(entry => {
-    if (entry.isIntersecting) {
-      entry.target.style.opacity = '1';
-      entry.target.style.transform = 'translateY(0)';
-    }
-  });
-}, { threshold: 0.1 });
+// Hamburger menu
+function toggleMobileMenu() {
+  const menu = document.getElementById('mobile-menu');
+  if (menu) menu.classList.toggle('open');
+}
 
-document.querySelectorAll('.step-card, .feature-card, .price-card, .testimonial').forEach(el => {
-  el.style.opacity = '0';
-  el.style.transform = 'translateY(24px)';
-  el.style.transition = 'opacity 0.5s ease, transform 0.5s ease';
-  observer.observe(el);
+// Entrance animations
+document.addEventListener('DOMContentLoaded', () => {
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.style.opacity = '1';
+        entry.target.style.transform = 'translateY(0)';
+      }
+    });
+  }, { threshold: 0.1 });
+
+  document.querySelectorAll('.step-card, .feature-card, .price-card, .testimonial').forEach(el => {
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(20px)';
+    el.style.transition = 'opacity 0.4s ease, transform 0.4s ease';
+    observer.observe(el);
+  });
 });

@@ -2,8 +2,9 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import json
 from pydantic import BaseModel
 from app.database import get_db
 from app.models.models import UserCreate, PlanType, PLAN_LIMITS, get_plan_type
@@ -14,6 +15,8 @@ from bson import ObjectId
 from bson.errors import InvalidId
 from app.security import limiter
 import jwt
+from google.auth.transport import requests
+from google.oauth2 import id_token
 
 router = APIRouter()
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -23,6 +26,9 @@ bearer_scheme = HTTPBearer()
 class InstagramTokenRequest(BaseModel):
     access_token: str
     user_id: str | None = None
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str
 
 def hash_password(pw: str) -> str:
     return pwd_ctx.hash(pw)
@@ -98,7 +104,18 @@ async def register(request: Request, data: UserCreate, db=Depends(get_db)):
     }
     result = await db.users.insert_one(user_doc)
     token = create_jwt(str(result.inserted_id))
-    return {"token": token, "message": "Account created ✅"}
+    
+    # Return httpOnly cookie instead of token in response body
+    response = Response(json.dumps({"message": "Account created ✅"}), media_type="application/json")
+    response.set_cookie(
+        key="pg_token",
+        value=token,
+        httponly=True,        # Not accessible to JavaScript (prevents XSS token theft)
+        secure=True,          # HTTPS only in production
+        samesite="strict",    # CSRF protection
+        max_age=604800        # 7 days (same as JWT expiry)
+    )
+    return response
 
 # ── Login ─────────────────────────────────────────────────────────────────────
 
@@ -109,7 +126,19 @@ async def login(request: Request, data: UserCreate, db=Depends(get_db)):
     if not user or not verify_password(data.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_jwt(str(user["_id"]))
-    return {"token": token, "plan": get_plan_type(user["plan"]).name, "instagram_connected": bool(user.get("instagram_user_id"))}
+    
+    # Return httpOnly cookie instead of token in response body
+    response_data = {"plan": get_plan_type(user["plan"]).name, "instagram_connected": bool(user.get("instagram_user_id"))}
+    response = Response(json.dumps(response_data), media_type="application/json")
+    response.set_cookie(
+        key="pg_token",
+        value=token,
+        httponly=True,        # Not accessible to JavaScript (prevents XSS token theft)
+        secure=True,          # HTTPS only in production
+        samesite="strict",    # CSRF protection
+        max_age=604800        # 7 days (same as JWT expiry)
+    )
+    return response
 
 # ── Instagram OAuth ───────────────────────────────────────────────────────────
 
@@ -181,6 +210,14 @@ async def save_instagram_token(
     db=Depends(get_db),
     x_admin_key: str = Header(None),
 ):
+    """Save Instagram token via POST body (NOT URL query string).
+    
+    Security fix: Token moved from URL to POST body + Bearer header to avoid:
+    - Exposure in browser history
+    - Exposure in server logs
+    - Exposure in proxy logs
+    - Exposure in network analysis tools
+    """
     if x_admin_key != settings.admin_api_key:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -188,12 +225,12 @@ async def save_instagram_token(
     if not access_token:
         raise HTTPException(status_code=400, detail="access_token is required")
 
-    url = (
-        "https://graph.facebook.com/v19.0/me/accounts"
-        f"?fields=instagram_business_account&access_token={access_token}"
-    )
+    # Token passed via Authorization header (Bearer), not in URL query string
+    url = "https://graph.facebook.com/v19.0/me/accounts?fields=instagram_business_account"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    
     async with httpx.AsyncClient() as client:
-        response = await client.get(url)
+        response = await client.get(url, headers=headers)
         if response.status_code >= 400:
             raise HTTPException(status_code=400, detail="Invalid or expired access token")
         profile = response.json()
@@ -243,3 +280,79 @@ async def save_instagram_token(
         raise HTTPException(status_code=404, detail="Update failed: User not found after verification")
 
     return {"status": "Instagram token saved ✅", "instagram_user_id": ig_user_id}
+
+
+# ── Google OAuth ──────────────────────────────────────────────────────────────
+
+@router.post("/google/callback")
+async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
+    """Handle Google OAuth 2.0 callback.
+    
+    Flow:
+    1. Frontend sends ID token from Google Sign-In
+    2. Backend verifies token with Google
+    3. Extract email and basic info
+    4. Create user if new, or link to existing account
+    5. Return httpOnly cookie with JWT
+    """
+    try:
+        # Verify ID token with Google
+        idinfo = id_token.verify_oauth2_token(
+            data.id_token,
+            requests.Request(),
+            settings.GOOGLE_CLIENT_ID
+        )
+        
+        # Extract user info from verified token
+        email = idinfo.get('email')
+        name = idinfo.get('name', '')
+        
+        if not email:
+            raise HTTPException(status_code=400, detail="No email in Google profile")
+        
+        # Find or create user
+        user = await db.users.find_one({"email": email})
+        
+        if not user:
+            # Create new user account from Google profile
+            user_doc = {
+                "email": email,
+                "hashed_password": hash_password(settings.DEFAULT_OAUTH_PASSWORD),  # Placeholder password
+                "plan": PlanType.Free,
+                "dm_limit": PLAN_LIMITS[PlanType.Free]["dm_limit"],
+                "dm_count_this_month": 0,
+                "is_active": True,
+                "oauth_provider": "google",
+                "created_at": datetime.now(timezone.utc),
+            }
+            result = await db.users.insert_one(user_doc)
+            user_id = str(result.inserted_id)
+        else:
+            user_id = str(user["_id"])
+        
+        # Create JWT token
+        token = create_jwt(user_id)
+        
+        # Return httpOnly cookie
+        response = Response(
+            json.dumps({
+                "plan": user.get("plan", PlanType.Free),
+                "instagram_connected": bool(user.get("instagram_user_id") if user else None)
+            }),
+            media_type="application/json"
+        )
+        response.set_cookie(
+            key="pg_token",
+            value=token,
+            httponly=True,        # Not accessible to JavaScript
+            secure=True,          # HTTPS only in production
+            samesite="strict",    # CSRF protection
+            max_age=604800        # 7 days
+        )
+        return response
+        
+    except ValueError as e:
+        # Token verification failed
+        raise HTTPException(status_code=400, detail=f"Invalid Google token: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Google authentication failed: {str(e)}")

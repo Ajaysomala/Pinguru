@@ -1,7 +1,8 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from typing import Optional, List
 from datetime import datetime, timezone
 from enum import Enum
+import re
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
@@ -20,8 +21,24 @@ class TriggerType(str, Enum):
 
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(..., min_length=12)
     instagram_username: Optional[str] = None
+    
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        """Enforce strong password policy: 12+ chars with uppercase, lowercase, number, special char."""
+        if len(v) < 12:
+            raise ValueError('Password must be at least 12 characters long')
+        if not re.search(r'[A-Z]', v):
+            raise ValueError('Password must contain at least one uppercase letter (A-Z)')
+        if not re.search(r'[a-z]', v):
+            raise ValueError('Password must contain at least one lowercase letter (a-z)')
+        if not re.search(r'\d', v):
+            raise ValueError('Password must contain at least one number (0-9)')
+        if not re.search(r'[!@#$%^&*()-_=+\[\]{}|;:,.<>?]', v):
+            raise ValueError('Password must contain at least one special character (!@#$%^&*...)')
+        return v
 
 class UserInDB(BaseModel):
     id: Optional[str] = Field(None, alias="_id")

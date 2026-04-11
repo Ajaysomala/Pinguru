@@ -1,6 +1,7 @@
-# Environment and secrets
+# Environment and secrets - NEVER push this
 .env
-.env.*
+.env.local
+.env.*.local
 !.env.example
 
 # Python virtual environments
@@ -8,6 +9,7 @@
 venv/
 ENV/
 env/
+.env.venv
 
 # Python cache and bytecode
 __pycache__/
@@ -15,27 +17,52 @@ __pycache__/
 *.pyo
 *.pyd
 *.py[cod]
+*$py.class
 
 # Python tooling caches and outputs
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.pylint_cache/
 .coverage
 .coverage.*
 htmlcov/
+.tox/
+.hypothesis/
 
 # Packaging / build
 dist/
 build/
 *.egg-info/
+*.egg
+.installed.cfg
+*.pot
 
 # Logs
 *.log
+logs/
 
 # IDE/editor
 .vscode/
+.vscode/settings.json
 .idea/
+*.swp
+*.swo
+*~
+.sublime-*
 
 # OS files
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
+
+# Project specific
+*.db
+*.sqlite
+*.sqlite3
+node_modules/
+dist/
