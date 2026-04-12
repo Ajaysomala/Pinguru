@@ -1,48 +1,110 @@
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
+import hashlib
+import json
+import secrets
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import json
-from pydantic import BaseModel
-from app.database import get_db
-from app.models.models import UserCreate, PlanType, PLAN_LIMITS, get_plan_type
-from app.config import settings
-from app.services.instagram import InstagramService
-from passlib.context import CryptContext
+import jwt
 from bson import ObjectId
 from bson.errors import InvalidId
-from app.security import limiter
-import jwt
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from google.auth.transport import requests
 from google.oauth2 import id_token
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, field_validator
+
+from app.config import settings
+from app.database import get_db
+from app.models.models import PLAN_LIMITS, PlanType, UserCreate, get_plan_type
+from app.security import limiter
+from app.services.email import send_otp_email
+from app.services.instagram import InstagramService
 
 router = APIRouter()
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-bearer_scheme = HTTPBearer()
+
+
+class UserLoginRequest(BaseModel):
+    email: EmailStr
+    password: str
 
 
 class InstagramTokenRequest(BaseModel):
     access_token: str
     user_id: str | None = None
 
+
 class GoogleAuthRequest(BaseModel):
     id_token: str
+
+
+class OTPVerifyRequest(BaseModel):
+    email: EmailStr
+    otp: str
+
+
+class OTPResendRequest(BaseModel):
+    email: EmailStr
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v: EmailStr) -> str:
+        return str(v).strip().lower()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_aware_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
 
 def hash_password(pw: str) -> str:
     return pwd_ctx.hash(pw)
 
+
 def verify_password(pw: str, hashed: str) -> bool:
     return pwd_ctx.verify(pw, hashed)
 
+
 def create_jwt(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
-    return jwt.encode({"sub": user_id, "exp": expire}, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+    expire = _utcnow() + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
+    payload = {"sub": user_id, "exp": expire}
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+
+def _set_auth_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key="pg_token",
+        value=token,
+        httponly=True,
+        secure=settings.ENVIRONMENT.lower() == "production",
+        samesite="lax",
+        max_age=604800,
+        path="/",
+    )
+
+
+def _clear_auth_cookie(response: Response) -> None:
+    response.delete_cookie(key="pg_token", path="/")
+
+
+def generate_otp() -> str:
+    return f"{secrets.randbelow(900000) + 100000:06d}"
+
+
+def hash_otp(otp: str) -> str:
+    return hashlib.sha256(otp.encode("utf-8")).hexdigest()
 
 
 def create_oauth_state(user_id: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=10)
+    expire = _utcnow() + timedelta(minutes=10)
     payload = {"sub": user_id, "exp": expire, "type": "instagram_oauth_state"}
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
@@ -63,82 +125,246 @@ def decode_oauth_state(state: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
     return user_id
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db=Depends(get_db)
-):
-    """Proper FastAPI dependency — use with Depends(get_current_user) in any route."""
-    token = credentials.credentials
+
+async def get_current_user(request: Request, db=Depends(get_db)):
+    """Supports cookie-first auth with Bearer fallback for compatibility."""
+    token = request.cookies.get("pg_token")
+
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
     try:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token payload")
+
         user = await db.users.find_one({"_id": ObjectId(user_id)})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
-    except InvalidId:
+    except (InvalidId, jwt.InvalidTokenError):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+
 
 # ── Register ──────────────────────────────────────────────────────────────────
 
 @router.post("/register")
 @limiter.limit("5/minute")
 async def register(request: Request, data: UserCreate, db=Depends(get_db)):
-    existing = await db.users.find_one({"email": data.email})
-    if existing:
+    email = str(data.email).strip().lower()
+    existing = await db.users.find_one({"email": email})
+
+    if existing and existing.get("email_verified", False):
         raise HTTPException(status_code=400, detail="Email already registered")
-    user_doc = {
-        "email": data.email,
-        "hashed_password": hash_password(data.password),
-        "plan": PlanType.Free,
-        "dm_limit": PLAN_LIMITS[PlanType.Free]["dm_limit"],
-        "dm_count_this_month": 0,
-        "is_active": True,
-        "created_at": datetime.now(timezone.utc),
+
+    otp = generate_otp()
+    otp_expires = _utcnow() + timedelta(minutes=5)
+
+    if existing and not existing.get("email_verified", False):
+        await db.users.update_one(
+            {"_id": existing["_id"]},
+            {
+                "$set": {
+                    "hashed_password": hash_password(data.password),
+                    "otp_hash": hash_otp(otp),
+                    "otp_expires_at": otp_expires,
+                    "otp_attempts": 0,
+                    "otp_resend_window_started_at": _utcnow(),
+                    "otp_resend_count": 1,
+                    "updated_at": _utcnow(),
+                }
+            },
+        )
+    else:
+        user_doc = {
+            "email": email,
+            "hashed_password": hash_password(data.password),
+            "plan": PlanType.Free,
+            "dm_limit": PLAN_LIMITS[PlanType.Free]["dm_limit"],
+            "dm_count_this_month": 0,
+            "is_active": True,
+            "email_verified": False,
+            "otp_hash": hash_otp(otp),
+            "otp_expires_at": otp_expires,
+            "otp_attempts": 0,
+            "otp_resend_window_started_at": _utcnow(),
+            "otp_resend_count": 1,
+            "created_at": _utcnow(),
+        }
+        await db.users.insert_one(user_doc)
+
+    otp_sent = await send_otp_email(email, otp)
+    if not otp_sent:
+        raise HTTPException(status_code=503, detail="Failed to send OTP email. Try again in a moment.")
+
+    return {
+        "message": "Account created. Check your email for verification code.",
+        "email": email,
+        "otp_expires_in_seconds": 300,
     }
-    result = await db.users.insert_one(user_doc)
-    token = create_jwt(str(result.inserted_id))
-    
-    # Return httpOnly cookie instead of token in response body
-    response = Response(json.dumps({"message": "Account created ✅"}), media_type="application/json")
-    response.set_cookie(
-        key="pg_token",
-        value=token,
-        httponly=True,        # Not accessible to JavaScript (prevents XSS token theft)
-        secure=True,          # HTTPS only in production
-        samesite="strict",    # CSRF protection
-        max_age=604800        # 7 days (same as JWT expiry)
+
+
+# ── Email Verification ────────────────────────────────────────────────────────
+
+@router.post("/verify-email")
+@limiter.limit("10/minute")
+async def verify_email(request: Request, data: OTPVerifyRequest, db=Depends(get_db)):
+    email = str(data.email).strip().lower()
+    otp = data.otp.strip()
+
+    if len(otp) != 6 or not otp.isdigit():
+        raise HTTPException(status_code=400, detail="OTP must be a 6-digit code")
+
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user.get("email_verified"):
+        token = create_jwt(str(user["_id"]))
+        response = Response(
+            json.dumps({
+                "message": "Already verified",
+                "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
+                "instagram_connected": bool(user.get("instagram_user_id")),
+            }),
+            media_type="application/json",
+        )
+        _set_auth_cookie(response, token)
+        return response
+
+    if int(user.get("otp_attempts", 0)) >= 3:
+        raise HTTPException(status_code=429, detail="Too many invalid attempts. Request a new code.")
+
+    otp_expires_at = _as_aware_utc(user.get("otp_expires_at"))
+    if not otp_expires_at or _utcnow() > otp_expires_at:
+        raise HTTPException(status_code=400, detail="Code expired. Request a new one.")
+
+    expected_hash = user.get("otp_hash")
+    if not expected_hash or hash_otp(otp) != expected_hash:
+        await db.users.update_one({"_id": user["_id"]}, {"$inc": {"otp_attempts": 1}})
+        raise HTTPException(status_code=400, detail="Invalid verification code")
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "email_verified": True,
+                "otp_hash": None,
+                "otp_expires_at": None,
+                "otp_attempts": 0,
+                "otp_resend_count": 0,
+                "otp_resend_window_started_at": None,
+            }
+        },
     )
+
+    token = create_jwt(str(user["_id"]))
+    response = Response(
+        json.dumps({
+            "message": "Email verified",
+            "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
+            "instagram_connected": bool(user.get("instagram_user_id")),
+        }),
+        media_type="application/json",
+    )
+    _set_auth_cookie(response, token)
     return response
 
-# ── Login ─────────────────────────────────────────────────────────────────────
+
+@router.post("/resend-otp")
+@limiter.limit("20/minute")
+async def resend_otp(request: Request, data: OTPResendRequest, db=Depends(get_db)):
+    email = str(data.email).strip().lower()
+    user = await db.users.find_one({"email": email})
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user.get("email_verified"):
+        return {"message": "Already verified"}
+
+    now = _utcnow()
+    window_start = _as_aware_utc(user.get("otp_resend_window_started_at"))
+    resend_count = int(user.get("otp_resend_count", 0))
+
+    if not window_start or now > window_start + timedelta(hours=1):
+        resend_count = 0
+        window_start = now
+
+    if resend_count >= 3:
+        raise HTTPException(status_code=429, detail="Resend limit reached. Try again in 1 hour.")
+
+    otp = generate_otp()
+    otp_expires = now + timedelta(minutes=5)
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "otp_hash": hash_otp(otp),
+                "otp_expires_at": otp_expires,
+                "otp_attempts": 0,
+                "otp_resend_window_started_at": window_start,
+                "otp_resend_count": resend_count + 1,
+            }
+        },
+    )
+
+    otp_sent = await send_otp_email(email, otp)
+    if not otp_sent:
+        raise HTTPException(status_code=503, detail="Failed to send OTP email. Try again later.")
+
+    return {"message": "New verification code sent", "otp_expires_in_seconds": 300}
+
+
+# ── Login / Session ───────────────────────────────────────────────────────────
 
 @router.post("/login")
 @limiter.limit("10/minute")
-async def login(request: Request, data: UserCreate, db=Depends(get_db)):
-    user = await db.users.find_one({"email": data.email})
+async def login(request: Request, data: UserLoginRequest, db=Depends(get_db)):
+    email = str(data.email).strip().lower()
+    user = await db.users.find_one({"email": email})
+
     if not user or not verify_password(data.password, user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    if not user.get("email_verified", False):
+        raise HTTPException(status_code=403, detail="Email not verified. Check your inbox for OTP.")
+
     token = create_jwt(str(user["_id"]))
-    
-    # Return httpOnly cookie instead of token in response body
-    response_data = {"plan": get_plan_type(user["plan"]).name, "instagram_connected": bool(user.get("instagram_user_id"))}
+    response_data = {
+        "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
+        "instagram_connected": bool(user.get("instagram_user_id")),
+    }
     response = Response(json.dumps(response_data), media_type="application/json")
-    response.set_cookie(
-        key="pg_token",
-        value=token,
-        httponly=True,        # Not accessible to JavaScript (prevents XSS token theft)
-        secure=True,          # HTTPS only in production
-        samesite="strict",    # CSRF protection
-        max_age=604800        # 7 days (same as JWT expiry)
-    )
+    _set_auth_cookie(response, token)
     return response
+
+
+@router.get("/me")
+async def me(user=Depends(get_current_user)):
+    return {
+        "email": user.get("email"),
+        "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
+        "instagram_connected": bool(user.get("instagram_user_id")),
+        "email_verified": bool(user.get("email_verified", False)),
+    }
+
+
+@router.post("/logout")
+async def logout():
+    response = Response(json.dumps({"message": "Logged out"}), media_type="application/json")
+    _clear_auth_cookie(response)
+    return response
+
 
 # ── Instagram OAuth ───────────────────────────────────────────────────────────
 
@@ -157,6 +383,7 @@ async def instagram_initiate(user=Depends(get_current_user)):
     )
     oauth_url = f"https://www.facebook.com/v19.0/dialog/oauth?{params}"
     return {"auth_url": oauth_url}
+
 
 @router.get("/instagram/callback")
 async def instagram_callback(
@@ -190,18 +417,20 @@ async def instagram_callback(
 
     profile = await InstagramService.get_user_profile(access_token)
     expires_in = token_data.get("expires_in", 5183944)
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    expires_at = _utcnow() + timedelta(seconds=expires_in)
     encrypted_access_token = InstagramService.encrypt_access_token(access_token)
 
     await db.users.update_one(
         {"_id": user["_id"]},
-        {"$set": {
-            "instagram_user_id": profile.get("id"),
-            "instagram_access_token": encrypted_access_token,
-            "ig_token_expires_at": expires_at,
-        }}
+        {
+            "$set": {
+                "instagram_user_id": profile.get("id"),
+                "instagram_access_token": encrypted_access_token,
+                "ig_token_expires_at": expires_at,
+            }
+        },
     )
-    return {"status": "Instagram connected ✅", "profile": profile}
+    return {"status": "Instagram connected", "profile": profile}
 
 
 @router.post("/instagram/token")
@@ -210,14 +439,6 @@ async def save_instagram_token(
     db=Depends(get_db),
     x_admin_key: str = Header(None),
 ):
-    """Save Instagram token via POST body (NOT URL query string).
-    
-    Security fix: Token moved from URL to POST body + Bearer header to avoid:
-    - Exposure in browser history
-    - Exposure in server logs
-    - Exposure in proxy logs
-    - Exposure in network analysis tools
-    """
     if x_admin_key != settings.admin_api_key:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -225,10 +446,9 @@ async def save_instagram_token(
     if not access_token:
         raise HTTPException(status_code=400, detail="access_token is required")
 
-    # Token passed via Authorization header (Bearer), not in URL query string
     url = "https://graph.facebook.com/v19.0/me/accounts?fields=instagram_business_account"
     headers = {"Authorization": f"Bearer {access_token}"}
-    
+
     async with httpx.AsyncClient() as client:
         response = await client.get(url, headers=headers)
         if response.status_code >= 400:
@@ -269,90 +489,69 @@ async def save_instagram_token(
     encrypted_access_token = InstagramService.encrypt_access_token(access_token)
     result = await db.users.update_one(
         update_filter,
-        {"$set": {
-            "instagram_access_token": encrypted_access_token,
-            "instagram_user_id": ig_user_id,
-            "instagram_connected": True
-        }},
+        {
+            "$set": {
+                "instagram_access_token": encrypted_access_token,
+                "instagram_user_id": ig_user_id,
+                "instagram_connected": True,
+            }
+        },
     )
 
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Update failed: User not found after verification")
 
-    return {"status": "Instagram token saved ✅", "instagram_user_id": ig_user_id}
+    return {"status": "Instagram token saved", "instagram_user_id": ig_user_id}
 
 
 # ── Google OAuth ──────────────────────────────────────────────────────────────
 
 @router.post("/google/callback")
 async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
-    """Handle Google OAuth 2.0 callback.
-    
-    Flow:
-    1. Frontend sends ID token from Google Sign-In
-    2. Backend verifies token with Google
-    3. Extract email and basic info
-    4. Create user if new, or link to existing account
-    5. Return httpOnly cookie with JWT
-    """
     try:
-        # Verify ID token with Google
-        idinfo = id_token.verify_oauth2_token(
-            data.id_token,
-            requests.Request(),
-            settings.GOOGLE_CLIENT_ID
-        )
-        
-        # Extract user info from verified token
-        email = idinfo.get('email')
-        name = idinfo.get('name', '')
-        
+        idinfo = id_token.verify_oauth2_token(data.id_token, requests.Request(), settings.GOOGLE_CLIENT_ID)
+        email = (idinfo.get("email") or "").strip().lower()
+
         if not email:
             raise HTTPException(status_code=400, detail="No email in Google profile")
-        
-        # Find or create user
+
         user = await db.users.find_one({"email": email})
-        
+
         if not user:
-            # Create new user account from Google profile
             user_doc = {
                 "email": email,
-                "hashed_password": hash_password(settings.DEFAULT_OAUTH_PASSWORD),  # Placeholder password
+                "hashed_password": hash_password(settings.DEFAULT_OAUTH_PASSWORD),
                 "plan": PlanType.Free,
                 "dm_limit": PLAN_LIMITS[PlanType.Free]["dm_limit"],
                 "dm_count_this_month": 0,
                 "is_active": True,
+                "email_verified": True,
                 "oauth_provider": "google",
-                "created_at": datetime.now(timezone.utc),
+                "created_at": _utcnow(),
             }
             result = await db.users.insert_one(user_doc)
-            user_id = str(result.inserted_id)
-        else:
-            user_id = str(user["_id"])
-        
-        # Create JWT token
-        token = create_jwt(user_id)
-        
-        # Return httpOnly cookie
+            user = await db.users.find_one({"_id": result.inserted_id})
+
+        if not user.get("email_verified", False):
+            await db.users.update_one({"_id": user["_id"]}, {"$set": {"email_verified": True}})
+            user["email_verified"] = True
+
+        token = create_jwt(str(user["_id"]))
         response = Response(
-            json.dumps({
-                "plan": user.get("plan", PlanType.Free),
-                "instagram_connected": bool(user.get("instagram_user_id") if user else None)
-            }),
-            media_type="application/json"
+            json.dumps(
+                {
+                    "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
+                    "instagram_connected": bool(user.get("instagram_user_id")),
+                }
+            ),
+            media_type="application/json",
         )
-        response.set_cookie(
-            key="pg_token",
-            value=token,
-            httponly=True,        # Not accessible to JavaScript
-            secure=True,          # HTTPS only in production
-            samesite="strict",    # CSRF protection
-            max_age=604800        # 7 days
-        )
+        _set_auth_cookie(response, token)
         return response
-        
+
     except ValueError as e:
-        # Token verification failed
         raise HTTPException(status_code=400, detail=f"Invalid Google token: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Google authentication failed: {str(e)}")

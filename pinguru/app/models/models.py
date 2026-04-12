@@ -23,6 +23,19 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=12)
     instagram_username: Optional[str] = None
+
+    @field_validator('email')
+    @classmethod
+    def validate_email_domain(cls, v: EmailStr) -> EmailStr:
+        """Block disposable emails while allowing mainstream providers and business domains."""
+        domain = str(v).split('@')[-1].lower()
+        disposable_domains = {
+            'mailinator.com', '10minutemail.com', 'guerrillamail.com',
+            'temp-mail.org', 'yopmail.com', 'sharklasers.com', 'dispostable.com'
+        }
+        if domain in disposable_domains:
+            raise ValueError('Please use a real email address (disposable emails are not allowed)')
+        return v
     
     @field_validator('password')
     @classmethod
@@ -44,6 +57,12 @@ class UserInDB(BaseModel):
     id: Optional[str] = Field(None, alias="_id")
     email: EmailStr
     hashed_password: str
+    email_verified: bool = False
+    otp_hash: Optional[str] = None
+    otp_expires_at: Optional[datetime] = None
+    otp_attempts: int = 0
+    otp_resend_count: int = 0
+    otp_resend_window_started_at: Optional[datetime] = None
     plan: PlanType = PlanType.Free
     instagram_user_id: Optional[str] = None
     instagram_access_token: Optional[str] = None
