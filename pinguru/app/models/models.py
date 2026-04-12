@@ -41,7 +41,7 @@ class UserCreate(BaseModel):
     @classmethod
     def validate_password(cls, v: str) -> str:
         """Enforce strong password policy: 8+ chars with uppercase, lowercase, number, special char."""
-        if len(v) < 12:
+        if len(v) < 8:
             raise ValueError('Password must be at least 8 characters long')
         if not re.search(r'[A-Z]', v):
             raise ValueError('Password must contain at least one uppercase letter (A-Z)')
