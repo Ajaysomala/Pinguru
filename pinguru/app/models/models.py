@@ -21,7 +21,7 @@ class TriggerType(str, Enum):
 
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str = Field(..., min_length=12)
+    password: str = Field(..., min_length=8)
     instagram_username: Optional[str] = None
 
     @field_validator('email')
