@@ -493,7 +493,6 @@ async def save_instagram_token(
             "$set": {
                 "instagram_access_token": encrypted_access_token,
                 "instagram_user_id": ig_user_id,
-                "instagram_connected": True,
             }
         },
     )
