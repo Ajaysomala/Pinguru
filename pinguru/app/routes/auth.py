@@ -555,26 +555,3 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Google authentication failed: {str(e)}")
-
-#----------- Cluade--------------------------------------------------------------------------------------
-
-@router.get("/me")
-async def get_me(request: Request, db=Depends(get_db)):
-    token = request.cookies.get("pg_token")
-    if not token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    try:
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
-        user_id = payload.get("sub")
-        user = await db.users.find_one({"_id": ObjectId(user_id)})
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        return {
-            "email": user["email"],
-            "plan": user.get("plan", "free"),
-            "instagram_connected": bool(user.get("instagram_user_id"))
-        }
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
