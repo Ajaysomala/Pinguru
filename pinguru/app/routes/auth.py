@@ -381,7 +381,7 @@ async def instagram_initiate(user=Depends(get_current_user)):
             "state": state,
         }
     )
-    oauth_url = f"https://www.facebook.com/v19.0/dialog/oauth?{params}"
+    oauth_url = f"https://www.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSION}/dialog/oauth?{params}"
     return {"auth_url": oauth_url}
 
 
@@ -446,7 +446,7 @@ async def save_instagram_token(
     if not access_token:
         raise HTTPException(status_code=400, detail="access_token is required")
 
-    url = "https://graph.facebook.com/v19.0/me/accounts?fields=instagram_business_account"
+    url = f"https://graph.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSION}/me/accounts?fields=instagram_business_account"
     headers = {"Authorization": f"Bearer {access_token}"}
 
     async with httpx.AsyncClient() as client:
