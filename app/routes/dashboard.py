@@ -9,11 +9,16 @@ router = APIRouter()
 
 @router.get("/stats")
 async def get_stats(db=Depends(get_db), user=Depends(get_current_user)):
-    user_id = str(user["_id"])
+   user_id = str(user["_id"])
     start_of_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    dm_logs = await db.dm_logs.find({"user_id": user_id, "sent_at": {"$gte": start_of_month}}).to_list(10000)
-    total_sent   = len([d for d in dm_logs if d["status"] == "sent"])
-    total_failed = len([d for d in dm_logs if d["status"] == "failed"])
+    pipeline = [
+        {"$match": {"user_id": user_id, "sent_at": {"$gte": start_of_month}}},
+        {"$group": {"_id": "$status", "count": {"$sum": 1}}}
+    ]
+    agg = await db.dm_logs.aggregate(pipeline).to_list(10)
+    counts = {r["_id"]: r["count"] for r in agg}
+    total_sent   = counts.get("sent", 0)
+    total_failed = counts.get("failed", 0)
     active_rules = await db.automation_rules.count_documents({"user_id": user_id, "is_active": True})
     plan_type = get_plan_type(user.get("plan", PlanType.Free))
     plan_limits  = get_plan_limits(plan_type)

@@ -182,6 +182,7 @@ async def _send_rule_reply(db, user: dict[str, Any], recipient_id: str, rule: di
 
     if result["success"]:
         await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
+        await db.automation_rules.update_one({"_id": rule["_id"]}, {"$inc": {"sent_count": 1}})
 
 
 async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) -> dict[str, int]:

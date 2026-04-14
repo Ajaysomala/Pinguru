@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     META_APP_ID: str
     META_APP_SECRET: str
     META_WEBHOOK_VERIFY_TOKEN: str
-    INSTAGRAM_GRAPH_API_VERSION: str = "v19.0"
+    INSTAGRAM_GRAPH_API_VERSION: str = "v22.0"
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
     JWT_SECRET: str
@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     ADMIN_EMAIL: str = ""
     ADMIN_PASSWORD_HASH: str = ""
     GOOGLE_CLIENT_ID: str = ""
-    DEFAULT_OAUTH_PASSWORD: str = "TempOAuth2024!"
+    DEFAULT_OAUTH_PASSWORD: str = ""
     RESEND_API_KEY: str = ""
     SMTP_EMAIL: str = ""
     SMTP_APP_PASSWORD: str = ""
