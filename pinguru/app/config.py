@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     ADMIN_EMAIL: str = ""
     ADMIN_PASSWORD_HASH: str = ""
     GOOGLE_CLIENT_ID: str = ""
-    DEFAULT_OAUTH_PASSWORD: str = "TempOAuth2024!"
+    DEFAULT_OAUTH_PASSWORD: str = ""
     RESEND_API_KEY: str = ""
     SMTP_EMAIL: str = ""
     SMTP_APP_PASSWORD: str = ""
