@@ -88,3 +88,4 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+print(f"DEBUG: Meta App ID is loaded as: {settings.META_APP_ID}")
