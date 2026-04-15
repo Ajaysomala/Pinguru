@@ -382,7 +382,7 @@ async def instagram_initiate(user=Depends(get_current_user)):
         "state": state,
         "response_type": "code",
         # REPLACE 'YOUR_CONFIG_ID' with the numeric ID from your dashboard
-        "config_id": "1432484434785544", # Paste your actual numeric ID here
+        "config_id": settings.META_CONFIG_ID, # Paste your actual numeric ID here
         "scope": "instagram_basic,instagram_manage_messages,instagram_manage_comments,pages_show_list,pages_read_engagement"
     })
     
