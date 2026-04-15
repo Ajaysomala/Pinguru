@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     META_APP_ID: str
     META_APP_SECRET: str
     META_WEBHOOK_VERIFY_TOKEN: str
-    INSTAGRAM_GRAPH_API_VERSION: str = "v22.0"
+    INSTAGRAM_GRAPH_API_VERSION: str = "v21.0"
     STRIPE_SECRET_KEY: str = ""
     STRIPE_WEBHOOK_SECRET: str = ""
     JWT_SECRET: str
