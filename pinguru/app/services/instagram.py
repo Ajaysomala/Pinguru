@@ -63,9 +63,10 @@ class InstagramService:
 
     @staticmethod
     async def exchange_code_for_token(code: str, redirect_uri: str) -> dict:
-        """Exchange OAuth code for short-lived token, then get long-lived token."""
-        # Step 1: short-lived token
-        token_url = f"{BASE}/oauth/access_token"
+        """Exchange OAuth code for short-lived token (Instagram Business Login flow),
+        then exchange for long-lived token (60 days)."""
+        # Step 1: short-lived token via Instagram API endpoint (not Facebook Graph)
+        token_url = "https://api.instagram.com/oauth/access_token"
         async with httpx.AsyncClient() as client:
             resp = await client.post(token_url, data={
                 "client_id": settings.META_APP_ID,
@@ -75,19 +76,28 @@ class InstagramService:
                 "code": code,
             })
             short = resp.json()
+            logger.info(f"Short-lived token response status: {resp.status_code}")
             if "access_token" not in short:
                 return {"success": False, "error": short}
 
-        # Step 2: exchange for long-lived token (60 days)
-        ll_url = f"{BASE}/oauth/access_token"
+        # Step 2: exchange for long-lived token (60 days) via Graph API
+        ll_url = f"{BASE}/access_token"
         async with httpx.AsyncClient() as client:
             resp = await client.get(ll_url, params={
-                "grant_type": "fb_exchange_token",
-                "client_id": settings.META_APP_ID,
+                "grant_type": "ig_exchange_token",
                 "client_secret": settings.META_APP_SECRET,
-                "fb_exchange_token": short["access_token"],
+                "access_token": short["access_token"],
             })
-            return {"success": True, "token_data": resp.json()}
+            ll_data = resp.json()
+            logger.info(f"Long-lived token response status: {resp.status_code}")
+            if "access_token" not in ll_data:
+                # Fall back to short-lived token if long-lived exchange fails
+                logger.warning("Long-lived token exchange failed, using short-lived token")
+                return {"success": True, "token_data": {
+                    "access_token": short["access_token"],
+                    "expires_in": 3600,
+                }}
+            return {"success": True, "token_data": ll_data}
 
     @staticmethod
     async def reply_to_comment(access_token: str, comment_id: str, message: str) -> dict:
