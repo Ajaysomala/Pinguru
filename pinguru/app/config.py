@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     DB_NAME: str = "pinguru"
     META_APP_ID: str
     META_APP_SECRET: str
+    INSTAGRAM_CLIENT_ID: str
+    INSTAGRAM_CLIENT_SECRET: str
     META_WEBHOOK_VERIFY_TOKEN: str
     INSTAGRAM_GRAPH_API_VERSION: str = "v22.0"
     STRIPE_SECRET_KEY: str = ""
