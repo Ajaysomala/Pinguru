@@ -374,24 +374,39 @@ async def instagram_initiate(user=Depends(get_current_user)):
     redirect_uri = f"{settings.BASE_URL}/auth/instagram/callback"
     params = urlencode(
         {
-            # Add a fallback to os.getenv just in case the settings class missed it
-            "client_id": settings.META_APP_ID or os.getenv("META_APP_ID"),
+            "force_reauth": "true",
+            "client_id": settings.META_APP_ID,
             "redirect_uri": redirect_uri,
             "scope": "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments",
             "response_type": "code",
             "state": state,
         }
     )
-    oauth_url = f"https://www.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSION}/dialog/oauth?{params}"
+    # Instagram Business Login (not Facebook dialog — different flow)
+    oauth_url = f"https://www.instagram.com/oauth/authorize?{params}"
     return {"auth_url": oauth_url}
 
 
 @router.get("/instagram/callback")
 async def instagram_callback(
-    code: str,
+    request: Request,
+    code: str | None = None,
     state: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
     db=Depends(get_db),
 ):
+    # Meta sends error_code + error_message when redirect URI is blocked or user denies
+    if error_code:
+        frontend_url = settings.FRONTEND_URL or "https://pinguru.me"
+        from fastapi.responses import RedirectResponse
+        from urllib.parse import quote
+        msg = quote(error_message or "Instagram connection failed")
+        return RedirectResponse(url=f"{frontend_url}/connect.html?ig_error={msg}")
+
+    if not code:
+        raise HTTPException(status_code=400, detail="No authorization code received")
+
     if not state:
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
@@ -431,7 +446,10 @@ async def instagram_callback(
             }
         },
     )
-    return {"status": "Instagram connected", "profile": profile}
+    # Redirect back to frontend connect page with success flag
+    from fastapi.responses import RedirectResponse
+    frontend_url = settings.FRONTEND_URL or "https://pinguru.me"
+    return RedirectResponse(url=f"{frontend_url}/connect.html?ig_connected=true")
 
 
 @router.post("/instagram/token")
@@ -555,4 +573,3 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Google authentication failed: {str(e)}")
-print(settings.META_APP_ID)
