@@ -374,6 +374,7 @@ async def instagram_initiate(user=Depends(get_current_user)):
     redirect_uri = f"{settings.BASE_URL}/auth/instagram/callback"
     params = urlencode(
         {
+            "force_reauth": "true",
             "client_id": settings.META_APP_ID,
             "redirect_uri": redirect_uri,
             "scope": "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments",
@@ -381,7 +382,8 @@ async def instagram_initiate(user=Depends(get_current_user)):
             "state": state,
         }
     )
-    oauth_url = f"https://www.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSION}/dialog/oauth?{params}"
+    # Instagram Business Login (not Facebook dialog — different flow)
+    oauth_url = f"https://www.instagram.com/oauth/authorize?{params}"
     return {"auth_url": oauth_url}
 
 
@@ -430,7 +432,10 @@ async def instagram_callback(
             }
         },
     )
-    return {"status": "Instagram connected", "profile": profile}
+    # Redirect back to frontend connect page with success flag
+    from fastapi.responses import RedirectResponse
+    frontend_url = settings.FRONTEND_URL or "https://pinguru.me"
+    return RedirectResponse(url=f"{frontend_url}/connect.html?ig_connected=true")
 
 
 @router.post("/instagram/token")
