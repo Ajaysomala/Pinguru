@@ -375,7 +375,7 @@ async def instagram_initiate(user=Depends(get_current_user)):
     params = urlencode(
         {
             "force_reauth": "true",
-            "client_id": settings.META_APP_ID,
+            "client_id": META_APP_ID,
             "redirect_uri": redirect_uri,
             "scope": "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments",
             "response_type": "code",
