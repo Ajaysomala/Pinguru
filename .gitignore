@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Environment and secrets - NEVER push this
 .env
 .env.local
@@ -12,11 +13,21 @@ env/
 .env.venv
 
 # Python cache and bytecode
+=======
+# Environment - NEVER push this (contains secrets)
+.env
+.env.local
+.env.*.local
+
+# Python
+venv/
+>>>>>>> 28f7c3eee10db4052a66f5020d11d2ba7e03a314
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.py[cod]
+<<<<<<< HEAD
 *$py.class
 
 # Python tooling caches and outputs
@@ -45,13 +56,35 @@ logs/
 # IDE/editor
 .vscode/
 .vscode/settings.json
+=======
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.egg-info/
+dist/
+build/
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# IDE / Editor
+.vscode/
+>>>>>>> 28f7c3eee10db4052a66f5020d11d2ba7e03a314
 .idea/
 *.swp
 *.swo
 *~
+<<<<<<< HEAD
 .sublime-*
 
 # OS files
+=======
+
+# OS
+>>>>>>> 28f7c3eee10db4052a66f5020d11d2ba7e03a314
 .DS_Store
 .DS_Store?
 ._*
@@ -60,9 +93,16 @@ logs/
 ehthumbs.db
 Thumbs.db
 
+<<<<<<< HEAD
 # Project specific
 *.db
 *.sqlite
 *.sqlite3
 node_modules/
 dist/
+=======
+# Logs
+logs/
+*.log
+*.log.*
+>>>>>>> 28f7c3eee10db4052a66f5020d11d2ba7e03a314
