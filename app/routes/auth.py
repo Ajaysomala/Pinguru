@@ -372,17 +372,19 @@ async def logout():
 async def instagram_initiate(user=Depends(get_current_user)):
     state = create_oauth_state(str(user["_id"]))
     redirect_uri = f"{settings.BASE_URL}/auth/instagram/callback"
+    # Use IG_APP_ID (Instagram sub-app) for instagram.com/oauth/authorize
+    # Fall back to META_APP_ID only if IG_APP_ID not set
+    ig_client_id = settings.IG_APP_ID or settings.META_APP_ID
     params = urlencode(
         {
             "force_reauth": "true",
-            "client_id": settings.META_APP_ID,
+            "client_id": ig_client_id,
             "redirect_uri": redirect_uri,
             "scope": "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments",
             "response_type": "code",
             "state": state,
         }
     )
-    # Instagram Business Login (not Facebook dialog — different flow)
     oauth_url = f"https://www.instagram.com/oauth/authorize?{params}"
     return {"auth_url": oauth_url}
 
