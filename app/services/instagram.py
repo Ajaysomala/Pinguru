@@ -83,6 +83,9 @@ class InstagramService:
             if "access_token" not in short:
                 return {"success": False, "error": short}
 
+        # Capture user_id from short token — available here, not in long-lived response
+        short_user_id = str(short.get("user_id") or "")
+
         # Step 2: exchange for long-lived token (60 days) via Graph API
         ll_url = f"{BASE}/access_token"
         async with httpx.AsyncClient() as client:
@@ -99,8 +102,9 @@ class InstagramService:
                 return {"success": True, "token_data": {
                     "access_token": short["access_token"],
                     "expires_in": 3600,
+                    "user_id": short_user_id,
                 }}
-            return {"success": True, "token_data": ll_data}
+            return {"success": True, "token_data": {**ll_data, "user_id": short_user_id}}
 
     @staticmethod
     async def reply_to_comment(access_token: str, comment_id: str, message: str) -> dict:
