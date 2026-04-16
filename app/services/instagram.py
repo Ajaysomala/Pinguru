@@ -65,12 +65,15 @@ class InstagramService:
     async def exchange_code_for_token(code: str, redirect_uri: str) -> dict:
         """Exchange OAuth code for short-lived token (Instagram Business Login flow),
         then exchange for long-lived token (60 days)."""
+        # Use IG_APP_ID/IG_APP_SECRET for token exchange (Instagram sub-app credentials)
+        ig_client_id = settings.IG_APP_ID or settings.META_APP_ID
+        ig_client_secret = settings.IG_APP_SECRET or settings.META_APP_SECRET
         # Step 1: short-lived token via Instagram API endpoint (not Facebook Graph)
         token_url = "https://api.instagram.com/oauth/access_token"
         async with httpx.AsyncClient() as client:
             resp = await client.post(token_url, data={
-                "client_id": settings.META_APP_ID,
-                "client_secret": settings.META_APP_SECRET,
+                "client_id": ig_client_id,
+                "client_secret": ig_client_secret,
                 "grant_type": "authorization_code",
                 "redirect_uri": redirect_uri,
                 "code": code,
@@ -85,7 +88,7 @@ class InstagramService:
         async with httpx.AsyncClient() as client:
             resp = await client.get(ll_url, params={
                 "grant_type": "ig_exchange_token",
-                "client_secret": settings.META_APP_SECRET,
+                "client_secret": ig_client_secret,
                 "access_token": short["access_token"],
             })
             ll_data = resp.json()
