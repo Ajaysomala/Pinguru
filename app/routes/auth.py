@@ -433,7 +433,19 @@ async def instagram_callback(
     if not access_token:
         raise HTTPException(status_code=400, detail="No access token returned")
 
-    profile = await InstagramService.get_user_profile(access_token)
+    # Prefer user_id baked into token_data (from short-lived token response).
+    # Fall back to /me profile call only if missing.
+    ig_user_id = str(token_data.get("user_id") or "").strip()
+    if not ig_user_id:
+        profile = await InstagramService.get_user_profile(access_token)
+        ig_user_id = str(profile.get("id") or "").strip()
+        logger.info(f"IG user_id from /me fallback: {ig_user_id}")
+    else:
+        logger.info(f"IG user_id from token_data: {ig_user_id}")
+
+    if not ig_user_id:
+        raise HTTPException(status_code=400, detail="Could not resolve Instagram user ID")
+
     expires_in = token_data.get("expires_in", 5183944)
     expires_at = _utcnow() + timedelta(seconds=expires_in)
     encrypted_access_token = InstagramService.encrypt_access_token(access_token)
@@ -442,7 +454,7 @@ async def instagram_callback(
         {"_id": user["_id"]},
         {
             "$set": {
-                "instagram_user_id": profile.get("id"),
+                "instagram_user_id": ig_user_id,
                 "instagram_access_token": encrypted_access_token,
                 "ig_token_expires_at": expires_at,
             }
@@ -575,3 +587,75 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Google authentication failed: {str(e)}")
+
+
+# ── Profile Update ─────────────────────────────────────────────────────────────
+
+class ProfileUpdateRequest(BaseModel):
+    first_name: str | None = None
+    last_name: str | None = None
+    business_category: str | None = None
+    onboarding_complete: bool | None = None
+
+
+@router.patch("/profile")
+async def update_profile(
+    data: ProfileUpdateRequest,
+    response: Response,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    update: dict = {}
+    if data.first_name is not None:
+        update["first_name"] = data.first_name.strip()[:80]
+    if data.last_name is not None:
+        update["last_name"] = data.last_name.strip()[:80]
+    if data.business_category is not None:
+        update["business_category"] = data.business_category.strip()[:100]
+    if data.onboarding_complete is not None:
+        update["onboarding_complete"] = data.onboarding_complete
+
+    if update:
+        await db.users.update_one({"_id": user["_id"]}, {"$set": update})
+
+    updated = await db.users.find_one({"_id": user["_id"]})
+    return {
+        "email": updated.get("email"),
+        "first_name": updated.get("first_name", ""),
+        "last_name": updated.get("last_name", ""),
+        "business_category": updated.get("business_category", ""),
+        "onboarding_complete": updated.get("onboarding_complete", False),
+        "plan": get_plan_type(updated.get("plan", PlanType.Free)).name,
+        "instagram_connected": bool(updated.get("instagram_user_id")),
+        "email_verified": bool(updated.get("email_verified", False)),
+    }
+
+
+# ── Data Deletion ──────────────────────────────────────────────────────────────
+
+@router.post("/data-deletion")
+async def request_data_deletion(
+    response: Response,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    user_id_str = str(user["_id"])
+    await db.automation_rules.delete_many({"user_id": user_id_str})
+    await db.dm_logs.delete_many({"user_id": user_id_str})
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "instagram_user_id": None,
+                "instagram_access_token": None,
+                "ig_token_expires_at": None,
+            },
+            "$unset": {
+                "first_name": "",
+                "last_name": "",
+                "business_category": "",
+            },
+        },
+    )
+    _clear_auth_cookie(response)
+    return {"message": "Your data has been deleted. Account deactivated."}
