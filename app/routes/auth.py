@@ -368,26 +368,24 @@ async def logout():
 
 # ── Instagram OAuth ───────────────────────────────────────────────────────────
 
-# ── Instagram OAuth ───────────────────────────────────────────────────────────
-
 @router.get("/instagram/initiate")
 async def instagram_initiate(user=Depends(get_current_user)):
     state = create_oauth_state(str(user["_id"]))
     redirect_uri = f"{settings.BASE_URL}/auth/instagram/callback"
-    
-    # These parameters are specific to Facebook Login for Business
-    params = urlencode({
-        "client_id": settings.META_APP_ID, 
-        "redirect_uri": redirect_uri,
-        "state": state,
-        "response_type": "code",
-        # REPLACE 'YOUR_CONFIG_ID' with the numeric ID from your dashboard
-        "config_id": settings.META_CONFIG_ID, # Paste your actual numeric ID here
-        "scope": "instagram_basic,instagram_manage_messages,instagram_manage_comments,pages_show_list,pages_read_engagement"
-    })
-    
-    oauth_url = f"https://www.facebook.com/v21.0/dialog/oauth?{params}"
+    params = urlencode(
+        {
+            "force_reauth": "true",
+            "client_id": settings.META_APP_ID,
+            "redirect_uri": redirect_uri,
+            "scope": "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments",
+            "response_type": "code",
+            "state": state,
+        }
+    )
+    # Instagram Business Login (not Facebook dialog — different flow)
+    oauth_url = f"https://www.instagram.com/oauth/authorize?{params}"
     return {"auth_url": oauth_url}
+
 
 @router.get("/instagram/callback")
 async def instagram_callback(
