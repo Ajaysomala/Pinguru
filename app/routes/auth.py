@@ -105,6 +105,27 @@ def hash_otp(otp: str) -> str:
     return hashlib.sha256(otp.encode("utf-8")).hexdigest()
 
 
+def _normalize_text(value: str | None, limit: int) -> str:
+    return (value or "").strip()[:limit]
+
+
+def _build_display_name(first_name: str, last_name: str) -> str:
+    return " ".join(part for part in [first_name, last_name] if part)
+
+
+async def _ensure_unique_instagram_account(db, instagram_user_id: str, current_user_id: ObjectId | None = None) -> None:
+    if not instagram_user_id:
+        return
+
+    query: dict[str, object] = {"instagram_user_id": instagram_user_id}
+    if current_user_id is not None:
+        query["_id"] = {"$ne": current_user_id}
+
+    linked_user = await db.users.find_one(query)
+    if linked_user:
+        raise HTTPException(status_code=409, detail="That Instagram account is already connected to another user")
+
+
 def create_oauth_state(user_id: str) -> str:
     expire = _utcnow() + timedelta(minutes=10)
     payload = {"sub": user_id, "exp": expire, "type": "instagram_oauth_state"}
@@ -164,44 +185,39 @@ async def register(request: Request, data: UserCreate, db=Depends(get_db)):
     email = str(data.email).strip().lower()
     existing = await db.users.find_one({"email": email})
 
-    if existing and existing.get("email_verified", False):
-        raise HTTPException(status_code=400, detail="Email already registered")
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered. Please sign in or verify your account.")
 
     otp = generate_otp()
     otp_expires = _utcnow() + timedelta(minutes=5)
 
-    if existing and not existing.get("email_verified", False):
-        await db.users.update_one(
-            {"_id": existing["_id"]},
-            {
-                "$set": {
-                    "hashed_password": hash_password(data.password),
-                    "otp_hash": hash_otp(otp),
-                    "otp_expires_at": otp_expires,
-                    "otp_attempts": 0,
-                    "otp_resend_window_started_at": _utcnow(),
-                    "otp_resend_count": 1,
-                    "updated_at": _utcnow(),
-                }
-            },
-        )
-    else:
-        user_doc = {
-            "email": email,
-            "hashed_password": hash_password(data.password),
-            "plan": PlanType.Free,
-            "dm_limit": PLAN_LIMITS[PlanType.Free]["dm_limit"],
-            "dm_count_this_month": 0,
-            "is_active": True,
-            "email_verified": False,
-            "otp_hash": hash_otp(otp),
-            "otp_expires_at": otp_expires,
-            "otp_attempts": 0,
-            "otp_resend_window_started_at": _utcnow(),
-            "otp_resend_count": 1,
-            "created_at": _utcnow(),
-        }
-        await db.users.insert_one(user_doc)
+    first_name = _normalize_text(data.first_name, 80)
+    last_name = _normalize_text(data.last_name, 80)
+    business_category = _normalize_text(data.business_category, 100)
+    instagram_username = _normalize_text(data.instagram_username, 100)
+    display_name = _build_display_name(first_name, last_name)
+
+    user_doc = {
+        "email": email,
+        "hashed_password": hash_password(data.password),
+        "plan": PlanType.Free,
+        "dm_limit": PLAN_LIMITS[PlanType.Free]["dm_limit"],
+        "dm_count_this_month": 0,
+        "is_active": True,
+        "email_verified": False,
+        "otp_hash": hash_otp(otp),
+        "otp_expires_at": otp_expires,
+        "otp_attempts": 0,
+        "otp_resend_window_started_at": _utcnow(),
+        "otp_resend_count": 1,
+        "created_at": _utcnow(),
+        "first_name": first_name,
+        "last_name": last_name,
+        "business_category": business_category,
+        "instagram_username": instagram_username,
+        "display_name": display_name,
+    }
+    await db.users.insert_one(user_doc)
 
     otp_sent = await send_otp_email(email, otp)
     if not otp_sent:
@@ -437,7 +453,7 @@ async def instagram_callback(
     redirect_uri = f"{settings.BASE_URL}/auth/instagram/callback"
     result = await InstagramService.exchange_code_for_token(code, redirect_uri)
     if not result["success"]:
-        raise HTTPException(status_code=400, detail=f"Token exchange failed: {result.get('error')}")
+        raise HTTPException(status_code=400, detail="Instagram connection failed. Please try again.")
 
     token_data = result["token_data"]
     access_token = token_data.get("access_token")
@@ -456,6 +472,8 @@ async def instagram_callback(
 
     if not ig_user_id:
         raise HTTPException(status_code=400, detail="Could not resolve Instagram user ID")
+
+    await _ensure_unique_instagram_account(db, ig_user_id, user["_id"])
 
     expires_in = token_data.get("expires_in", 5183944)
     expires_at = _utcnow() + timedelta(seconds=expires_in)
@@ -494,10 +512,10 @@ async def save_instagram_token(
     url = f"https://graph.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSION}/me/accounts?fields=instagram_business_account"
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0)) as client:
         response = await client.get(url, headers=headers)
         if response.status_code >= 400:
-            raise HTTPException(status_code=400, detail="Invalid or expired access token")
+            raise HTTPException(status_code=400, detail="Instagram connection failed. Invalid or expired access token.")
         profile = response.json()
 
     ig_user_id = None
@@ -531,6 +549,8 @@ async def save_instagram_token(
             detail="No matching user found. Provide user_id to link token to an existing account.",
         )
 
+    await _ensure_unique_instagram_account(db, ig_user_id, update_filter["_id"])
+
     encrypted_access_token = InstagramService.encrypt_access_token(access_token)
     result = await db.users.update_one(
         update_filter,
@@ -555,6 +575,9 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
     try:
         idinfo = id_token.verify_oauth2_token(data.id_token, requests.Request(), settings.GOOGLE_CLIENT_ID)
         email = (idinfo.get("email") or "").strip().lower()
+        first_name = _normalize_text(idinfo.get("given_name"), 80)
+        last_name = _normalize_text(idinfo.get("family_name"), 80)
+        display_name = _build_display_name(first_name, last_name) or _normalize_text(idinfo.get("name"), 160)
 
         if not email:
             raise HTTPException(status_code=400, detail="No email in Google profile")
@@ -572,6 +595,9 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
                 "email_verified": True,
                 "oauth_provider": "google",
                 "created_at": _utcnow(),
+                "first_name": first_name,
+                "last_name": last_name,
+                "display_name": display_name,
             }
             result = await db.users.insert_one(user_doc)
             user = await db.users.find_one({"_id": result.inserted_id})
@@ -594,11 +620,11 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
         return response
 
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid Google token: {str(e)}")
+        raise HTTPException(status_code=400, detail="Google authentication failed.")
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Google authentication failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Google authentication failed.")
 
 
 # ── Profile Update ─────────────────────────────────────────────────────────────

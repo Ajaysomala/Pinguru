@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
+from pydantic import model_validator
 
 
 class Settings(BaseSettings):
@@ -43,6 +44,13 @@ class Settings(BaseSettings):
     OTP_FROM_EMAIL: str = ""
     ENVIRONMENT: str = "development"
     DISABLE_WEBHOOK_SIGNATURE: bool = False
+
+    @model_validator(mode="after")
+    def validate_production_settings(self):
+        environment = (self.ENVIRONMENT or "").strip().lower()
+        if environment == "production" and not (self.FRONTEND_URL or "").strip():
+            raise ValueError("FRONTEND_URL must be set in production")
+        return self
 
 
 settings = Settings()

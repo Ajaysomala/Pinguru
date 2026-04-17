@@ -6,6 +6,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 BASE = f"https://graph.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSION}"
+HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
 class InstagramService:
 
@@ -39,15 +40,23 @@ class InstagramService:
             "message": {"text": message},
             "access_token": access_token,
         }
-        logger.info(f"DM request payload: {payload}")
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload)
+        logger.info("Sending Instagram DM request")
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                resp = await client.post(url, json=payload)
+        except httpx.RequestError:
+            logger.exception("Instagram DM request failed")
+            return {"success": False, "error": "Instagram API request failed"}
+
+        try:
             data = resp.json()
-            if resp.status_code != 200:
-                logger.error("DM failed with non-200 response from Instagram API")
-                logger.error(f"DM error response: {resp.text}")
-                return {"success": False, "error": data}
-            return {"success": True, "data": data}
+        except ValueError:
+            data = {}
+
+        if resp.status_code != 200:
+            logger.error("DM failed with non-200 response from Instagram API: %s", resp.status_code)
+            return {"success": False, "error": "Instagram API request failed", "status_code": resp.status_code}
+        return {"success": True, "data": data}
 
     @staticmethod
     async def get_user_profile(access_token: str) -> dict:
@@ -57,9 +66,13 @@ class InstagramService:
             "fields": "id,name",
             "access_token": access_token,
         }
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, params=params)
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                resp = await client.get(url, params=params)
             return resp.json()
+        except httpx.RequestError:
+            logger.exception("Instagram profile fetch failed")
+            return {}
 
     @staticmethod
     async def exchange_code_for_token(code: str, redirect_uri: str) -> dict:
@@ -70,32 +83,37 @@ class InstagramService:
         ig_client_secret = settings.IG_APP_SECRET or settings.META_APP_SECRET
         # Step 1: short-lived token via Instagram API endpoint (not Facebook Graph)
         token_url = "https://api.instagram.com/oauth/access_token"
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(token_url, data={
-                "client_id": ig_client_id,
-                "client_secret": ig_client_secret,
-                "grant_type": "authorization_code",
-                "redirect_uri": redirect_uri,
-                "code": code,
-            })
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                resp = await client.post(token_url, data={
+                    "client_id": ig_client_id,
+                    "client_secret": ig_client_secret,
+                    "grant_type": "authorization_code",
+                    "redirect_uri": redirect_uri,
+                    "code": code,
+                })
             short = resp.json()
-            logger.info(f"Short-lived token response status: {resp.status_code}")
+            logger.info("Short-lived token response status: %s", resp.status_code)
             if "access_token" not in short:
-                return {"success": False, "error": short}
+                return {"success": False, "error": "Instagram token exchange failed"}
+        except httpx.RequestError:
+            logger.exception("Instagram short-lived token exchange failed")
+            return {"success": False, "error": "Instagram token exchange failed"}
 
         # Capture user_id from short token — available here, not in long-lived response
         short_user_id = str(short.get("user_id") or "")
 
         # Step 2: exchange for long-lived token (60 days) via Graph API
         ll_url = f"{BASE}/access_token"
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(ll_url, params={
-                "grant_type": "ig_exchange_token",
-                "client_secret": ig_client_secret,
-                "access_token": short["access_token"],
-            })
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                resp = await client.get(ll_url, params={
+                    "grant_type": "ig_exchange_token",
+                    "client_secret": ig_client_secret,
+                    "access_token": short["access_token"],
+                })
             ll_data = resp.json()
-            logger.info(f"Long-lived token response status: {resp.status_code}")
+            logger.info("Long-lived token response status: %s", resp.status_code)
             if "access_token" not in ll_data:
                 # Fall back to short-lived token if long-lived exchange fails
                 logger.warning("Long-lived token exchange failed, using short-lived token")
@@ -105,14 +123,25 @@ class InstagramService:
                     "user_id": short_user_id,
                 }}
             return {"success": True, "token_data": {**ll_data, "user_id": short_user_id}}
+        except httpx.RequestError:
+            logger.exception("Instagram long-lived token exchange failed")
+            return {"success": True, "token_data": {
+                "access_token": short["access_token"],
+                "expires_in": 3600,
+                "user_id": short_user_id,
+            }}
 
     @staticmethod
     async def reply_to_comment(access_token: str, comment_id: str, message: str) -> dict:
         """Reply to an Instagram comment (not DM — comment reply)."""
         url = f"{BASE}/{comment_id}/replies"
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, data={
-                "message": message,
-                "access_token": access_token,
-            })
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                resp = await client.post(url, data={
+                    "message": message,
+                    "access_token": access_token,
+                })
             return resp.json()
+        except httpx.RequestError:
+            logger.exception("Instagram comment reply failed")
+            return {"success": False, "error": "Instagram API request failed"}

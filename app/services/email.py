@@ -43,11 +43,11 @@ async def _send_via_resend(to_email: str, otp: str) -> bool:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0)) as client:
             resp = await client.post("https://api.resend.com/emails", headers=headers, json=payload)
         if resp.status_code in (200, 201, 202):
             return True
-        logger.error("Resend failed: %s %s", resp.status_code, resp.text)
+        logger.error("Resend failed with status code %s", resp.status_code)
         return False
     except Exception:
         logger.exception("Resend email send failed")

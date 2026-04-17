@@ -37,6 +37,9 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=8)
     instagram_username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    business_category: Optional[str] = None
 
     @field_validator('email')
     @classmethod

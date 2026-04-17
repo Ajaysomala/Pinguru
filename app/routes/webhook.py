@@ -198,7 +198,6 @@ async def _send_rule_reply(db, user: dict[str, Any], recipient_id: str, rule: di
 async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) -> dict[str, int]:
     entries = body.get("entry", [])
     logger.info(f"Webhook received: {len(raw_body)} bytes, {len(entries)} entries")
-    logger.info(f"Webhook payload: {body}")
 
     processed_events = 0
     deduped_events = 0
@@ -217,9 +216,7 @@ async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) ->
             sender_id = (messaging.get("sender") or {}).get("id")
             recipient_id = (messaging.get("recipient") or {}).get("id") or ig_id
             message_text = (messaging.get("message") or {}).get("text")
-            logger.info(
-                f"Messaging webhook event: sender_id={sender_id}, recipient_id={recipient_id}, message_text={message_text}"
-            )
+            logger.info("Messaging webhook event received: sender_id=%s, recipient_id=%s", sender_id, recipient_id)
 
             await handle_messaging_event(db, ig_id, messaging)
             processed_events += 1
@@ -370,7 +367,7 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
     if not sender_id or not message_text:
         return
 
-    logger.info(f"DM processing started: sender_id={sender_id}, message_text={message_text}")
+    logger.info("DM processing started: sender_id=%s", sender_id)
 
     if sender_id == ig_account_id:
         return
@@ -409,7 +406,11 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         use_hinglish = match_mode == "hinglish" and user_plan == PlanType.Pro
 
         logger.info(
-            f"DM keyword match run: sender_id={sender_id}, rule_id={rule.get('_id')}, match_mode={match_mode}, use_hinglish={use_hinglish}, keywords={keywords}"
+            "DM keyword match run: sender_id=%s, rule_id=%s, match_mode=%s, use_hinglish=%s",
+            sender_id,
+            rule.get("_id"),
+            match_mode,
+            use_hinglish,
         )
 
         if use_hinglish:
@@ -417,9 +418,7 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         else:
             is_match = any(kw in message_text for kw in keywords)
 
-        logger.info(
-            f"DM keyword match result: sender_id={sender_id}, rule_id={rule.get('_id')}, is_match={is_match}"
-        )
+        logger.info("DM keyword match result: sender_id=%s, rule_id=%s, is_match=%s", sender_id, rule.get("_id"), is_match)
 
         if is_match:
             await _send_rule_reply(db, user, sender_id, rule, TriggerType.KEYWORD)
