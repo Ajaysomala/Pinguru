@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     STRIPE_PRICE_FREE: str = "price_FREE"
     STRIPE_PRICE_STARTER_199: str = "price_STARTER_199"
     STRIPE_PRICE_PRO_399: str = "price_PRO_399"
+    STRIPE_PRICE_STARTER_QUARTERLY: str = ""
+    STRIPE_PRICE_STARTER_ANNUALLY: str = ""
+    STRIPE_PRICE_PRO_QUARTERLY: str = ""
+    STRIPE_PRICE_PRO_ANNUALLY: str = ""
     ENCRYPTION_KEY: str
     admin_api_key: str = ""
     ADMIN_EMAIL: str = ""
