@@ -3,6 +3,8 @@ from urllib.parse import urlencode
 import hashlib
 import json
 import secrets
+import logging
+logger = logging.getLogger(__name__)
 
 import httpx
 import jwt
