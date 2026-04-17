@@ -353,8 +353,15 @@ async def login(request: Request, data: UserLoginRequest, db=Depends(get_db)):
 
 @router.get("/me")
 async def me(user=Depends(get_current_user)):
+    first_name = (user.get("first_name") or "").strip()
+    last_name = (user.get("last_name") or "").strip()
+    full_name = " ".join(part for part in [first_name, last_name] if part)
     return {
         "email": user.get("email"),
+        "first_name": first_name,
+        "last_name": last_name,
+        "business_category": user.get("business_category", ""),
+        "display_name": user.get("display_name") or full_name,
         "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
         "instagram_connected": bool(user.get("instagram_user_id")),
         "instagram_user_id": user.get("instagram_user_id", ""),
