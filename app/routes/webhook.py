@@ -183,6 +183,16 @@ async def _send_rule_reply(db, user: dict[str, Any], recipient_id: str, rule: di
     if result["success"]:
         await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
         await db.automation_rules.update_one({"_id": rule["_id"]}, {"$inc": {"sent_count": 1}})
+        now = datetime.now(timezone.utc)
+        await db.contacts.update_one(
+            {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
+            {
+                "$set": {"last_seen_at": now, "last_triggered_rule_id": str(rule["_id"]), "trigger_type": trigger_type},
+                "$inc": {"dm_count": 1},
+                "$setOnInsert": {"user_id": str(user["_id"]), "ig_user_id": recipient_id, "first_seen_at": now},
+            },
+            upsert=True,
+        )
 
 
 async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) -> dict[str, int]:
