@@ -43,23 +43,46 @@ async def get_plans():
 @router.post("/checkout/{plan}")
 async def create_checkout(
     plan: PlanType,
+    db=Depends(get_db),
     user=Depends(get_current_user),
 ):
     if plan == PlanType.Free:
         raise HTTPException(status_code=400, detail="Cannot checkout free plan")
 
+    current_plan = get_plan_type(user.get("plan", PlanType.Free))
+    order = {PlanType.Free: 0, PlanType.Starter: 1, PlanType.Pro: 2}
+    if order[plan] <= order[current_plan]:
+        raise HTTPException(status_code=400, detail="Only upgrades are allowed")
+
+    stripe_ready = bool((settings.STRIPE_SECRET_KEY or "").strip()) and bool((settings.STRIPE_WEBHOOK_SECRET or "").strip())
+    frontend_base = settings.FRONTEND_URL or settings.BASE_URL
+
+    if not stripe_ready:
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {
+                "$set": {
+                    "plan": plan,
+                    "dm_limit": get_plan_limits(plan).get("dm_limit"),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        return {"checkout_url": f"{frontend_base}/billing?upgraded=true&simulated=true&plan={plan.value}"}
+
     price_id = STRIPE_PRICE_IDS.get(plan)
     if not price_id:
         raise HTTPException(status_code=400, detail="Invalid plan")
 
+    stripe.api_key = settings.STRIPE_SECRET_KEY
     session = stripe.checkout.Session.create(
         payment_method_types=["card"],
         mode="subscription",
         line_items=[{"price": price_id, "quantity": 1}],
         customer_email=user["email"],
         metadata={"user_id": str(user["_id"]), "plan": plan.value},
-        success_url=f"{settings.BASE_URL}/dashboard?upgraded=true",
-        cancel_url=f"{settings.BASE_URL}/plans",
+        success_url=f"{frontend_base}/billing?upgraded=true",
+        cancel_url=f"{frontend_base}/billing",
     )
     return {"checkout_url": session.url}
 

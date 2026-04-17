@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.config import settings
 from app.database import connect_db, disconnect_db
-from app.routes import webhook, auth, automation, dashboard, plans, admin, contacts
+from app.routes import webhook, auth, automation, dashboard, plans, admin, contacts, billing
 from app.security import limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -79,6 +79,7 @@ app.include_router(auth.router,       prefix="/auth",       tags=["Auth"])
 app.include_router(automation.router, prefix="/automation", tags=["Automation"])
 app.include_router(dashboard.router,  prefix="/dashboard",  tags=["Dashboard"])
 app.include_router(plans.router,      prefix="/plans",      tags=["Plans"])
+app.include_router(billing.router,    prefix="/billing",    tags=["Billing"])
 app.include_router(admin.router,      prefix="/admin",      tags=["Admin"])
 app.include_router(contacts.router,   prefix="/contacts",   tags=["Contacts"])
 

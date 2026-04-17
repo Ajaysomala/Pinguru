@@ -375,7 +375,8 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
 
     user_plan = get_plan_type(user.get("plan", PlanType.Free))
     plan_limits = get_plan_limits(user_plan)
-    if user.get("dm_count_this_month", 0) >= plan_limits["dm_limit"]:
+    dm_limit = plan_limits.get("dm_limit")
+    if dm_limit is not None and user.get("dm_count_this_month", 0) >= dm_limit:
         logger.warning("DM limit reached")
         return
 
@@ -431,7 +432,8 @@ async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
 
     user_plan = get_plan_type(user.get("plan", PlanType.Free))
     plan_limits = get_plan_limits(user_plan)
-    if user.get("dm_count_this_month", 0) >= plan_limits["dm_limit"]:
+    dm_limit = plan_limits.get("dm_limit")
+    if dm_limit is not None and user.get("dm_count_this_month", 0) >= dm_limit:
         return
 
     rules = await db.automation_rules.find(
@@ -466,7 +468,8 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
 
     user_plan = get_plan_type(user.get("plan", PlanType.Free))
     plan_limits = get_plan_limits(user_plan)
-    if user.get("dm_count_this_month", 0) >= plan_limits["dm_limit"]:
+    dm_limit = plan_limits.get("dm_limit")
+    if dm_limit is not None and user.get("dm_count_this_month", 0) >= dm_limit:
         return
 
     rules = await db.automation_rules.find(

@@ -22,13 +22,14 @@ async def get_stats(db=Depends(get_db), user=Depends(get_current_user)):
    active_rules = await db.automation_rules.count_documents({"user_id": user_id, "is_active": True})
    plan_type = get_plan_type(user.get("plan", PlanType.Free))
    plan_limits  = get_plan_limits(plan_type)
+   dm_limit = plan_limits.get("dm_limit")
    rule_limit = plan_limits["rules"]
    return {
        "plan": plan_type.name,
        "dm_sent_this_month": total_sent,
        "dm_failed_this_month": total_failed,
-       "dm_limit": plan_limits["dm_limit"],
-       "dm_remaining": max(0, plan_limits["dm_limit"] - total_sent),
+       "dm_limit": dm_limit,
+       "dm_remaining": None if dm_limit is None else max(0, dm_limit - total_sent),
        "active_rules": active_rules,
        "rule_limit": "Unlimited" if rule_limit is None else rule_limit,
        "instagram_connected": bool(user.get("instagram_user_id")),
