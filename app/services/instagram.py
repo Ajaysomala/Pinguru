@@ -5,7 +5,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-BASE = f"https://graph.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSION}"
+BASE_GRAPH_FB = f"https://graph.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSION}"  # for FB Login / admin
+BASE_GRAPH_IG = "https://graph.instagram.com"  # for IG Business Login — NO version in URL
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
 class InstagramService:
@@ -34,7 +35,7 @@ class InstagramService:
     async def send_dm(access_token: str, recipient_ig_id: str, message: str, ig_user_id: str) -> dict:
         """Send a DM to an Instagram user via Graph API."""
         access_token = InstagramService.decrypt_access_token(access_token)
-        url = f"{BASE}/{ig_user_id}/messages"
+        url = f"{BASE_GRAPH_IG}/{ig_user_id}/messages"
         payload = {
             "recipient": {"id": recipient_ig_id},
             "message": {"text": message},
@@ -61,7 +62,7 @@ class InstagramService:
     @staticmethod
     async def get_user_profile(access_token: str) -> dict:
         """Get Instagram business account info."""
-        url = f"{BASE}/me"
+        url = f"{BASE_GRAPH_IG}/me"
         params = {
             "fields": "id,name",
             "access_token": access_token,
@@ -104,7 +105,7 @@ class InstagramService:
         short_user_id = str(short.get("user_id") or "")
 
         # Step 2: exchange for long-lived token (60 days) via Graph API
-        ll_url = f"{BASE}/access_token"
+        ll_url = f"{BASE_GRAPH_IG}/access_token"
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 resp = await client.get(ll_url, params={
@@ -134,7 +135,7 @@ class InstagramService:
     @staticmethod
     async def reply_to_comment(access_token: str, comment_id: str, message: str) -> dict:
         """Reply to an Instagram comment (not DM — comment reply)."""
-        url = f"{BASE}/{comment_id}/replies"
+        url = f"{BASE_GRAPH_IG}/{comment_id}/replies"
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 resp = await client.post(url, data={
@@ -145,3 +146,14 @@ class InstagramService:
         except httpx.RequestError:
             logger.exception("Instagram comment reply failed")
             return {"success": False, "error": "Instagram API request failed"}
+    # Add to instagram.py
+    @staticmethod
+    async def refresh_long_lived_token(access_token: str) -> dict:
+        """Refresh a long-lived token. Call every 30-45 days."""
+        decrypted = InstagramService.decrypt_access_token(access_token)
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{BASE_GRAPH_IG}/refresh_access_token", params={
+                "grant_type": "ig_refresh_token",
+                "access_token": decrypted,
+            })
+            return resp.json()  # returns {access_token, token_type, expires_in}
