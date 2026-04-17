@@ -7,15 +7,29 @@ import re
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 class PlanType(str, Enum):
-    Free = "free"
+    Free    = "free"
     Starter = "starter"
-    Pro = "pro"
+    Pro     = "pro"
 
 class TriggerType(str, Enum):
-    KEYWORD  = "keyword"
-    STORY_REPLY = "story_reply"
+    KEYWORD      = "keyword"
+    STORY_REPLY  = "story_reply"
     POST_COMMENT = "post_comment"
     REEL_COMMENT = "reel_comment"
+
+# ── Contact ───────────────────────────────────────────────────────────────────
+
+class Contact(BaseModel):
+    id: Optional[str] = Field(None, alias="_id")
+    user_id: str
+    ig_user_id: str
+    ig_username: Optional[str] = None
+    display_name: Optional[str] = None
+    last_triggered_rule_id: Optional[str] = None
+    trigger_type: Optional[TriggerType] = None
+    dm_count: int = 0
+    first_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 # ── User ──────────────────────────────────────────────────────────────────────
 
@@ -27,7 +41,6 @@ class UserCreate(BaseModel):
     @field_validator('email')
     @classmethod
     def validate_email_domain(cls, v: EmailStr) -> EmailStr:
-        """Block disposable emails while allowing mainstream providers and business domains."""
         domain = str(v).split('@')[-1].lower()
         disposable_domains = {
             'mailinator.com', '10minutemail.com', 'guerrillamail.com',
@@ -36,11 +49,10 @@ class UserCreate(BaseModel):
         if domain in disposable_domains:
             raise ValueError('Please use a real email address (disposable emails are not allowed)')
         return v
-    
+
     @field_validator('password')
     @classmethod
     def validate_password(cls, v: str) -> str:
-        """Enforce strong password policy: 8+ chars with uppercase, lowercase, number, special char."""
         if len(v) < 8:
             raise ValueError('Password must be at least 8 characters long')
         if not re.search(r'[A-Z]', v):
@@ -68,7 +80,7 @@ class UserInDB(BaseModel):
     instagram_access_token: Optional[str] = None
     ig_token_expires_at: Optional[datetime] = None
     dm_count_this_month: int = 0
-    dm_limit: int = 200         # updated based on plan
+    dm_limit: int = 200
     stripe_customer_id: Optional[str] = None
     stripe_subscription_id: Optional[str] = None
     is_active: bool = True
@@ -81,9 +93,9 @@ class AutomationRule(BaseModel):
     user_id: str
     name: str
     trigger_type: TriggerType
-    keywords: List[str] = []        # for keyword / comment triggers
-    match_mode: str = "exact"      # options: "exact" or "hinglish"
-    reply_message: str              # DM template, supports {{username}}
+    keywords: List[str] = []
+    match_mode: str = "exact"
+    reply_message: str
     is_active: bool = True
     sent_count: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -104,15 +116,15 @@ class DMLog(BaseModel):
     recipient_ig_id: str
     message_sent: str
     trigger_type: TriggerType
-    status: str = "sent"       # sent | failed
+    status: str = "sent"
     sent_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-# ── Plan Info ─────────────────────────────────────────────────────────────────
+# ── Plan Limits ───────────────────────────────────────────────────────────────
 
 PLAN_LIMITS = {
-    PlanType.Free:    {"dm_limit": 200,   "price_inr": 0,   "rules": 1},
-    PlanType.Starter: {"dm_limit": 3000,  "price_inr": 199, "rules": 5},
-    PlanType.Pro:     {"dm_limit": 15000, "price_inr": 399, "rules": None},
+    PlanType.Free:    {"dm_limit": None, "price_inr": 0,   "rules": 5,    "contacts_limit": 500},
+    PlanType.Starter: {"dm_limit": None, "price_inr": 199, "rules": 15,   "contacts_limit": None},
+    PlanType.Pro:     {"dm_limit": None, "price_inr": 499, "rules": None,  "contacts_limit": None},
 }
 
 
