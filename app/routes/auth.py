@@ -357,6 +357,8 @@ async def me(user=Depends(get_current_user)):
         "email": user.get("email"),
         "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
         "instagram_connected": bool(user.get("instagram_user_id")),
+        "instagram_user_id": user.get("instagram_user_id", ""),
+        "instagram_username": user.get("instagram_username", ""),
         "email_verified": bool(user.get("email_verified", False)),
     }
 
@@ -457,6 +459,7 @@ async def instagram_callback(
         {
             "$set": {
                 "instagram_user_id": ig_user_id,
+                "instagram_username": str(token_data.get("username") or ""),
                 "instagram_access_token": encrypted_access_token,
                 "ig_token_expires_at": expires_at,
             }
