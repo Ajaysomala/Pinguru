@@ -347,8 +347,15 @@ async def handle_change_event(db, ig_account_id: str, change: dict):
 
 
 async def handle_dm_event(db, ig_account_id: str, messaging: dict):
+    message_obj = messaging.get("message", {})
+
+    # Ignore echoes of our own sent messages
+    if message_obj.get("is_echo"):
+        logger.info("Ignoring echo message")
+        return
+
     sender_id = messaging.get("sender", {}).get("id")
-    message_text = messaging.get("message", {}).get("text", "").lower()
+    message_text = message_obj.get("text", "").lower()
 
     if not sender_id or not message_text:
         return
