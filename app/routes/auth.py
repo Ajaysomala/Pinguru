@@ -10,7 +10,7 @@ import httpx
 import jwt
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 from google.auth.transport import requests
 from google.oauth2 import id_token
@@ -582,6 +582,27 @@ async def save_instagram_token(
         raise HTTPException(status_code=404, detail="Update failed: User not found after verification")
 
     return {"status": "Instagram token saved", "instagram_user_id": ig_user_id}
+
+
+@router.get("/instagram/media")
+async def instagram_media(
+    media_type: str = Query("all"),
+    limit: int = Query(25, ge=1, le=50),
+    user=Depends(get_current_user),
+):
+    access_token = str(user.get("instagram_access_token") or "").strip()
+    instagram_user_id = str(user.get("instagram_user_id") or user.get("instagram_user_id_v2") or "").strip()
+
+    if not access_token or not instagram_user_id:
+        return {"media": [], "source": "unavailable", "connected": False}
+
+    media = await InstagramService.get_user_media(access_token, limit=limit, media_type=media_type)
+    return {
+        "media": media,
+        "source": "instagram" if media else "fallback",
+        "connected": True,
+        "media_type": media_type,
+    }
 
 
 # ── Google OAuth ──────────────────────────────────────────────────────────────

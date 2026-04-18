@@ -14,8 +14,21 @@ class PlanType(str, Enum):
 class TriggerType(str, Enum):
     KEYWORD      = "keyword"
     STORY_REPLY  = "story_reply"
+    COMMENT      = "comment"
     POST_COMMENT = "post_comment"
     REEL_COMMENT = "reel_comment"
+
+
+class CommentTargetType(str, Enum):
+    SPECIFIC = "specific"
+    NEXT = "next"
+    ANY = "any"
+
+
+class CommentMediaFilterType(str, Enum):
+    POST = "post"
+    REEL = "reel"
+    ALL = "all"
 
 # ── Contact ───────────────────────────────────────────────────────────────────
 
@@ -99,6 +112,12 @@ class AutomationRule(BaseModel):
     keywords: List[str] = []
     match_mode: str = "exact"
     reply_message: str
+    comment_target_type: Optional[CommentTargetType] = None
+    comment_media_filter: CommentMediaFilterType = CommentMediaFilterType.ALL
+    comment_media_id: Optional[str] = None
+    comment_media_permalink: Optional[str] = None
+    comment_media_caption: Optional[str] = None
+    comment_media_type: Optional[str] = None
     is_active: bool = True
     sent_count: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -109,6 +128,12 @@ class AutomationRuleCreate(BaseModel):
     keywords: List[str] = []
     match_mode: str = "exact"
     reply_message: str
+    comment_target_type: Optional[CommentTargetType] = None
+    comment_media_filter: Optional[CommentMediaFilterType] = None
+    comment_media_id: Optional[str] = None
+    comment_media_permalink: Optional[str] = None
+    comment_media_caption: Optional[str] = None
+    comment_media_type: Optional[str] = None
 
 # ── DM Log ────────────────────────────────────────────────────────────────────
 

@@ -132,6 +132,69 @@ def _event_key_for_change(ig_id: str, change: dict[str, Any]) -> str:
     return f"chg:{ig_id}:{field}:{_safe_event_hash(value)}"
 
 
+def _normalize_comment_target_type(value: Any) -> str:
+    normalized = str(value or "any").strip().lower()
+    if normalized in {"specific", "next", "any"}:
+        return normalized
+    return "any"
+
+
+def _normalize_comment_media_filter(value: Any, trigger_type: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"post", "reel", "all"}:
+        return normalized
+    if trigger_type == TriggerType.POST_COMMENT.value:
+        return "post"
+    if trigger_type == TriggerType.REEL_COMMENT.value:
+        return "reel"
+    return "all"
+
+
+def _extract_comment_media_context(value: dict[str, Any]) -> tuple[str, str | None]:
+    media_id = str(value.get("media_id") or value.get("media", {}).get("id") or value.get("id") or "").strip()
+    media_type_raw = str(
+        value.get("media_type")
+        or value.get("media", {}).get("media_type")
+        or value.get("media_product_type")
+        or value.get("product_type")
+        or ""
+    ).strip().lower()
+
+    media_kind: str | None = None
+    if media_type_raw in {"image", "photo", "carousel_album", "post"}:
+        media_kind = "post"
+    elif media_type_raw in {"video", "reel", "reels"}:
+        media_kind = "reel"
+    elif str(value.get("media_product_type") or "").strip().upper() == "REELS":
+        media_kind = "reel"
+
+    return media_id, media_kind
+
+
+def _comment_rule_matches(rule: dict[str, Any], media_id: str, media_kind: str | None) -> bool:
+    trigger_type = str(rule.get("trigger_type") or TriggerType.POST_COMMENT.value)
+    target_type = _normalize_comment_target_type(rule.get("comment_target_type"))
+    media_filter = _normalize_comment_media_filter(rule.get("comment_media_filter"), trigger_type)
+    rule_media_id = str(rule.get("comment_media_id") or "").strip()
+
+    if target_type == "specific":
+        if not rule_media_id:
+            return False
+        if not media_id or media_id != rule_media_id:
+            return False
+    elif target_type == "next":
+        # Safe fallback: if we don't yet have a pinned media id, do not block the rule.
+        if rule_media_id and media_id and media_id != rule_media_id:
+            return False
+
+    if media_filter == "post" and media_kind == "reel":
+        return False
+    if media_filter == "reel" and media_kind == "post":
+        return False
+
+    return True
+
+
 async def _mark_event_if_new(db, event_key: str, source: str) -> bool:
     result = await db.webhook_events.update_one(
         {"_id": event_key},
@@ -476,6 +539,7 @@ async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
 async def handle_comment_event(db, ig_account_id: str, value: dict):
     commenter_id = value.get("from", {}).get("id")
     comment_text = value.get("text", "").lower()
+    media_id, media_kind = _extract_comment_media_context(value)
 
     if not commenter_id or not comment_text:
         return
@@ -503,11 +567,13 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
         {
             "user_id": str(user["_id"]),
             "is_active": True,
-            "trigger_type": {"$in": [TriggerType.POST_COMMENT, TriggerType.REEL_COMMENT]},
+            "trigger_type": {"$in": [TriggerType.COMMENT, TriggerType.POST_COMMENT, TriggerType.REEL_COMMENT]},
         }
     ).to_list(100)
 
     for rule in rules:
+        if not _comment_rule_matches(rule, media_id, media_kind):
+            continue
         keywords = [k.lower() for k in rule.get("keywords", [])]
         if not keywords or any(kw in comment_text for kw in keywords):
             raw_trigger = str(rule.get("trigger_type") or TriggerType.POST_COMMENT)

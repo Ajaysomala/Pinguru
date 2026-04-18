@@ -12,6 +12,19 @@ HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 class InstagramService:
 
     @staticmethod
+    def _normalize_media_kind(item: dict) -> str:
+        media_type = str(item.get("media_type") or "").strip().upper()
+        media_product_type = str(item.get("media_product_type") or "").strip().upper()
+
+        if media_product_type == "REELS" or media_type == "REEL":
+            return "reel"
+        if media_type in {"IMAGE", "CAROUSEL_ALBUM"}:
+            return "post"
+        if media_type == "VIDEO":
+            return "reel" if media_product_type == "REELS" else "post"
+        return "all"
+
+    @staticmethod
     def _fernet() -> Fernet:
         return Fernet(settings.ENCRYPTION_KEY.encode("utf-8"))
 
@@ -74,6 +87,47 @@ class InstagramService:
         except httpx.RequestError:
             logger.exception("Instagram profile fetch failed")
             return {}
+
+    @staticmethod
+    async def get_user_media(access_token: str, limit: int = 25, media_type: str = "all") -> list[dict]:
+        """Fetch recent Instagram media for the connected business account."""
+        decrypted = InstagramService.decrypt_access_token(access_token)
+        url = f"{BASE_GRAPH_IG}/me/media"
+        params = {
+            "fields": "id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp",
+            "limit": limit,
+            "access_token": decrypted,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                resp = await client.get(url, params=params)
+            if resp.status_code != 200:
+                logger.warning("Instagram media fetch returned %s", resp.status_code)
+                return []
+
+            payload = resp.json() or {}
+            items: list[dict] = []
+            wanted = (media_type or "all").strip().lower()
+            for item in payload.get("data", []):
+                kind = InstagramService._normalize_media_kind(item)
+                if wanted in {"post", "reel"} and kind != wanted:
+                    continue
+                items.append(
+                    {
+                        "id": str(item.get("id") or ""),
+                        "caption": item.get("caption") or "",
+                        "media_type": kind,
+                        "media_product_type": str(item.get("media_product_type") or "").lower() or None,
+                        "media_url": item.get("media_url") or "",
+                        "thumbnail_url": item.get("thumbnail_url") or "",
+                        "permalink": item.get("permalink") or "",
+                        "timestamp": item.get("timestamp") or "",
+                    }
+                )
+            return items
+        except httpx.RequestError:
+            logger.exception("Instagram media fetch failed")
+            return []
 
     @staticmethod
     async def exchange_code_for_token(code: str, redirect_uri: str) -> dict:
