@@ -385,6 +385,20 @@ async def me(user=Depends(get_current_user)):
     first_name = (user.get("first_name") or "").strip()
     last_name = (user.get("last_name") or "").strip()
     full_name = " ".join(part for part in [first_name, last_name] if part)
+    instagram_username = str(user.get("instagram_username") or "").strip()
+
+    if not instagram_username and user.get("instagram_access_token") and user.get("instagram_user_id"):
+        try:
+            profile = await InstagramService.get_user_profile(str(user.get("instagram_access_token") or ""))
+            instagram_username = str(profile.get("username") or "").strip()
+            if instagram_username:
+                await get_db().users.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"instagram_username": instagram_username}},
+                )
+        except Exception:
+            instagram_username = str(user.get("instagram_username") or "").strip()
+
     return {
         "email": user.get("email"),
         "first_name": first_name,
@@ -394,7 +408,7 @@ async def me(user=Depends(get_current_user)):
         "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
         "instagram_connected": bool(user.get("instagram_user_id")),
         "instagram_user_id": user.get("instagram_user_id", ""),
-        "instagram_username": user.get("instagram_username", ""),
+        "instagram_username": instagram_username,
         "email_verified": bool(user.get("email_verified", False)),
     }
 
@@ -544,6 +558,13 @@ async def save_instagram_token(
     if not ig_user_id:
         raise HTTPException(status_code=400, detail="Failed to fetch Instagram user ID from token")
 
+    ig_username = ""
+    try:
+        profile = await InstagramService.get_user_profile(access_token)
+        ig_username = str(profile.get("username") or "").strip()
+    except Exception:
+        ig_username = ""
+
     update_filter = None
     if data.user_id:
         try:
@@ -574,6 +595,7 @@ async def save_instagram_token(
             "$set": {
                 "instagram_access_token": encrypted_access_token,
                 "instagram_user_id": ig_user_id,
+                "instagram_username": ig_username or None,
             }
         },
     )
@@ -581,7 +603,7 @@ async def save_instagram_token(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Update failed: User not found after verification")
 
-    return {"status": "Instagram token saved", "instagram_user_id": ig_user_id}
+    return {"status": "Instagram token saved", "instagram_user_id": ig_user_id, "instagram_username": ig_username}
 
 
 @router.get("/instagram/media")
