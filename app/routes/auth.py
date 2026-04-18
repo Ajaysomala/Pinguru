@@ -469,15 +469,18 @@ async def instagram_callback(
         if not access_token:
             raise HTTPException(status_code=400, detail="No access token returned")
 
-        # Prefer user_id baked into token_data (from short-lived token response).
-        # Fall back to /me profile call only if missing.
-        ig_user_id = str(token_data.get("user_id") or "").strip()
+        # Always call /me to get the Business Account ID.
+        # token_data user_id is OAuth scoped ID — does NOT match webhook entry.id.
+        # graph.instagram.com/me returns the Business Account ID that webhooks use.
+        profile = await InstagramService.get_user_profile(access_token)
+        ig_user_id = str(profile.get("id") or "").strip()
+        ig_username = str(profile.get("username") or "").strip()
+        logger.info(f"IG user_id from /me: {ig_user_id}, username: {ig_username}")
         if not ig_user_id:
-            profile = await InstagramService.get_user_profile(access_token)
-            ig_user_id = str(profile.get("id") or "").strip()
-            logger.info(f"IG user_id from /me fallback: {ig_user_id}")
-        else:
-            logger.info(f"IG user_id from token_data: {ig_user_id}")
+            # fallback if /me fails
+            ig_user_id = str(token_data.get("user_id") or "").strip()
+            ig_username = ""
+            logger.info(f"IG user_id from token_data fallback: {ig_user_id}")
 
         if not ig_user_id:
             raise HTTPException(status_code=400, detail="Could not resolve Instagram user ID")
@@ -493,7 +496,7 @@ async def instagram_callback(
             {
                 "$set": {
                     "instagram_user_id": ig_user_id,
-                    "instagram_username": str(token_data.get("username") or ""),
+                    "instagram_username": ig_username,
                     "instagram_access_token": encrypted_access_token,
                     "ig_token_expires_at": expires_at,
                 }

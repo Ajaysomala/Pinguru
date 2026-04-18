@@ -64,7 +64,7 @@ class InstagramService:
         """Get Instagram business account info."""
         url = f"{BASE_GRAPH_IG}/me"
         params = {
-            "fields": "id,name",
+            "fields": "id,name,username",
             "access_token": access_token,
         }
         try:
