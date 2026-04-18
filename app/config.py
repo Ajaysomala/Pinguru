@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_SECRET: str = ""
     RAZORPAY_PLAN_STARTER: str = ""   # plan_xxx from Razorpay dashboard
     RAZORPAY_PLAN_PRO: str = ""       # plan_xxx from Razorpay dashboard
+    RAZORPAY_PLAN_STARTER_MONTHLY: str = ""
+    RAZORPAY_PLAN_STARTER_QUARTERLY: str = ""
+    RAZORPAY_PLAN_STARTER_YEARLY: str = ""
+    RAZORPAY_PLAN_PRO_MONTHLY: str = ""
+    RAZORPAY_PLAN_PRO_QUARTERLY: str = ""
+    RAZORPAY_PLAN_PRO_YEARLY: str = ""
     RAZORPAY_WEBHOOK_SECRET: str = ""
 
     JWT_SECRET: str

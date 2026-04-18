@@ -21,7 +21,6 @@ class TriggerType(str, Enum):
 
 class CommentTargetType(str, Enum):
     SPECIFIC = "specific"
-    NEXT = "next"
     ANY = "any"
 
 
@@ -118,6 +117,13 @@ class AutomationRule(BaseModel):
     comment_media_permalink: Optional[str] = None
     comment_media_caption: Optional[str] = None
     comment_media_type: Optional[str] = None
+    dm_attachment_url: Optional[str] = None
+    dm_attachment_type: Optional[str] = None
+    any_comment_keyword: bool = True
+    public_comment_reply_enabled: bool = False
+    public_comment_reply_template: Optional[str] = None
+    ask_follow_before_dm: bool = False
+    send_follow_up_message: bool = False
     is_active: bool = True
     sent_count: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -134,6 +140,13 @@ class AutomationRuleCreate(BaseModel):
     comment_media_permalink: Optional[str] = None
     comment_media_caption: Optional[str] = None
     comment_media_type: Optional[str] = None
+    dm_attachment_url: Optional[str] = None
+    dm_attachment_type: Optional[str] = None
+    any_comment_keyword: Optional[bool] = None
+    public_comment_reply_enabled: Optional[bool] = None
+    public_comment_reply_template: Optional[str] = None
+    ask_follow_before_dm: Optional[bool] = None
+    send_follow_up_message: Optional[bool] = None
 
 # ── DM Log ────────────────────────────────────────────────────────────────────
 

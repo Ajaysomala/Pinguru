@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 class CheckoutRequest(BaseModel):
     plan: str
+    billing_cycle: str = "monthly"
 
 class RefundRequest(BaseModel):
     reason: str
@@ -48,19 +49,53 @@ def _normalize_requested_plan(plan_value: str) -> PlanType:
     return get_plan_type(value)
 
 
+def _normalize_billing_cycle(value: str | None) -> str:
+    normalized = (value or "monthly").strip().lower()
+    aliases = {
+        "month": "monthly",
+        "monthly": "monthly",
+        "quarter": "quarterly",
+        "quarterly": "quarterly",
+        "qtr": "quarterly",
+        "year": "yearly",
+        "yearly": "yearly",
+        "annual": "yearly",
+        "annually": "yearly",
+    }
+    return aliases.get(normalized, "monthly")
+
+
+def _resolve_razorpay_plan_id(plan: PlanType, billing_cycle: str) -> str:
+    cycle = _normalize_billing_cycle(billing_cycle)
+    if plan == PlanType.Starter:
+        if cycle == "quarterly":
+            return (settings.RAZORPAY_PLAN_STARTER_QUARTERLY or "").strip()
+        if cycle == "yearly":
+            return (settings.RAZORPAY_PLAN_STARTER_YEARLY or "").strip()
+        return ((settings.RAZORPAY_PLAN_STARTER_MONTHLY or "").strip() or (settings.RAZORPAY_PLAN_STARTER or "").strip())
+    if plan == PlanType.Pro:
+        if cycle == "quarterly":
+            return (settings.RAZORPAY_PLAN_PRO_QUARTERLY or "").strip()
+        if cycle == "yearly":
+            return (settings.RAZORPAY_PLAN_PRO_YEARLY or "").strip()
+        return ((settings.RAZORPAY_PLAN_PRO_MONTHLY or "").strip() or (settings.RAZORPAY_PLAN_PRO or "").strip())
+    return ""
+
+
 def _is_razorpay_configured() -> bool:
     return bool((settings.RAZORPAY_KEY_ID or "").strip()) and bool(
         (settings.RAZORPAY_KEY_SECRET or "").strip()
     )
 
 
-def _ensure_razorpay_checkout_ready() -> None:
+def _ensure_razorpay_checkout_ready(target_plan: PlanType, billing_cycle: str) -> None:
     if not _is_razorpay_configured():
         raise HTTPException(status_code=503, detail="Payments are temporarily unavailable")
-    if not (settings.RAZORPAY_PLAN_STARTER or "").strip():
-        raise HTTPException(status_code=503, detail="Starter plan is not configured")
-    if not (settings.RAZORPAY_PLAN_PRO or "").strip():
-        raise HTTPException(status_code=503, detail="Pro plan is not configured")
+
+    resolved_plan_id = _resolve_razorpay_plan_id(target_plan, billing_cycle)
+    if not resolved_plan_id:
+        cycle = _normalize_billing_cycle(billing_cycle)
+        raise HTTPException(status_code=503, detail=f"{target_plan.value.capitalize()} {cycle} plan is not configured")
 
 
 def _ensure_razorpay_webhook_ready() -> None:
@@ -80,6 +115,7 @@ async def create_checkout_session(
 ):
     current_plan = _normalize_user_plan(user)
     target_plan = _normalize_requested_plan(payload.plan)
+    billing_cycle = _normalize_billing_cycle(payload.billing_cycle)
 
     if target_plan == PlanType.Free:
         raise HTTPException(status_code=400, detail="Cannot checkout free plan")
@@ -91,9 +127,9 @@ async def create_checkout_session(
     if pending_plan in {PlanType.Starter.value, PlanType.Pro.value}:
         raise HTTPException(status_code=409, detail="A checkout is already pending confirmation")
 
-    _ensure_razorpay_checkout_ready()
+    _ensure_razorpay_checkout_ready(target_plan, billing_cycle)
 
-    plan_id = settings.RAZORPAY_PLAN_STARTER if target_plan == PlanType.Starter else settings.RAZORPAY_PLAN_PRO
+    plan_id = _resolve_razorpay_plan_id(target_plan, billing_cycle)
 
     auth = (settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
     sub_payload = {
@@ -103,6 +139,7 @@ async def create_checkout_session(
         "customer_notify": 1,
         "notes": {"user_id": str(user["_id"]), "plan": target_plan.value, "email": user["email"]},
     }
+    sub_payload["notes"]["billing_cycle"] = billing_cycle
 
     async with httpx.AsyncClient() as client:
         resp = await client.post("https://api.razorpay.com/v1/subscriptions", json=sub_payload, auth=auth)
@@ -119,7 +156,13 @@ async def create_checkout_session(
 
     await db.users.update_one(
         {"_id": user["_id"]},
-        {"$set": {"razorpay_subscription_id": sub_id, "pending_plan": target_plan.value}},
+        {
+            "$set": {
+                "razorpay_subscription_id": sub_id,
+                "pending_plan": target_plan.value,
+                "pending_plan_billing_cycle": billing_cycle,
+            }
+        },
     )
 
     frontend_base = _frontend_base_url()
@@ -161,6 +204,7 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
         notes = payload.get("notes", {})
         user_id = notes.get("user_id")
         plan_str = notes.get("plan")
+        billing_cycle = _normalize_billing_cycle(notes.get("billing_cycle"))
         if user_id and plan_str:
             if plan_str not in {PlanType.Starter.value, PlanType.Pro.value}:
                 logger.warning("Ignoring unsupported plan in webhook notes: %s", plan_str)
@@ -175,7 +219,16 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
 
             await db.users.update_one(
                 {"_id": user_object_id},
-                {"$set": {"plan": plan_enum, "dm_limit": get_plan_limits(plan_enum).get("dm_limit"), "razorpay_subscription_id": payload.get("id"), "pending_plan": None}},
+                {
+                    "$set": {
+                        "plan": plan_enum,
+                        "dm_limit": get_plan_limits(plan_enum).get("dm_limit"),
+                        "razorpay_subscription_id": payload.get("id"),
+                        "pending_plan": None,
+                        "billing_cycle": billing_cycle,
+                        "pending_plan_billing_cycle": None,
+                    }
+                },
             )
 
     elif event_type in ("subscription.cancelled", "subscription.expired"):
@@ -184,7 +237,16 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
         if sub_id:
             await db.users.update_one(
                 {"razorpay_subscription_id": sub_id},
-                {"$set": {"plan": PlanType.Free, "dm_limit": get_plan_limits(PlanType.Free).get("dm_limit"), "razorpay_subscription_id": None, "pending_plan": None}},
+                {
+                    "$set": {
+                        "plan": PlanType.Free,
+                        "dm_limit": get_plan_limits(PlanType.Free).get("dm_limit"),
+                        "razorpay_subscription_id": None,
+                        "pending_plan": None,
+                        "billing_cycle": None,
+                        "pending_plan_billing_cycle": None,
+                    }
+                },
             )
 
     return {"status": "ok"}
@@ -195,6 +257,8 @@ async def get_billing_status(user=Depends(get_current_user)):
     current_plan = _normalize_user_plan(user)
     pending_value = user.get("pending_plan")
     pending_plan = pending_value if pending_value in {PlanType.Starter.value, PlanType.Pro.value} else None
+    current_billing_cycle = _normalize_billing_cycle(user.get("billing_cycle")) if user.get("billing_cycle") else None
+    pending_billing_cycle = _normalize_billing_cycle(user.get("pending_plan_billing_cycle")) if user.get("pending_plan_billing_cycle") else None
     sub_id = user.get("razorpay_subscription_id")
     is_active_paid = current_plan in {PlanType.Starter, PlanType.Pro} and bool(sub_id)
 
@@ -205,6 +269,8 @@ async def get_billing_status(user=Depends(get_current_user)):
         "payment_provider": "razorpay",
         "is_active_paid": is_active_paid,
         "is_checkout_pending": pending_plan is not None and not is_active_paid,
+        "current_billing_cycle": current_billing_cycle,
+        "pending_billing_cycle": pending_billing_cycle,
     }
 
 

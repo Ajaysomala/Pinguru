@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Query
 
 from app.database import get_db
 from app.models.models import PLAN_LIMITS, PlanType
@@ -11,6 +11,12 @@ router = APIRouter()
 
 @router.get("")
 async def get_plans():
+    billing_cycles = {
+        "monthly": 1,
+        "quarterly": 3,
+        "yearly": 12,
+    }
+
     return {
         "plans": [
             {
@@ -18,6 +24,11 @@ async def get_plans():
                 "price_inr": limits["price_inr"],
                 "dm_limit": limits["dm_limit"],
                 "rule_limit": "Unlimited" if limits["rules"] is None else limits["rules"],
+                "contacts_limit": limits.get("contacts_limit"),
+                "pricing": {
+                    cycle: (limits["price_inr"] * multiplier)
+                    for cycle, multiplier in billing_cycles.items()
+                },
             }
             for plan, limits in PLAN_LIMITS.items()
         ]
@@ -28,11 +39,12 @@ async def get_plans():
 @router.post("/checkout/{plan}")
 async def create_checkout(
     plan: PlanType,
+    billing_cycle: str = Query(default="monthly"),
     db=Depends(get_db),
     user=Depends(get_current_user),
 ):
     return await create_checkout_session(
-        payload=CheckoutRequest(plan=plan.value),
+        payload=CheckoutRequest(plan=plan.value, billing_cycle=billing_cycle),
         user=user,
         db=db,
     )

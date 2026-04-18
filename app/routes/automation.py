@@ -63,9 +63,41 @@ def _normalize_comment_target_type(value: str | CommentTargetType | None) -> str
         return None
     normalized = value.value if isinstance(value, CommentTargetType) else str(value)
     normalized = normalized.strip().lower()
-    if normalized in {"specific", "next", "any"}:
+    if normalized in {"specific", "any"}:
         return normalized
     return None
+
+
+def _sanitize_public_comment_reply_template(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = _sanitize_text(value)
+    if not cleaned:
+        return None
+    if len(cleaned) > 300:
+        raise HTTPException(status_code=422, detail="Public comment reply must be 300 characters or fewer")
+    return cleaned
+
+
+def _sanitize_attachment_url(value: str | None) -> str | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if len(text) > 2048:
+        raise HTTPException(status_code=422, detail="Attachment URL must be 2048 characters or fewer")
+    if not re.match(r"^https://", text, flags=re.IGNORECASE):
+        raise HTTPException(status_code=422, detail="Attachment URL must use https")
+    return text
+
+
+def _require_comment_pro_features(user_plan: PlanType, enabled: bool, field_name: str) -> None:
+    if enabled and user_plan != PlanType.Pro:
+        raise HTTPException(status_code=403, detail=f"{field_name} is available on the Pro plan only")
+
+
+def _require_comment_starter_or_pro_features(user_plan: PlanType, enabled: bool, field_name: str) -> None:
+    if enabled and user_plan not in {PlanType.Starter, PlanType.Pro}:
+        raise HTTPException(status_code=403, detail=f"{field_name} is available on Starter and Pro plans only")
 
 
 def _normalize_comment_media_filter(value: str | CommentMediaFilterType | None) -> str:
@@ -109,6 +141,13 @@ def _serialize_rule(rule: dict) -> dict:
     serialized["comment_media_permalink"] = (rule.get("comment_media_permalink") or "").strip() or None
     serialized["comment_media_caption"] = (rule.get("comment_media_caption") or "").strip() or None
     serialized["comment_media_type"] = (rule.get("comment_media_type") or "").strip() or None
+    serialized["dm_attachment_url"] = (rule.get("dm_attachment_url") or "").strip() or None
+    serialized["dm_attachment_type"] = (rule.get("dm_attachment_type") or "").strip() or None
+    serialized["any_comment_keyword"] = bool(rule.get("any_comment_keyword", True))
+    serialized["public_comment_reply_enabled"] = bool(rule.get("public_comment_reply_enabled", False))
+    serialized["public_comment_reply_template"] = (rule.get("public_comment_reply_template") or "").strip() or None
+    serialized["ask_follow_before_dm"] = bool(rule.get("ask_follow_before_dm", False))
+    serialized["send_follow_up_message"] = bool(rule.get("send_follow_up_message", False))
     if "created_at" in serialized and hasattr(serialized["created_at"], "isoformat"):
         serialized["created_at"] = serialized["created_at"].isoformat()
     return serialized
@@ -133,6 +172,29 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
     comment_media_permalink = _optional_text(data.comment_media_permalink) if is_comment_rule else None
     comment_media_caption = _optional_text(data.comment_media_caption) if is_comment_rule else None
     comment_media_type = _optional_text(data.comment_media_type) if is_comment_rule else None
+    dm_attachment_url = _sanitize_attachment_url(data.dm_attachment_url) if is_comment_rule else None
+    dm_attachment_type = (data.dm_attachment_type or "").strip().lower() if is_comment_rule and data.dm_attachment_type else None
+    any_comment_keyword = bool(data.any_comment_keyword) if is_comment_rule and data.any_comment_keyword is not None else (True if is_comment_rule else False)
+    public_comment_reply_enabled = bool(data.public_comment_reply_enabled) if is_comment_rule else False
+    public_comment_reply_template = _sanitize_public_comment_reply_template(data.public_comment_reply_template) if is_comment_rule else None
+    ask_follow_before_dm = bool(data.ask_follow_before_dm) if is_comment_rule else False
+    send_follow_up_message = bool(data.send_follow_up_message) if is_comment_rule else False
+
+    if dm_attachment_type and dm_attachment_type not in {"image"}:
+        raise HTTPException(status_code=422, detail="Only image attachments are supported for DM attachments")
+
+    _require_comment_pro_features(user_plan, bool(dm_attachment_url), "DM image attachments")
+
+    _require_comment_pro_features(user_plan, public_comment_reply_enabled, "Public comment reply")
+    _require_comment_starter_or_pro_features(user_plan, ask_follow_before_dm, "Follow-before-DM automation")
+    _require_comment_pro_features(user_plan, send_follow_up_message, "Follow-up automation")
+
+    if is_comment_rule and not any_comment_keyword and len(keywords) == 0:
+        raise HTTPException(status_code=422, detail="Add at least one keyword or enable any_comment_keyword")
+
+    if is_comment_rule and public_comment_reply_enabled and not public_comment_reply_template:
+        raise HTTPException(status_code=422, detail="public_comment_reply_template is required when public_comment_reply_enabled is true")
+
     rule_doc = {
         "user_id": str(user["_id"]),
         "name": name,
@@ -146,6 +208,13 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
         "comment_media_permalink": comment_media_permalink,
         "comment_media_caption": comment_media_caption,
         "comment_media_type": comment_media_type,
+        "dm_attachment_url": dm_attachment_url,
+        "dm_attachment_type": dm_attachment_type,
+        "any_comment_keyword": any_comment_keyword,
+        "public_comment_reply_enabled": public_comment_reply_enabled,
+        "public_comment_reply_template": public_comment_reply_template,
+        "ask_follow_before_dm": ask_follow_before_dm,
+        "send_follow_up_message": send_follow_up_message,
         "is_active": True,
         "sent_count": 0,
         "created_at": datetime.now(timezone.utc),
@@ -191,6 +260,29 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
     comment_media_permalink = _optional_text(data.comment_media_permalink) if is_comment_rule else None
     comment_media_caption = _optional_text(data.comment_media_caption) if is_comment_rule else None
     comment_media_type = _optional_text(data.comment_media_type) if is_comment_rule else None
+    dm_attachment_url = _sanitize_attachment_url(data.dm_attachment_url) if is_comment_rule else None
+    dm_attachment_type = (data.dm_attachment_type or "").strip().lower() if is_comment_rule and data.dm_attachment_type else None
+    any_comment_keyword = bool(data.any_comment_keyword) if is_comment_rule and data.any_comment_keyword is not None else (True if is_comment_rule else False)
+    public_comment_reply_enabled = bool(data.public_comment_reply_enabled) if is_comment_rule else False
+    public_comment_reply_template = _sanitize_public_comment_reply_template(data.public_comment_reply_template) if is_comment_rule else None
+    ask_follow_before_dm = bool(data.ask_follow_before_dm) if is_comment_rule else False
+    send_follow_up_message = bool(data.send_follow_up_message) if is_comment_rule else False
+
+    if dm_attachment_type and dm_attachment_type not in {"image"}:
+        raise HTTPException(status_code=422, detail="Only image attachments are supported for DM attachments")
+
+    _require_comment_pro_features(user_plan, bool(dm_attachment_url), "DM image attachments")
+
+    _require_comment_pro_features(user_plan, public_comment_reply_enabled, "Public comment reply")
+    _require_comment_starter_or_pro_features(user_plan, ask_follow_before_dm, "Follow-before-DM automation")
+    _require_comment_pro_features(user_plan, send_follow_up_message, "Follow-up automation")
+
+    if is_comment_rule and not any_comment_keyword and len(keywords) == 0:
+        raise HTTPException(status_code=422, detail="Add at least one keyword or enable any_comment_keyword")
+
+    if is_comment_rule and public_comment_reply_enabled and not public_comment_reply_template:
+        raise HTTPException(status_code=422, detail="public_comment_reply_template is required when public_comment_reply_enabled is true")
+
     result = await db.automation_rules.update_one(
         {"_id": rule_object_id, "user_id": str(user["_id"])},
         {"$set": {
@@ -205,6 +297,13 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
             "comment_media_permalink": comment_media_permalink,
             "comment_media_caption": comment_media_caption,
             "comment_media_type": comment_media_type,
+            "dm_attachment_url": dm_attachment_url,
+            "dm_attachment_type": dm_attachment_type,
+            "any_comment_keyword": any_comment_keyword,
+            "public_comment_reply_enabled": public_comment_reply_enabled,
+            "public_comment_reply_template": public_comment_reply_template,
+            "ask_follow_before_dm": ask_follow_before_dm,
+            "send_follow_up_message": send_follow_up_message,
         }}
     )
     if result.matched_count == 0:

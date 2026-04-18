@@ -45,15 +45,25 @@ class InstagramService:
             return encrypted_access_token
 
     @staticmethod
-    async def send_dm(access_token: str, recipient_ig_id: str, message: str, ig_user_id: str) -> dict:
+    async def send_dm(access_token: str, recipient_ig_id: str, message: str, ig_user_id: str, attachment_url: str | None = None, attachment_type: str = "image") -> dict:
         """Send a DM to an Instagram user via Graph API."""
         access_token = InstagramService.decrypt_access_token(access_token)
         url = f"{BASE_GRAPH_IG}/{ig_user_id}/messages"
-        payload = {
+        payload: dict = {
             "recipient": {"id": recipient_ig_id},
-            "message": {"text": message},
             "access_token": access_token,
         }
+        message_payload: dict = {}
+        if message:
+            message_payload["text"] = message
+        if attachment_url:
+            message_payload["attachment"] = {
+                "type": attachment_type,
+                "payload": {"url": attachment_url},
+            }
+        if not message_payload:
+            message_payload["text"] = ""
+        payload["message"] = message_payload
         logger.info("Sending Instagram DM request")
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
@@ -190,11 +200,12 @@ class InstagramService:
     async def reply_to_comment(access_token: str, comment_id: str, message: str) -> dict:
         """Reply to an Instagram comment (not DM — comment reply)."""
         url = f"{BASE_GRAPH_IG}/{comment_id}/replies"
+        decrypted = InstagramService.decrypt_access_token(access_token)
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 resp = await client.post(url, data={
                     "message": message,
-                    "access_token": access_token,
+                    "access_token": decrypted,
                 })
             return resp.json()
         except httpx.RequestError:

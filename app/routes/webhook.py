@@ -13,9 +13,19 @@ from app.config import settings
 from app.database import get_db
 from app.models.models import PlanType, TriggerType, get_plan_limits, get_plan_type
 from app.services.instagram import InstagramService
+from bson import ObjectId
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+FREE_BRAND_FOOTER = "\n\n- Powered by PinGuru"
+FOLLOW_CONFIRMATION_TOKENS = {
+    "followed",
+    "done",
+    "i followed",
+    "following",
+    "yes followed",
+}
 
 
 class WebhookSimulateRequest(BaseModel):
@@ -134,7 +144,7 @@ def _event_key_for_change(ig_id: str, change: dict[str, Any]) -> str:
 
 def _normalize_comment_target_type(value: Any) -> str:
     normalized = str(value or "any").strip().lower()
-    if normalized in {"specific", "next", "any"}:
+    if normalized in {"specific", "any"}:
         return normalized
     return "any"
 
@@ -182,10 +192,6 @@ def _comment_rule_matches(rule: dict[str, Any], media_id: str, media_kind: str |
             return False
         if not media_id or media_id != rule_media_id:
             return False
-    elif target_type == "next":
-        # Safe fallback: if we don't yet have a pinned media id, do not block the rule.
-        if rule_media_id and media_id and media_id != rule_media_id:
-            return False
 
     if media_filter == "post" and media_kind == "reel":
         return False
@@ -193,6 +199,38 @@ def _comment_rule_matches(rule: dict[str, Any], media_id: str, media_kind: str |
         return False
 
     return True
+
+
+def _render_comment_template(template: str, commenter_id: str, comment_text: str) -> str:
+    rendered = template.replace("{username}", commenter_id).replace("{name}", commenter_id)
+    rendered = rendered.replace("{comment}", comment_text)
+    return rendered.strip()
+
+
+def _apply_plan_footer(message: str, user_plan: PlanType) -> str:
+    base = (message or "").strip()
+    if user_plan == PlanType.Free and FREE_BRAND_FOOTER.strip().lower() not in base.lower():
+        return f"{base}{FREE_BRAND_FOOTER}".strip()
+    return base
+
+
+def _is_follow_confirmation_message(message_text: str) -> bool:
+    normalized = _normalize_text(message_text or "")
+    if not normalized:
+        return False
+    if normalized in FOLLOW_CONFIRMATION_TOKENS:
+        return True
+    return any(token in normalized for token in FOLLOW_CONFIRMATION_TOKENS)
+
+
+def _build_follow_prompt(user: dict[str, Any]) -> str:
+    username = str(user.get("instagram_username") or "").strip()
+    if username:
+        return (
+            f"Please follow @{username} first, then reply FOLLOWED here. "
+            f"You can open the profile: https://instagram.com/{username}"
+        )
+    return "Please follow our Instagram account first, then reply FOLLOWED here to receive your DM details."
 
 
 async def _mark_event_if_new(db, event_key: str, source: str) -> bool:
@@ -223,12 +261,69 @@ def _is_story_reply(messaging: dict[str, Any]) -> bool:
 
 
 async def _send_rule_reply(db, user: dict[str, Any], recipient_id: str, rule: dict[str, Any], trigger_type: TriggerType):
-    reply = rule["reply_message"].replace("{{username}}", recipient_id)
+    user_plan = get_plan_type(user.get("plan", PlanType.Free))
+    base_reply = str(rule.get("reply_message") or "").replace("{{username}}", recipient_id)
+    reply = _apply_plan_footer(base_reply, user_plan)
+
+    follow_gate_requested = bool(rule.get("ask_follow_before_dm", False))
+    if (
+        follow_gate_requested
+        and user_plan in {PlanType.Starter, PlanType.Pro}
+        and trigger_type in {TriggerType.COMMENT, TriggerType.POST_COMMENT, TriggerType.REEL_COMMENT}
+    ):
+        contact = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": recipient_id})
+        is_awaiting_for_rule = bool(contact) and str(contact.get("follow_gate_status") or "") == "awaiting" and str(contact.get("follow_gate_rule_id") or "") == str(rule.get("_id"))
+
+        if not is_awaiting_for_rule:
+            prompt_message = _build_follow_prompt(user)
+            prompt_result = await InstagramService.send_dm(
+                access_token=user["instagram_access_token"],
+                recipient_ig_id=recipient_id,
+                message=prompt_message,
+                ig_user_id=user["instagram_user_id"],
+            )
+
+            await db.dm_logs.insert_one(
+                {
+                    "user_id": str(user["_id"]),
+                    "rule_id": str(rule["_id"]),
+                    "recipient_ig_id": recipient_id,
+                    "message_sent": prompt_message,
+                    "trigger_type": trigger_type,
+                    "status": "sent" if prompt_result["success"] else "failed",
+                    "sent_at": datetime.now(timezone.utc),
+                }
+            )
+
+            if prompt_result["success"]:
+                now = datetime.now(timezone.utc)
+                await db.contacts.update_one(
+                    {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
+                    {
+                        "$set": {
+                            "last_seen_at": now,
+                            "last_triggered_rule_id": str(rule["_id"]),
+                            "trigger_type": trigger_type,
+                            "follow_gate_status": "awaiting",
+                            "follow_gate_rule_id": str(rule["_id"]),
+                            "follow_gate_trigger_type": trigger_type.value,
+                            "follow_gate_prompted_at": now,
+                        },
+                        "$inc": {"dm_count": 1},
+                        "$setOnInsert": {"user_id": str(user["_id"]), "ig_user_id": recipient_id, "first_seen_at": now},
+                    },
+                    upsert=True,
+                )
+                await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
+            return
+
     result = await InstagramService.send_dm(
         access_token=user["instagram_access_token"],
         recipient_ig_id=recipient_id,
         message=reply,
         ig_user_id=user["instagram_user_id"],
+        attachment_url=str(rule.get("dm_attachment_url") or "").strip() or None,
+        attachment_type=str(rule.get("dm_attachment_type") or "image").strip().lower() or "image",
     )
 
     await db.dm_logs.insert_one(
@@ -458,6 +553,34 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         logger.warning("DM limit reached")
         return
 
+    contact = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": sender_id})
+    if contact and str(contact.get("follow_gate_status") or "") == "awaiting" and _is_follow_confirmation_message(message_text):
+        pending_rule_id = str(contact.get("follow_gate_rule_id") or "").strip()
+        pending_trigger_raw = str(contact.get("follow_gate_trigger_type") or TriggerType.COMMENT.value)
+        pending_trigger = TriggerType(pending_trigger_raw) if pending_trigger_raw in {t.value for t in TriggerType} else TriggerType.COMMENT
+
+        if ObjectId.is_valid(pending_rule_id):
+            pending_rule = await db.automation_rules.find_one(
+                {
+                    "_id": ObjectId(pending_rule_id),
+                    "user_id": str(user["_id"]),
+                    "is_active": True,
+                }
+            )
+            if pending_rule:
+                await _send_rule_reply(db, user, sender_id, pending_rule, pending_trigger)
+
+        await db.contacts.update_one(
+            {"_id": contact["_id"]},
+            {
+                "$set": {
+                    "follow_gate_status": "completed",
+                    "follow_gate_completed_at": datetime.now(timezone.utc),
+                }
+            },
+        )
+        return
+
     dm_rules_query = {
         "user_id": str(user["_id"]),
         "is_active": True,
@@ -538,7 +661,9 @@ async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
 
 async def handle_comment_event(db, ig_account_id: str, value: dict):
     commenter_id = value.get("from", {}).get("id")
-    comment_text = value.get("text", "").lower()
+    raw_comment_text = str(value.get("text", "") or "")
+    comment_text = raw_comment_text.lower()
+    comment_id = str(value.get("comment_id") or value.get("id") or "").strip()
     media_id, media_kind = _extract_comment_media_context(value)
 
     if not commenter_id or not comment_text:
@@ -575,8 +700,22 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
         if not _comment_rule_matches(rule, media_id, media_kind):
             continue
         keywords = [k.lower() for k in rule.get("keywords", [])]
-        if not keywords or any(kw in comment_text for kw in keywords):
+        any_comment_keyword = bool(rule.get("any_comment_keyword", True))
+        keyword_match = True if any_comment_keyword else (len(keywords) > 0 and any(kw in comment_text for kw in keywords))
+        if keyword_match:
             raw_trigger = str(rule.get("trigger_type") or TriggerType.POST_COMMENT)
             trigger_type = TriggerType(raw_trigger) if raw_trigger in {t.value for t in TriggerType} else TriggerType.POST_COMMENT
+
+            if bool(rule.get("public_comment_reply_enabled", False)) and comment_id:
+                public_template = str(rule.get("public_comment_reply_template") or "").strip()
+                if public_template:
+                    public_reply = _render_comment_template(public_template, commenter_id, raw_comment_text)
+                    if public_reply:
+                        await InstagramService.reply_to_comment(
+                            access_token=user["instagram_access_token"],
+                            comment_id=comment_id,
+                            message=public_reply,
+                        )
+
             await _send_rule_reply(db, user, commenter_id, rule, trigger_type)
             break
