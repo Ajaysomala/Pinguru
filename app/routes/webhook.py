@@ -247,6 +247,46 @@ async def _mark_event_if_new(db, event_key: str, source: str) -> bool:
     return result.upserted_id is not None
 
 
+async def _find_user_for_ig_account(db, ig_account_id: str) -> dict[str, Any] | None:
+    user = await db.users.find_one({"instagram_user_id": ig_account_id})
+    if user:
+        return user
+
+    # Self-heal fallback: if there is exactly one connected Instagram user,
+    # map that user to the webhook account id so automation can proceed.
+    connected_query = {
+        "instagram_access_token": {"$exists": True, "$nin": [None, ""]},
+        "instagram_user_id": {"$exists": True, "$nin": [None, ""]},
+    }
+    connected_count = await db.users.count_documents(connected_query)
+    if connected_count != 1:
+        logger.warning(
+            "No user found for webhook ig_account_id=%s; connected_account_candidates=%s",
+            ig_account_id,
+            connected_count,
+        )
+        return None
+
+    fallback_user = await db.users.find_one(connected_query)
+    if not fallback_user:
+        logger.warning("No fallback user resolved for webhook ig_account_id=%s", ig_account_id)
+        return None
+
+    old_id = str(fallback_user.get("instagram_user_id") or "")
+    await db.users.update_one(
+        {"_id": fallback_user["_id"]},
+        {"$set": {"instagram_user_id": ig_account_id}},
+    )
+    fallback_user["instagram_user_id"] = ig_account_id
+    logger.warning(
+        "Auto-mapped instagram_user_id from %s to webhook ig_account_id=%s for user_id=%s",
+        old_id,
+        ig_account_id,
+        str(fallback_user.get("_id")),
+    )
+    return fallback_user
+
+
 def _is_story_reply(messaging: dict[str, Any]) -> bool:
     message_obj = messaging.get("message") or {}
     referral = messaging.get("referral") or {}
@@ -376,7 +416,7 @@ async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) ->
             message_text = (messaging.get("message") or {}).get("text")
             logger.info("Messaging webhook event received: sender_id=%s, recipient_id=%s", sender_id, recipient_id)
 
-            await handle_messaging_event(db, ig_id, messaging)
+            await handle_messaging_event(db, str(recipient_id or ig_id), messaging)
             processed_events += 1
 
         for change in change_events:
@@ -533,7 +573,7 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
     if sender_id == ig_account_id:
         return
 
-    user = await db.users.find_one({"instagram_user_id": ig_account_id})
+    user = await _find_user_for_ig_account(db, ig_account_id)
     if not user:
         return
 
@@ -621,7 +661,7 @@ async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
     if not sender_id:
         return
 
-    user = await db.users.find_one({"instagram_user_id": ig_account_id})
+    user = await _find_user_for_ig_account(db, ig_account_id)
     if not user:
         return
 
@@ -659,7 +699,7 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
     if not commenter_id or not comment_text:
         return
 
-    user = await db.users.find_one({"instagram_user_id": ig_account_id})
+    user = await _find_user_for_ig_account(db, ig_account_id)
     if not user:
         return
 
