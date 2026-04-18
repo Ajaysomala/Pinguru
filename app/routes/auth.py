@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from urllib.parse import quote, urlencode
 import hashlib
 import json
@@ -381,7 +382,7 @@ async def login(request: Request, data: UserLoginRequest, db=Depends(get_db)):
 
 
 @router.get("/me")
-async def me(user=Depends(get_current_user)):
+async def me(user=Depends(get_current_user), db: Any = Depends(get_db)):
     first_name = (user.get("first_name") or "").strip()
     last_name = (user.get("last_name") or "").strip()
     full_name = " ".join(part for part in [first_name, last_name] if part)
@@ -392,7 +393,7 @@ async def me(user=Depends(get_current_user)):
             profile = await InstagramService.get_user_profile(str(user.get("instagram_access_token") or ""))
             instagram_username = str(profile.get("username") or "").strip()
             if instagram_username:
-                await get_db().users.update_one(
+                await db.users.update_one(
                     {"_id": user["_id"]},
                     {"$set": {"instagram_username": instagram_username}},
                 )
@@ -483,18 +484,17 @@ async def instagram_callback(
         if not access_token:
             raise HTTPException(status_code=400, detail="No access token returned")
 
-        # Always call /me to get the Business Account ID.
-        # token_data user_id is OAuth scoped ID — does NOT match webhook entry.id.
-        # graph.instagram.com/me returns the Business Account ID that webhooks use.
+        # user_id from short-lived token = legacy IG ID = matches webhook entry.id
+        # profile.get("id") from /me = new-format ID = does NOT match webhooks
+        # So we store token_data user_id for webhook matching,
+        # and use /me only for username display
+        ig_user_id = str(token_data.get("user_id") or "").strip()
         profile = await InstagramService.get_user_profile(access_token)
-        ig_user_id = str(profile.get("id") or "").strip()
         ig_username = str(profile.get("username") or "").strip()
-        logger.info(f"IG user_id from /me: {ig_user_id}, username: {ig_username}")
+        logger.info(f"IG user_id from token: {ig_user_id}, username: {ig_username}")
         if not ig_user_id:
-            # fallback if /me fails
-            ig_user_id = str(token_data.get("user_id") or "").strip()
-            ig_username = ""
-            logger.info(f"IG user_id from token_data fallback: {ig_user_id}")
+            ig_user_id = str(profile.get("id") or "").strip()
+            logger.info(f"IG user_id fallback from /me: {ig_user_id}")
 
         if not ig_user_id:
             raise HTTPException(status_code=400, detail="Could not resolve Instagram user ID")
@@ -510,7 +510,6 @@ async def instagram_callback(
             {
                 "$set": {
                     "instagram_user_id": ig_user_id,
-                    "instagram_user_id_v2": str(token_data.get("user_id") or ""),
                     "instagram_username": ig_username,
                     "instagram_access_token": encrypted_access_token,
                     "ig_token_expires_at": expires_at,
@@ -613,7 +612,7 @@ async def instagram_media(
     user=Depends(get_current_user),
 ):
     access_token = str(user.get("instagram_access_token") or "").strip()
-    instagram_user_id = str(user.get("instagram_user_id") or user.get("instagram_user_id_v2") or "").strip()
+    instagram_user_id = str(user.get("instagram_user_id") or "").strip()
 
     if not access_token or not instagram_user_id:
         return {"media": [], "source": "unavailable", "connected": False}

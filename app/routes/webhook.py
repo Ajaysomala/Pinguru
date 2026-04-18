@@ -533,12 +533,7 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
     if sender_id == ig_account_id:
         return
 
-    user = await db.users.find_one({
-        "$or": [
-            {"instagram_user_id": ig_account_id},
-            {"instagram_user_id_v2": ig_account_id},
-        ]
-    })
+    user = await db.users.find_one({"instagram_user_id": ig_account_id})
     if not user:
         return
 
@@ -626,12 +621,7 @@ async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
     if not sender_id:
         return
 
-    user = await db.users.find_one({
-        "$or": [
-            {"instagram_user_id": ig_account_id},
-            {"instagram_user_id_v2": ig_account_id},
-        ]
-    })
+    user = await db.users.find_one({"instagram_user_id": ig_account_id})
     if not user:
         return
 
@@ -669,12 +659,7 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
     if not commenter_id or not comment_text:
         return
 
-    user = await db.users.find_one({
-        "$or": [
-            {"instagram_user_id": ig_account_id},
-            {"instagram_user_id_v2": ig_account_id},
-        ]
-    })
+    user = await db.users.find_one({"instagram_user_id": ig_account_id})
     if not user:
         return
 
