@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from app.config import settings
@@ -438,7 +439,7 @@ async def verify_webhook(
 ):
     if hub_mode == "subscribe" and hub_verify_token == settings.META_WEBHOOK_VERIFY_TOKEN:
         logger.info("Webhook verified by Meta")
-        return int(hub_challenge)
+        return PlainTextResponse(hub_challenge)
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
