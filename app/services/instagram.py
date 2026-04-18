@@ -87,7 +87,7 @@ class InstagramService:
         """Get Instagram business account info."""
         url = f"{BASE_GRAPH_IG}/me"
         params = {
-            "fields": "id,name,username",
+            "fields": "id,name,username,user_id",
             "access_token": access_token,
         }
         try:
@@ -97,6 +97,51 @@ class InstagramService:
         except httpx.RequestError:
             logger.exception("Instagram profile fetch failed")
             return {}
+
+    @staticmethod
+    async def get_business_account_id(access_token: str, preferred_username: str | None = None) -> str | None:
+        """Resolve Instagram Business Account ID that matches webhook entry.id/recipient.id."""
+        decrypted = InstagramService.decrypt_access_token(access_token)
+        url = f"{BASE_GRAPH_FB}/me/accounts"
+        params = {
+            "fields": "instagram_business_account{id,username}",
+            "access_token": decrypted,
+        }
+        preferred = (preferred_username or "").strip().lower()
+
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                resp = await client.get(url, params=params)
+            if resp.status_code != 200:
+                logger.warning("Instagram business account lookup returned %s", resp.status_code)
+                return None
+
+            payload = resp.json() or {}
+            candidates: list[dict] = []
+            for account in payload.get("data", []):
+                ig_business = account.get("instagram_business_account") or {}
+                ig_id = str(ig_business.get("id") or "").strip()
+                if not ig_id:
+                    continue
+                candidates.append(
+                    {
+                        "id": ig_id,
+                        "username": str(ig_business.get("username") or "").strip().lower(),
+                    }
+                )
+
+            if not candidates:
+                return None
+
+            if preferred:
+                for candidate in candidates:
+                    if candidate["username"] == preferred:
+                        return str(candidate["id"])
+
+            return str(candidates[0]["id"])
+        except httpx.RequestError:
+            logger.exception("Instagram business account lookup failed")
+            return None
 
     @staticmethod
     async def get_user_media(access_token: str, limit: int = 25, media_type: str = "all") -> list[dict]:

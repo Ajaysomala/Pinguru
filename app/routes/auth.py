@@ -484,17 +484,18 @@ async def instagram_callback(
         if not access_token:
             raise HTTPException(status_code=400, detail="No access token returned")
 
-        # user_id from short-lived token = legacy IG ID = matches webhook entry.id
-        # profile.get("id") from /me = new-format ID = does NOT match webhooks
-        # So we store token_data user_id for webhook matching,
-        # and use /me only for username display
-        ig_user_id = str(token_data.get("user_id") or "").strip()
         profile = await InstagramService.get_user_profile(access_token)
         ig_username = str(profile.get("username") or "").strip()
-        logger.info(f"IG user_id from token: {ig_user_id}, username: {ig_username}")
+        business_account_id = await InstagramService.get_business_account_id(access_token, preferred_username=ig_username)
+
+        # Webhook recipient.id / entry.id uses Instagram Business Account ID.
+        # Resolve it from graph.facebook.com/me/accounts first.
+        ig_user_id = str(business_account_id or "").strip()
+        logger.info(f"IG business account id from /me/accounts: {ig_user_id}, username: {ig_username}")
+
         if not ig_user_id:
-            ig_user_id = str(profile.get("id") or "").strip()
-            logger.info(f"IG user_id fallback from /me: {ig_user_id}")
+            ig_user_id = str(token_data.get("user_id") or profile.get("id") or "").strip()
+            logger.info(f"IG user_id fallback: {ig_user_id}")
 
         if not ig_user_id:
             raise HTTPException(status_code=400, detail="Could not resolve Instagram user ID")
