@@ -496,6 +496,7 @@ async def instagram_callback(
             {
                 "$set": {
                     "instagram_user_id": ig_user_id,
+                    "instagram_user_id_v2": str(token_data.get("user_id") or ""),
                     "instagram_username": ig_username,
                     "instagram_access_token": encrypted_access_token,
                     "ig_token_expires_at": expires_at,
