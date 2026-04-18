@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 import hashlib
 import json
 import secrets
@@ -11,6 +11,7 @@ import jwt
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
 from google.auth.transport import requests
 from google.oauth2 import id_token
 from passlib.context import CryptContext
@@ -147,6 +148,18 @@ def decode_oauth_state(state: str) -> str:
     if not user_id:
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
     return user_id
+
+
+def _oauth_frontend_base() -> str:
+    return settings.FRONTEND_URL or "https://pinguru.me"
+
+
+def _oauth_error_redirect(message: str) -> RedirectResponse:
+    return RedirectResponse(url=f"{_oauth_frontend_base()}/connect.html?ig_error={quote(message)}")
+
+
+def _oauth_success_redirect() -> RedirectResponse:
+    return RedirectResponse(url=f"{_oauth_frontend_base()}/connect.html?ig_connected=true")
 
 
 async def get_current_user(request: Request, db=Depends(get_db)):
@@ -404,7 +417,6 @@ async def instagram_initiate(user=Depends(get_current_user)):
     ig_client_id = settings.IG_APP_ID or settings.META_APP_ID
     params = urlencode(
         {
-            "force_reauth": "true",
             "client_id": ig_client_id,
             "redirect_uri": redirect_uri,
             "scope": "instagram_business_basic,instagram_business_manage_messages,instagram_business_manage_comments",
@@ -427,73 +439,73 @@ async def instagram_callback(
 ):
     # Meta sends error_code + error_message when redirect URI is blocked or user denies
     if error_code:
-        frontend_url = settings.FRONTEND_URL or "https://pinguru.me"
-        from fastapi.responses import RedirectResponse
-        from urllib.parse import quote
-        msg = quote(error_message or "Instagram connection failed")
-        return RedirectResponse(url=f"{frontend_url}/connect.html?ig_error={msg}")
-
-    if not code:
-        raise HTTPException(status_code=400, detail="No authorization code received")
-
-    if not state:
-        raise HTTPException(status_code=400, detail="Invalid OAuth state")
-
-    user_id = decode_oauth_state(state)
+        return _oauth_error_redirect(error_message or "Instagram connection failed")
 
     try:
-        user_object_id = ObjectId(user_id)
-    except InvalidId:
-        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+        if not code:
+            raise HTTPException(status_code=400, detail="No authorization code received")
 
-    user = await db.users.find_one({"_id": user_object_id})
-    if not user:
-        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+        if not state:
+            raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
-    redirect_uri = f"{settings.BASE_URL}/auth/instagram/callback"
-    result = await InstagramService.exchange_code_for_token(code, redirect_uri)
-    if not result["success"]:
-        raise HTTPException(status_code=400, detail="Instagram connection failed. Please try again.")
+        user_id = decode_oauth_state(state)
 
-    token_data = result["token_data"]
-    access_token = token_data.get("access_token")
-    if not access_token:
-        raise HTTPException(status_code=400, detail="No access token returned")
+        try:
+            user_object_id = ObjectId(user_id)
+        except InvalidId:
+            raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
-    # Prefer user_id baked into token_data (from short-lived token response).
-    # Fall back to /me profile call only if missing.
-    ig_user_id = str(token_data.get("user_id") or "").strip()
-    if not ig_user_id:
-        profile = await InstagramService.get_user_profile(access_token)
-        ig_user_id = str(profile.get("id") or "").strip()
-        logger.info(f"IG user_id from /me fallback: {ig_user_id}")
-    else:
-        logger.info(f"IG user_id from token_data: {ig_user_id}")
+        user = await db.users.find_one({"_id": user_object_id})
+        if not user:
+            raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
-    if not ig_user_id:
-        raise HTTPException(status_code=400, detail="Could not resolve Instagram user ID")
+        redirect_uri = f"{settings.BASE_URL}/auth/instagram/callback"
+        result = await InstagramService.exchange_code_for_token(code, redirect_uri)
+        if not result["success"]:
+            raise HTTPException(status_code=400, detail="Instagram connection failed. Please try again.")
 
-    await _ensure_unique_instagram_account(db, ig_user_id, user["_id"])
+        token_data = result["token_data"]
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise HTTPException(status_code=400, detail="No access token returned")
 
-    expires_in = token_data.get("expires_in", 5183944)
-    expires_at = _utcnow() + timedelta(seconds=expires_in)
-    encrypted_access_token = InstagramService.encrypt_access_token(access_token)
+        # Prefer user_id baked into token_data (from short-lived token response).
+        # Fall back to /me profile call only if missing.
+        ig_user_id = str(token_data.get("user_id") or "").strip()
+        if not ig_user_id:
+            profile = await InstagramService.get_user_profile(access_token)
+            ig_user_id = str(profile.get("id") or "").strip()
+            logger.info(f"IG user_id from /me fallback: {ig_user_id}")
+        else:
+            logger.info(f"IG user_id from token_data: {ig_user_id}")
 
-    await db.users.update_one(
-        {"_id": user["_id"]},
-        {
-            "$set": {
-                "instagram_user_id": ig_user_id,
-                "instagram_username": str(token_data.get("username") or ""),
-                "instagram_access_token": encrypted_access_token,
-                "ig_token_expires_at": expires_at,
-            }
-        },
-    )
-    # Redirect back to frontend connect page with success flag
-    from fastapi.responses import RedirectResponse
-    frontend_url = settings.FRONTEND_URL or "https://pinguru.me"
-    return RedirectResponse(url=f"{frontend_url}/connect.html?ig_connected=true")
+        if not ig_user_id:
+            raise HTTPException(status_code=400, detail="Could not resolve Instagram user ID")
+
+        await _ensure_unique_instagram_account(db, ig_user_id, user["_id"])
+
+        expires_in = token_data.get("expires_in", 5183944)
+        expires_at = _utcnow() + timedelta(seconds=expires_in)
+        encrypted_access_token = InstagramService.encrypt_access_token(access_token)
+
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {
+                "$set": {
+                    "instagram_user_id": ig_user_id,
+                    "instagram_username": str(token_data.get("username") or ""),
+                    "instagram_access_token": encrypted_access_token,
+                    "ig_token_expires_at": expires_at,
+                }
+            },
+        )
+    except HTTPException as exc:
+        return _oauth_error_redirect(str(exc.detail))
+    except Exception:
+        logger.exception("Unexpected Instagram callback failure")
+        return _oauth_error_redirect("Instagram connection failed. Please try again.")
+
+    return _oauth_success_redirect()
 
 
 @router.post("/instagram/token")
