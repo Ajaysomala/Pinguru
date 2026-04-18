@@ -60,6 +60,9 @@ async def add_security_headers(request, call_next):
     return response
 
 environment = settings.ENVIRONMENT.lower()
+if environment == "production" and not settings.FRONTEND_URL:
+    raise RuntimeError("FRONTEND_URL must be set in production")
+
 allowed_origins = (
     [settings.FRONTEND_URL] if environment == "production" and settings.FRONTEND_URL else ["http://localhost:3000", "http://127.0.0.1:3000"]
 )

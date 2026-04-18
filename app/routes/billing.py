@@ -98,7 +98,7 @@ async def create_checkout_session(
     auth = (settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
     sub_payload = {
         "plan_id": plan_id,
-        "total_count": 12,
+        "total_count": 0,
         "quantity": 1,
         "customer_notify": 1,
         "notes": {"user_id": str(user["_id"]), "plan": target_plan.value, "email": user["email"]},

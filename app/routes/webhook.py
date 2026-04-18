@@ -248,6 +248,9 @@ async def verify_webhook(
 async def handle_webhook(request: Request):
     raw_body = await request.body()
 
+    if settings.ENVIRONMENT.lower() == "production" and settings.DISABLE_WEBHOOK_SIGNATURE:
+        raise HTTPException(status_code=503, detail="Webhook signature verification cannot be disabled in production")
+
     if not settings.DISABLE_WEBHOOK_SIGNATURE:
         signature = request.headers.get("X-Hub-Signature-256")
         _validate_signature(signature, raw_body)

@@ -1,5 +1,5 @@
 name: pinguru-backend
-region: nyc
+region: blr1
 services:
   - name: api
     github:
@@ -50,6 +50,6 @@ services:
       - key: BASE_URL
         value: https://pinguru-backend-XXXX.ondigitalocean.app
       - key: FRONTEND_URL
-        value: https://your-frontend-domain.com
+        value: https://pinguru.me
       - key: ENVIRONMENT
         value: production
