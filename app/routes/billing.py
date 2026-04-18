@@ -3,10 +3,13 @@ import hmac
 import json
 import logging
 from datetime import datetime, timezone
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
+from bson import ObjectId
+from bson.errors import InvalidId
 from pydantic import BaseModel
 
 from app.config import settings
@@ -51,13 +54,31 @@ def _is_razorpay_configured() -> bool:
     )
 
 
+def _ensure_razorpay_checkout_ready() -> None:
+    if not _is_razorpay_configured():
+        raise HTTPException(status_code=503, detail="Payments are temporarily unavailable")
+    if not (settings.RAZORPAY_PLAN_STARTER or "").strip():
+        raise HTTPException(status_code=503, detail="Starter plan is not configured")
+    if not (settings.RAZORPAY_PLAN_PRO or "").strip():
+        raise HTTPException(status_code=503, detail="Pro plan is not configured")
+
+
+def _ensure_razorpay_webhook_ready() -> None:
+    if settings.ENVIRONMENT.lower() == "production" and not (settings.RAZORPAY_WEBHOOK_SECRET or "").strip():
+        raise HTTPException(status_code=503, detail="Webhook secret is not configured")
+
+
+def _normalize_user_plan(user_doc: dict[str, Any]) -> PlanType:
+    return get_plan_type(user_doc.get("plan", PlanType.Free))
+
+
 @router.post("/create-checkout")
 async def create_checkout_session(
     payload: CheckoutRequest,
     user=Depends(get_current_user),
     db=Depends(get_db),
 ):
-    current_plan = get_plan_type(user.get("plan", PlanType.Free))
+    current_plan = _normalize_user_plan(user)
     target_plan = _normalize_requested_plan(payload.plan)
 
     if target_plan == PlanType.Free:
@@ -66,16 +87,13 @@ async def create_checkout_session(
     if _plan_rank(target_plan) <= _plan_rank(current_plan):
         raise HTTPException(status_code=400, detail="Only upgrades are allowed")
 
-    if not _is_razorpay_configured():
-        await db.users.update_one(
-            {"_id": user["_id"]},
-            {"$set": {"plan": target_plan, "dm_limit": get_plan_limits(target_plan).get("dm_limit"), "updated_at": datetime.now(timezone.utc)}},
-        )
-        return {"checkout_url": f"{_frontend_base_url()}/billing?upgraded=true&simulated=true&plan={target_plan.value}"}
+    pending_plan = user.get("pending_plan")
+    if pending_plan in {PlanType.Starter.value, PlanType.Pro.value}:
+        raise HTTPException(status_code=409, detail="A checkout is already pending confirmation")
+
+    _ensure_razorpay_checkout_ready()
 
     plan_id = settings.RAZORPAY_PLAN_STARTER if target_plan == PlanType.Starter else settings.RAZORPAY_PLAN_PRO
-    if not plan_id:
-        raise HTTPException(status_code=400, detail="Razorpay plan ID not configured")
 
     auth = (settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
     sub_payload = {
@@ -95,13 +113,21 @@ async def create_checkout_session(
 
     sub = resp.json()
     sub_id = sub.get("id")
+    if not sub_id:
+        logger.error("Razorpay response missing subscription id: %s", resp.text)
+        raise HTTPException(status_code=502, detail="Invalid response from payment provider")
+
     await db.users.update_one(
         {"_id": user["_id"]},
         {"$set": {"razorpay_subscription_id": sub_id, "pending_plan": target_plan.value}},
     )
 
     frontend_base = _frontend_base_url()
-    checkout_url = f"https://rzp.io/l/{sub_id}?prefill[email]={user['email']}&callback_url={frontend_base}/billing?upgraded=true&cancel_url={frontend_base}/billing"
+    checkout_url = (
+        f"https://rzp.io/l/{sub_id}?prefill[email]={user['email']}"
+        f"&callback_url={frontend_base}/billing?payment=processing&provider=razorpay"
+        f"&cancel_url={frontend_base}/billing"
+    )
     return {"checkout_url": checkout_url}
 
 
@@ -116,6 +142,8 @@ async def get_customer_portal_url(user=Depends(get_current_user)):
 
 @router.post("/razorpay-webhook")
 async def razorpay_webhook(request: Request, db=Depends(get_db)):
+    _ensure_razorpay_webhook_ready()
+
     raw_body = await request.body()
     signature = request.headers.get("X-Razorpay-Signature", "")
 
@@ -129,15 +157,24 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
     logger.info(f"Razorpay webhook: {event_type}")
 
     if event_type == "subscription.activated":
-        from bson import ObjectId
         payload = event.get("payload", {}).get("subscription", {}).get("entity", {})
         notes = payload.get("notes", {})
         user_id = notes.get("user_id")
         plan_str = notes.get("plan")
         if user_id and plan_str:
+            if plan_str not in {PlanType.Starter.value, PlanType.Pro.value}:
+                logger.warning("Ignoring unsupported plan in webhook notes: %s", plan_str)
+                return {"status": "ignored"}
+
             plan_enum = get_plan_type(plan_str)
+            try:
+                user_object_id = ObjectId(user_id)
+            except InvalidId:
+                logger.warning("Ignoring webhook with invalid user id: %s", user_id)
+                return {"status": "ignored"}
+
             await db.users.update_one(
-                {"_id": ObjectId(user_id)},
+                {"_id": user_object_id},
                 {"$set": {"plan": plan_enum, "dm_limit": get_plan_limits(plan_enum).get("dm_limit"), "razorpay_subscription_id": payload.get("id"), "pending_plan": None}},
             )
 
@@ -147,10 +184,28 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
         if sub_id:
             await db.users.update_one(
                 {"razorpay_subscription_id": sub_id},
-                {"$set": {"plan": PlanType.Free, "dm_limit": get_plan_limits(PlanType.Free).get("dm_limit")}},
+                {"$set": {"plan": PlanType.Free, "dm_limit": get_plan_limits(PlanType.Free).get("dm_limit"), "razorpay_subscription_id": None, "pending_plan": None}},
             )
 
     return {"status": "ok"}
+
+
+@router.get("/status")
+async def get_billing_status(user=Depends(get_current_user)):
+    current_plan = _normalize_user_plan(user)
+    pending_value = user.get("pending_plan")
+    pending_plan = pending_value if pending_value in {PlanType.Starter.value, PlanType.Pro.value} else None
+    sub_id = user.get("razorpay_subscription_id")
+    is_active_paid = current_plan in {PlanType.Starter, PlanType.Pro} and bool(sub_id)
+
+    return {
+        "current_plan": current_plan.value,
+        "pending_plan": pending_plan,
+        "subscription_id": sub_id,
+        "payment_provider": "razorpay",
+        "is_active_paid": is_active_paid,
+        "is_checkout_pending": pending_plan is not None and not is_active_paid,
+    }
 
 
 @router.post("/refund")

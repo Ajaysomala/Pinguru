@@ -19,7 +19,7 @@ pinguru/
 │   │   ├── auth.py       # Register, Login, Instagram OAuth
 │   │   ├── automation.py # CRUD for automation rules
 │   │   ├── dashboard.py  # Stats + DM logs
-│   │   └── plans.py      # Stripe checkout + webhook
+│   │   └── plans.py      # Plans + Razorpay checkout alias
 │   └── services/
 │       └── instagram.py  # Instagram Graph API calls
 ├── .do/app.yaml          # DigitalOcean App Platform spec
@@ -95,18 +95,20 @@ Starter and Pro use flat-rate billing. Pro includes unlimited automation rules.
 
 ## 📡 Key API Endpoints
 
-| Method | Route                         | Description       |
-| ------ | ----------------------------- | ----------------- |
-| GET    | /health                       | Health check      |
-| POST   | /auth/register                | Create account    |
-| POST   | /auth/login                   | Login             |
-| GET    | /auth/instagram/callback      | Instagram OAuth   |
-| POST   | /automation/rules             | Create DM rule    |
-| GET    | /automation/rules             | List rules        |
-| PATCH  | /automation/rules/{id}/toggle | Enable/disable    |
-| GET    | /dashboard/stats              | DM stats          |
-| GET    | /dashboard/dm-logs            | DM history        |
-| GET    | /plans                        | Available plans   |
-| POST   | /plans/checkout/{plan}        | Stripe checkout   |
-| GET    | /webhook/instagram            | Meta verification |
-| POST   | /webhook/instagram            | Meta events       |
+| Method | Route                         | Description            |
+| ------ | ----------------------------- | ---------------------- |
+| GET    | /health                       | Health check           |
+| POST   | /auth/register                | Create account         |
+| POST   | /auth/login                   | Login                  |
+| GET    | /auth/instagram/callback      | Instagram OAuth        |
+| POST   | /automation/rules             | Create DM rule         |
+| GET    | /automation/rules             | List rules             |
+| PATCH  | /automation/rules/{id}/toggle | Enable/disable         |
+| GET    | /dashboard/stats              | DM stats               |
+| GET    | /dashboard/dm-logs            | DM history             |
+| GET    | /plans                        | Available plans        |
+| POST   | /plans/checkout/{plan}        | Razorpay checkout      |
+| GET    | /plans/status                 | Current billing status |
+| POST   | /plans/razorpay-webhook       | Razorpay webhook       |
+| GET    | /webhook/instagram            | Meta verification      |
+| POST   | /webhook/instagram            | Meta events            |

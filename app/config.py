@@ -44,4 +44,4 @@ class Settings(BaseSettings):
     DISABLE_WEBHOOK_SIGNATURE: bool = False
 
 
-settings = Settings()
+settings = Settings()  # pyright: ignore[reportCallIssue]

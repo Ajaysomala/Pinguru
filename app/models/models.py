@@ -84,8 +84,8 @@ class UserInDB(BaseModel):
     ig_token_expires_at: Optional[datetime] = None
     dm_count_this_month: int = 0
     dm_limit: int = 200
-    stripe_customer_id: Optional[str] = None
-    stripe_subscription_id: Optional[str] = None
+    razorpay_subscription_id: Optional[str] = None
+    pending_plan: Optional[str] = None
     is_active: bool = True
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
