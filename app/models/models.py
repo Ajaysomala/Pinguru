@@ -98,6 +98,9 @@ class UserInDB(BaseModel):
     dm_limit: Optional[int] = None
     razorpay_subscription_id: Optional[str] = None
     pending_plan: Optional[str] = None
+    billing_cycle: Optional[str] = None
+    pending_plan_billing_cycle: Optional[str] = None
+    checkout_initiated_at: Optional[datetime] = None
     is_active: bool = True
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

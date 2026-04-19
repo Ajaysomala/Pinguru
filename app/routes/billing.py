@@ -2,9 +2,9 @@ import hashlib
 import hmac
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -107,6 +107,37 @@ def _normalize_user_plan(user_doc: dict[str, Any]) -> PlanType:
     return get_plan_type(user_doc.get("plan", PlanType.Free))
 
 
+async def _clear_stale_pending_checkout(db, user: dict[str, Any]) -> bool:
+    pending_plan = user.get("pending_plan")
+    if pending_plan not in {PlanType.Starter.value, PlanType.Pro.value}:
+        return False
+
+    initiated_at = user.get("checkout_initiated_at")
+    if not initiated_at:
+        return False
+
+    if initiated_at.tzinfo is None:
+        initiated_at = initiated_at.replace(tzinfo=timezone.utc)
+
+    age_minutes = (datetime.now(timezone.utc) - initiated_at).total_seconds() / 60
+    if age_minutes <= 30:
+        return False
+
+    await db.users.update_one(
+        {"_id": user["_id"], "plan": PlanType.Free.value},
+        {
+            "$set": {
+                "pending_plan": None,
+                "pending_plan_billing_cycle": None,
+                "razorpay_subscription_id": None,
+                "checkout_initiated_at": None,
+            }
+        },
+    )
+    logger.info("Auto-cleared stale pending checkout for user=%s", str(user.get("_id")))
+    return True
+
+
 @router.post("/create-checkout")
 async def create_checkout_session(
     payload: CheckoutRequest,
@@ -122,6 +153,9 @@ async def create_checkout_session(
 
     if _plan_rank(target_plan) <= _plan_rank(current_plan):
         raise HTTPException(status_code=400, detail="Only upgrades are allowed")
+
+    if await _clear_stale_pending_checkout(db, user):
+        user = await db.users.find_one({"_id": user["_id"]}) or user
 
     pending_plan = user.get("pending_plan")
     if pending_plan in {PlanType.Starter.value, PlanType.Pro.value}:
@@ -162,17 +196,20 @@ async def create_checkout_session(
                 "razorpay_subscription_id": sub_id,
                 "pending_plan": target_plan.value,
                 "pending_plan_billing_cycle": billing_cycle,
+                "checkout_initiated_at": datetime.now(timezone.utc),
             }
         },
     )
 
-    frontend_base = _frontend_base_url()
-    checkout_url = (
-        f"https://rzp.io/l/{sub_id}?prefill[email]={user['email']}"
-        f"&callback_url={frontend_base}/billing?payment=processing&provider=razorpay"
-        f"&cancel_url={frontend_base}/billing"
-    )
-    return {"checkout_url": checkout_url}
+    short_url = str(sub.get("short_url") or "").strip()
+    return {
+        "subscription_id": sub_id,
+        "checkout_url": short_url or f"https://rzp.io/l/{sub_id}",
+        "key_id": settings.RAZORPAY_KEY_ID,
+        "prefill_email": user["email"],
+        "plan": target_plan.value,
+        "billing_cycle": billing_cycle,
+    }
 
 
 @router.post("/portal")
@@ -209,16 +246,25 @@ async def cancel_pending_checkout(user=Depends(get_current_user), db=Depends(get
         except httpx.RequestError as exc:
             logger.warning("Failed to cancel pending Razorpay subscription %s: %s", sub_id, exc)
 
-    await db.users.update_one(
-        {"_id": user["_id"]},
+    result = await db.users.update_one(
+        {
+            "_id": user["_id"],
+            "plan": PlanType.Free.value,
+            "pending_plan": {"$in": [PlanType.Starter.value, PlanType.Pro.value]},
+        },
         {
             "$set": {
                 "pending_plan": None,
                 "pending_plan_billing_cycle": None,
                 "razorpay_subscription_id": None,
+                "checkout_initiated_at": None,
             }
         },
     )
+
+    if result.matched_count == 0:
+        logger.info("cancel-pending skipped because checkout already changed for user=%s", str(user.get("_id")))
+        return {"cancelled": False, "message": "Subscription already changed or activated"}
 
     return {"cancelled": True, "message": "Pending checkout cancelled"}
 
@@ -230,10 +276,12 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
     raw_body = await request.body()
     signature = request.headers.get("X-Razorpay-Signature", "")
 
-    if settings.RAZORPAY_WEBHOOK_SECRET:
-        expected = hmac.new(settings.RAZORPAY_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, signature):
-            raise HTTPException(status_code=400, detail="Invalid webhook signature")
+    if not signature:
+        raise HTTPException(status_code=400, detail="Missing signature")
+
+    expected = hmac.new(settings.RAZORPAY_WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
     event = json.loads(raw_body)
     event_type = event.get("event")
@@ -244,6 +292,7 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
         notes = payload.get("notes", {})
         user_id = notes.get("user_id")
         plan_str = notes.get("plan")
+        incoming_sub_id = payload.get("id")
         billing_cycle = _normalize_billing_cycle(notes.get("billing_cycle"))
         if user_id and plan_str:
             if plan_str not in {PlanType.Starter.value, PlanType.Pro.value}:
@@ -257,16 +306,32 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
                 logger.warning("Ignoring webhook with invalid user id: %s", user_id)
                 return {"status": "ignored"}
 
+            user_doc = await db.users.find_one({"_id": user_object_id})
+            if not user_doc:
+                logger.warning("Webhook for unknown user id: %s", user_id)
+                return {"status": "ignored"}
+
+            stored_sub_id = str(user_doc.get("razorpay_subscription_id") or "")
+            if stored_sub_id and stored_sub_id != str(incoming_sub_id or ""):
+                logger.warning(
+                    "Subscription id mismatch user=%s stored=%s incoming=%s",
+                    user_id,
+                    stored_sub_id,
+                    incoming_sub_id,
+                )
+                return {"status": "ignored"}
+
             await db.users.update_one(
                 {"_id": user_object_id},
                 {
                     "$set": {
                         "plan": plan_enum,
                         "dm_limit": get_plan_limits(plan_enum).get("dm_limit"),
-                        "razorpay_subscription_id": payload.get("id"),
+                        "razorpay_subscription_id": incoming_sub_id,
                         "pending_plan": None,
                         "billing_cycle": billing_cycle,
                         "pending_plan_billing_cycle": None,
+                        "checkout_initiated_at": None,
                     }
                 },
             )
@@ -285,6 +350,7 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
                         "pending_plan": None,
                         "billing_cycle": None,
                         "pending_plan_billing_cycle": None,
+                        "checkout_initiated_at": None,
                     }
                 },
             )
