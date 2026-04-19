@@ -19,7 +19,7 @@ from bson import ObjectId
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-FREE_BRAND_FOOTER = "\n\n- Powered by PinGuru"
+FREE_BRAND_FOOTER = "\n\n© PinGuru"
 FOLLOW_CONFIRMATION_TOKENS = {
     "followed",
     "done",
@@ -228,10 +228,15 @@ def _build_follow_prompt(user: dict[str, Any]) -> str:
     username = str(user.get("instagram_username") or "").strip()
     if username:
         return (
-            f"Please follow @{username} first, then reply FOLLOWED here. "
-            f"You can open the profile: https://instagram.com/{username}"
+            f"Please follow @{username} first to unlock this DM.\n\n"
+            f"1) Visit profile: https://instagram.com/{username}\n"
+            f"2) After following, reply here with: FOLLOWED"
         )
-    return "Please follow our Instagram account first, then reply FOLLOWED here to receive your DM details."
+    return (
+        "Please follow our Instagram account first to unlock this DM.\n\n"
+        "1) Visit our profile\n"
+        "2) After following, reply here with: FOLLOWED"
+    )
 
 
 async def _mark_event_if_new(db, event_key: str, source: str) -> bool:

@@ -95,7 +95,7 @@ class UserInDB(BaseModel):
     instagram_access_token: Optional[str] = None
     ig_token_expires_at: Optional[datetime] = None
     dm_count_this_month: int = 0
-    dm_limit: int = 200
+    dm_limit: Optional[int] = None
     razorpay_subscription_id: Optional[str] = None
     pending_plan: Optional[str] = None
     is_active: bool = True
@@ -163,9 +163,36 @@ class DMLog(BaseModel):
 # ── Plan Limits ───────────────────────────────────────────────────────────────
 
 PLAN_LIMITS = {
-    PlanType.Free:    {"dm_limit": None, "price_inr": 0,   "rules": 5,    "contacts_limit": 500},
-    PlanType.Starter: {"dm_limit": None, "price_inr": 199, "rules": 15,   "contacts_limit": None},
-    PlanType.Pro:     {"dm_limit": None, "price_inr": 499, "rules": None,  "contacts_limit": None},
+    PlanType.Free: {
+        "dm_limit": None,
+        "price_inr": 0,
+        "rules": 5,
+        "contacts_limit": 500,
+        "analytics_tier": "basic",
+        "support_tier": "email",
+        "branding": "footer_copyright",
+        "ask_follow_before_dm": False,
+    },
+    PlanType.Starter: {
+        "dm_limit": None,
+        "price_inr": 199,
+        "rules": 15,
+        "contacts_limit": None,
+        "analytics_tier": "premium",
+        "support_tier": "priority_email",
+        "branding": "none",
+        "ask_follow_before_dm": True,
+    },
+    PlanType.Pro: {
+        "dm_limit": None,
+        "price_inr": 499,
+        "rules": None,
+        "contacts_limit": None,
+        "analytics_tier": "premium",
+        "support_tier": "24x7_priority",
+        "branding": "none",
+        "ask_follow_before_dm": True,
+    },
 }
 
 

@@ -7,6 +7,35 @@ from app.routes.billing import CheckoutRequest, create_checkout_session, get_bil
 
 router = APIRouter()
 
+PLAN_FEATURES = {
+    PlanType.Free: [
+        "5 automation flows",
+        "Unlimited DMs",
+        "500 contacts / month",
+        "Basic analytics",
+        "Email support",
+        "DM footer: © PinGuru",
+    ],
+    PlanType.Starter: [
+        "15 automation flows",
+        "Unlimited DMs",
+        "Unlimited contacts",
+        "No footer branding",
+        "Premium analytics",
+        "Ask-to-follow before DM delivery",
+        "Priority email support",
+    ],
+    PlanType.Pro: [
+        "Unlimited automation flows",
+        "Unlimited DMs",
+        "Unlimited contacts",
+        "Premium analytics",
+        "24/7 faster support",
+        "No footer branding",
+        "Ask-to-follow before DM delivery",
+    ],
+}
+
 # ── Get All Plans ─────────────────────────────────────────────────────────────
 
 @router.get("")
@@ -20,11 +49,17 @@ async def get_plans():
     return {
         "plans": [
             {
+                "id": plan.value,
                 "name": plan.name,
                 "price_inr": limits["price_inr"],
                 "dm_limit": limits["dm_limit"],
                 "rule_limit": "Unlimited" if limits["rules"] is None else limits["rules"],
                 "contacts_limit": limits.get("contacts_limit"),
+                "analytics_tier": limits.get("analytics_tier", "basic"),
+                "support_tier": limits.get("support_tier", "email"),
+                "branding": limits.get("branding", "footer_copyright"),
+                "ask_follow_before_dm": bool(limits.get("ask_follow_before_dm", False)),
+                "features": PLAN_FEATURES.get(plan, []),
                 "pricing": {
                     cycle: (limits["price_inr"] * multiplier)
                     for cycle, multiplier in billing_cycles.items()
