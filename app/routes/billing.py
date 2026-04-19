@@ -184,6 +184,45 @@ async def get_customer_portal_url(user=Depends(get_current_user)):
     return {"portal_url": f"https://razorpay.com/subscription/{sub_id}"}
 
 
+@router.post("/cancel-pending")
+async def cancel_pending_checkout(user=Depends(get_current_user), db=Depends(get_db)):
+    pending_plan = user.get("pending_plan")
+    sub_id = user.get("razorpay_subscription_id")
+    current_plan = _normalize_user_plan(user)
+    is_active_paid = current_plan in {PlanType.Starter, PlanType.Pro} and bool(sub_id)
+
+    if not pending_plan:
+        return {"cancelled": False, "message": "No pending checkout found"}
+
+    if is_active_paid:
+        raise HTTPException(status_code=409, detail="Cannot cancel an active paid subscription")
+
+    # Best effort cancellation on provider side if subscription was already created.
+    if sub_id and _is_razorpay_configured():
+        auth = (settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
+        cancel_url = f"https://api.razorpay.com/v1/subscriptions/{sub_id}/cancel"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(cancel_url, auth=auth)
+            if resp.status_code >= 400:
+                logger.warning("Razorpay pending cancellation returned %s: %s", resp.status_code, resp.text)
+        except httpx.RequestError as exc:
+            logger.warning("Failed to cancel pending Razorpay subscription %s: %s", sub_id, exc)
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "pending_plan": None,
+                "pending_plan_billing_cycle": None,
+                "razorpay_subscription_id": None,
+            }
+        },
+    )
+
+    return {"cancelled": True, "message": "Pending checkout cancelled"}
+
+
 @router.post("/razorpay-webhook")
 async def razorpay_webhook(request: Request, db=Depends(get_db)):
     _ensure_razorpay_webhook_ready()
