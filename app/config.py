@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     RAZORPAY_PLAN_PRO_QUARTERLY: str = ""
     RAZORPAY_PLAN_PRO_YEARLY: str = ""
     RAZORPAY_WEBHOOK_SECRET: str = ""
+    RAZORPAY_SUBSCRIPTION_TOTAL_COUNT: int = 120
 
     JWT_SECRET: str
     JWT_ALGORITHM: str = "HS256"

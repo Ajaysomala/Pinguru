@@ -132,9 +132,10 @@ async def create_checkout_session(
     plan_id = _resolve_razorpay_plan_id(target_plan, billing_cycle)
 
     auth = (settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
+    total_count = max(1, int(settings.RAZORPAY_SUBSCRIPTION_TOTAL_COUNT or 1))
     sub_payload = {
         "plan_id": plan_id,
-        "total_count": 0,
+        "total_count": total_count,
         "quantity": 1,
         "customer_notify": 1,
         "notes": {"user_id": str(user["_id"]), "plan": target_plan.value, "email": user["email"]},
