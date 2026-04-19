@@ -99,7 +99,7 @@ def _ensure_razorpay_checkout_ready(target_plan: PlanType, billing_cycle: str) -
 
 
 def _ensure_razorpay_webhook_ready() -> None:
-    if settings.ENVIRONMENT.lower() == "production" and not (settings.RAZORPAY_WEBHOOK_SECRET or "").strip():
+    if not (settings.RAZORPAY_WEBHOOK_SECRET or "").strip():
         raise HTTPException(status_code=503, detail="Webhook secret is not configured")
 
 
@@ -344,7 +344,7 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
                 {"razorpay_subscription_id": sub_id},
                 {
                     "$set": {
-                        "plan": PlanType.Free,
+                        "plan": PlanType.Free.value,
                         "dm_limit": get_plan_limits(PlanType.Free).get("dm_limit"),
                         "razorpay_subscription_id": None,
                         "pending_plan": None,
