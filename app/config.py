@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     JWT_EXPIRE_MINUTES: int = 10080
     BASE_URL: str = "https://api.pinguru.me"
     FRONTEND_URL: str = ""
+    INSTAGRAM_REDIRECT_URI: str = ""
     ADMIN_FRONTEND_URLS: str = ""
     ENCRYPTION_KEY: str
     admin_api_key: str = ""

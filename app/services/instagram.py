@@ -12,6 +12,29 @@ HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 class InstagramService:
 
     @staticmethod
+    def _resolve_instagram_oauth_credentials() -> tuple[str, str, str]:
+        """Return (client_id, client_secret, source) for OAuth token exchange.
+
+        Uses IG app credentials when both are set; otherwise falls back to Meta app credentials.
+        Prevents mixed credential pairs (e.g., IG app id + Meta app secret), which Meta rejects.
+        """
+        ig_client_id = (settings.IG_APP_ID or "").strip()
+        ig_client_secret = (settings.IG_APP_SECRET or "").strip()
+        meta_client_id = (settings.META_APP_ID or "").strip()
+        meta_client_secret = (settings.META_APP_SECRET or "").strip()
+
+        if bool(ig_client_id) != bool(ig_client_secret):
+            raise ValueError("IG_APP_ID and IG_APP_SECRET must both be set together")
+
+        if ig_client_id and ig_client_secret:
+            return ig_client_id, ig_client_secret, "instagram-app"
+
+        if meta_client_id and meta_client_secret:
+            return meta_client_id, meta_client_secret, "meta-app"
+
+        raise ValueError("Missing OAuth app credentials: set IG_APP_ID/IG_APP_SECRET or META_APP_ID/META_APP_SECRET")
+
+    @staticmethod
     def _normalize_media_kind(item: dict) -> str:
         media_type = str(item.get("media_type") or "").strip().upper()
         media_product_type = str(item.get("media_product_type") or "").strip().upper()
@@ -188,9 +211,12 @@ class InstagramService:
     async def exchange_code_for_token(code: str, redirect_uri: str) -> dict:
         """Exchange OAuth code for short-lived token (Instagram Business Login flow),
         then exchange for long-lived token (60 days)."""
-        # Use IG_APP_ID/IG_APP_SECRET for token exchange (Instagram sub-app credentials)
-        ig_client_id = settings.IG_APP_ID or settings.META_APP_ID
-        ig_client_secret = settings.IG_APP_SECRET or settings.META_APP_SECRET
+        try:
+            ig_client_id, ig_client_secret, credential_source = InstagramService._resolve_instagram_oauth_credentials()
+        except ValueError as exc:
+            logger.error("Instagram OAuth config error: %s", exc)
+            return {"success": False, "error": "Instagram OAuth configuration is incomplete"}
+
         # Step 1: short-lived token via Instagram API endpoint (not Facebook Graph)
         token_url = "https://api.instagram.com/oauth/access_token"
         try:
@@ -202,10 +228,20 @@ class InstagramService:
                     "redirect_uri": redirect_uri,
                     "code": code,
                 })
-            short = resp.json()
-            logger.info("Short-lived token response status: %s", resp.status_code)
+            try:
+                short = resp.json()
+            except ValueError:
+                short = {}
+            logger.info("Short-lived token response status: %s (credentials=%s)", resp.status_code, credential_source)
             if "access_token" not in short:
-                return {"success": False, "error": "Instagram token exchange failed"}
+                error_message = str(
+                    short.get("error_message")
+                    or short.get("error_description")
+                    or short.get("error")
+                    or "Instagram token exchange failed"
+                )
+                logger.warning("Instagram short-lived token exchange failed: status=%s body=%s", resp.status_code, short)
+                return {"success": False, "error": error_message}
         except httpx.RequestError:
             logger.exception("Instagram short-lived token exchange failed")
             return {"success": False, "error": "Instagram token exchange failed"}
@@ -222,11 +258,14 @@ class InstagramService:
                     "client_secret": ig_client_secret,
                     "access_token": short["access_token"],
                 })
-            ll_data = resp.json()
+            try:
+                ll_data = resp.json()
+            except ValueError:
+                ll_data = {}
             logger.info("Long-lived token response status: %s", resp.status_code)
             if "access_token" not in ll_data:
                 # Fall back to short-lived token if long-lived exchange fails
-                logger.warning("Long-lived token exchange failed, using short-lived token")
+                logger.warning("Long-lived token exchange failed, using short-lived token: status=%s body=%s", resp.status_code, ll_data)
                 return {"success": True, "token_data": {
                     "access_token": short["access_token"],
                     "expires_in": 3600,

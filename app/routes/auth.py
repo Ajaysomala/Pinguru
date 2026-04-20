@@ -218,6 +218,13 @@ def _oauth_frontend_base() -> str:
     return settings.FRONTEND_URL or "https://pinguru.me"
 
 
+def _instagram_redirect_uri() -> str:
+    explicit = (settings.INSTAGRAM_REDIRECT_URI or "").strip()
+    if explicit:
+        return explicit
+    return f"{settings.BASE_URL.rstrip('/')}/auth/instagram/callback"
+
+
 def _oauth_error_redirect(message: str) -> RedirectResponse:
     return RedirectResponse(url=f"{_oauth_frontend_base()}/connect.html?ig_error={quote(message)}")
 
@@ -566,7 +573,7 @@ async def logout():
 @router.get("/instagram/initiate")
 async def instagram_initiate(user=Depends(get_current_user)):
     state = create_oauth_state(str(user["_id"]))
-    redirect_uri = f"{settings.BASE_URL}/auth/instagram/callback"
+    redirect_uri = _instagram_redirect_uri()
     # Use IG_APP_ID (Instagram sub-app) for instagram.com/oauth/authorize
     # Fall back to META_APP_ID only if IG_APP_ID not set
     ig_client_id = settings.IG_APP_ID or settings.META_APP_ID
@@ -614,10 +621,11 @@ async def instagram_callback(
         if not user:
             raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
-        redirect_uri = f"{settings.BASE_URL}/auth/instagram/callback"
+        redirect_uri = _instagram_redirect_uri()
         result = await InstagramService.exchange_code_for_token(code, redirect_uri)
         if not result["success"]:
-            raise HTTPException(status_code=400, detail="Instagram connection failed. Please try again.")
+            detail = str(result.get("error") or "Instagram connection failed. Please try again.")
+            raise HTTPException(status_code=400, detail=detail)
 
         token_data = result["token_data"]
         access_token = token_data.get("access_token")
