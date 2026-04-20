@@ -90,6 +90,9 @@ class UserInDB(BaseModel):
     otp_attempts: int = 0
     otp_resend_count: int = 0
     otp_resend_window_started_at: Optional[datetime] = None
+    failed_login_attempts: int = 0
+    login_lockout_until: Optional[datetime] = None
+    session_version: int = 0
     plan: PlanType = PlanType.Free
     instagram_user_id: Optional[str] = None
     instagram_access_token: Optional[str] = None

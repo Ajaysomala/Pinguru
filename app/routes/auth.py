@@ -87,10 +87,26 @@ def verify_password(pw: str, hashed: str) -> bool:
     return pwd_ctx.verify(pw, hashed)
 
 
-def create_jwt(user_id: str) -> str:
+def create_jwt(user_id: str, session_version: int = 0) -> str:
     expire = _utcnow() + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
-    payload = {"sub": user_id, "exp": expire}
+    payload = {"sub": user_id, "exp": expire, "sv": int(session_version)}
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+
+def _session_version(user_doc: dict[str, Any]) -> int:
+    try:
+        return int(user_doc.get("session_version", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _login_lockout_until(user_doc: dict[str, Any]) -> datetime | None:
+    return _as_aware_utc(user_doc.get("login_lockout_until"))
+
+
+def _is_login_locked(user_doc: dict[str, Any]) -> bool:
+    locked_until = _login_lockout_until(user_doc)
+    return bool(locked_until and _utcnow() < locked_until)
 
 
 def _set_auth_cookie(response: Response, token: str) -> None:
@@ -231,6 +247,9 @@ async def get_current_user(request: Request, db=Depends(get_db)):
         user = await db.users.find_one({"_id": ObjectId(user_id)})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
+        token_session_version = int(payload.get("sv") or 0)
+        if token_session_version != _session_version(user):
+            raise HTTPException(status_code=401, detail="Session expired")
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -247,7 +266,7 @@ async def register(request: Request, data: UserCreate, db=Depends(get_db)):
     existing = await db.users.find_one({"email": email})
 
     if existing:
-        raise HTTPException(status_code=400, detail="Email already registered. Please sign in or verify your account.")
+        raise HTTPException(status_code=400, detail="Unable to create account. Please try again.")
 
     otp = generate_otp()
     otp_expires = _utcnow() + timedelta(minutes=5)
@@ -271,6 +290,9 @@ async def register(request: Request, data: UserCreate, db=Depends(get_db)):
         "otp_attempts": 0,
         "otp_resend_window_started_at": _utcnow(),
         "otp_resend_count": 1,
+        "failed_login_attempts": 0,
+        "login_lockout_until": None,
+        "session_version": 0,
         "created_at": _utcnow(),
         "first_name": first_name,
         "last_name": last_name,
@@ -307,7 +329,7 @@ async def verify_email(request: Request, data: OTPVerifyRequest, db=Depends(get_
         raise HTTPException(status_code=404, detail="User not found")
 
     if user.get("email_verified"):
-        token = create_jwt(str(user["_id"]))
+        token = create_jwt(str(user["_id"]), _session_version(user))
         response = Response(
             json.dumps({
                 "message": "Already verified",
@@ -341,11 +363,13 @@ async def verify_email(request: Request, data: OTPVerifyRequest, db=Depends(get_
                 "otp_attempts": 0,
                 "otp_resend_count": 0,
                 "otp_resend_window_started_at": None,
+                "failed_login_attempts": 0,
+                "login_lockout_until": None,
             }
         },
     )
 
-    token = create_jwt(str(user["_id"]))
+    token = create_jwt(str(user["_id"]), _session_version(user))
     response = Response(
         json.dumps({
             "message": "Email verified",
@@ -449,6 +473,9 @@ async def forgot_password_reset(request: Request, data: ResetPasswordRequest, db
         {
             "$set": {
                 "hashed_password": hash_password(password),
+                "failed_login_attempts": 0,
+                "login_lockout_until": None,
+                "session_version": _session_version(user) + 1,
             }
         },
     )
@@ -464,13 +491,27 @@ async def login(request: Request, data: UserLoginRequest, db=Depends(get_db)):
     email = str(data.email).strip().lower()
     user = await db.users.find_one({"email": email})
 
+    if user and _is_login_locked(user):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again later.")
+
     if not user or not verify_password(data.password, user["hashed_password"]):
+        if user:
+            failed_login_attempts = int(user.get("failed_login_attempts", 0) or 0) + 1
+            update: dict[str, Any] = {"failed_login_attempts": failed_login_attempts}
+            if failed_login_attempts >= 5:
+                update["login_lockout_until"] = _utcnow() + timedelta(minutes=15)
+            await db.users.update_one({"_id": user["_id"]}, {"$set": update})
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     if not user.get("email_verified", False):
         raise HTTPException(status_code=403, detail="Email not verified. Check your inbox for OTP.")
 
-    token = create_jwt(str(user["_id"]))
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"failed_login_attempts": 0, "login_lockout_until": None}},
+    )
+
+    token = create_jwt(str(user["_id"]), _session_version(user))
     response_data = {
         "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
         "instagram_connected": bool(user.get("instagram_user_id")),
@@ -752,6 +793,9 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
                 "is_active": True,
                 "email_verified": True,
                 "oauth_provider": "google",
+                "failed_login_attempts": 0,
+                "login_lockout_until": None,
+                "session_version": 0,
                 "created_at": _utcnow(),
                 "first_name": first_name,
                 "last_name": last_name,
@@ -764,7 +808,7 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
             await db.users.update_one({"_id": user["_id"]}, {"$set": {"email_verified": True}})
             user["email_verified"] = True
 
-        token = create_jwt(str(user["_id"]))
+        token = create_jwt(str(user["_id"]), _session_version(user))
         response = Response(
             json.dumps(
                 {
