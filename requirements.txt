@@ -12,5 +12,5 @@ slowapi==0.1.9
 cryptography==42.0.8
 bcrypt==4.0.1
 google-auth==2.27.0
-pyotp
-resend
+pyotp==2.9.0
+resend==2.0.0

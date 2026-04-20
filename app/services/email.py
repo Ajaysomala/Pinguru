@@ -130,3 +130,36 @@ async def send_password_reset_email(to_email: str, reset_url: str) -> bool:
     if resend_ok:
         return True
     return await asyncio.to_thread(_send_via_smtp_html_sync, to_email, subject, html)
+
+
+def _subscription_expired_html(plan: str) -> str:
+    plan_display = plan.capitalize()
+    return f"""
+    <div style='font-family: Inter, Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 28px;'>
+      <h2 style='margin: 0 0 10px; color: #6d28d9;'>Your PinGuru {plan_display} plan has ended</h2>
+      <p style='margin: 0 0 14px; color: #111827;'>
+        Your <strong>{plan_display}</strong> subscription has been cancelled or expired.
+        Your account has been moved to the Free plan.
+      </p>
+      <p style='margin: 0 0 18px; color: #111827;'>
+        Your automation rules are still saved — simply resubscribe to reactivate them.
+      </p>
+      <p style='margin: 0 0 18px;'>
+        <a href='https://pinguru.me/billing' style='display:inline-block; background:#4f46e5; color:#fff; text-decoration:none; padding:12px 18px; border-radius:10px; font-weight:600;'>
+          Resubscribe
+        </a>
+      </p>
+      <p style='margin: 0; color: #6b7280; font-size: 14px;'>
+        If you have any questions, reply to this email or contact support at pinguru.me/support.
+      </p>
+    </div>
+    """
+
+
+async def send_subscription_expired_email(to_email: str, plan: str) -> bool:
+    subject = f"Your PinGuru {plan.capitalize()} plan has ended"
+    html = _subscription_expired_html(plan)
+    resend_ok = await _send_via_resend_html(to_email, subject, html)
+    if resend_ok:
+        return True
+    return await asyncio.to_thread(_send_via_smtp_html_sync, to_email, subject, html)

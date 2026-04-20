@@ -16,6 +16,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.models import PlanType, get_plan_limits, get_plan_type
 from app.routes.auth import get_current_user
+from app.services.email import send_subscription_expired_email
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -340,6 +341,10 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
         payload = event.get("payload", {}).get("subscription", {}).get("entity", {})
         sub_id = payload.get("id")
         if sub_id:
+            # Fetch user before downgrading to get email + current plan
+            user_doc = await db.users.find_one({"razorpay_subscription_id": sub_id})
+            previous_plan = str((user_doc or {}).get("plan") or "paid")
+
             await db.users.update_one(
                 {"razorpay_subscription_id": sub_id},
                 {
@@ -354,6 +359,13 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
                     }
                 },
             )
+
+            # Notify user their plan has ended
+            if user_doc and user_doc.get("email"):
+                try:
+                    await send_subscription_expired_email(user_doc["email"], previous_plan)
+                except Exception:
+                    logger.warning("Failed to send subscription expired email to %s", user_doc.get("email"))
 
     return {"status": "ok"}
 
@@ -382,11 +394,22 @@ async def get_billing_status(user=Depends(get_current_user)):
 
 @router.post("/refund")
 async def request_refund(data: RefundRequest, user=Depends(get_current_user), db=Depends(get_db)):
+    current_plan = _normalize_user_plan(user)
+
+    # Free plan users have nothing to refund
+    if current_plan == PlanType.Free:
+        raise HTTPException(status_code=400, detail="No active paid subscription found to refund.")
+
+    # Require a reason
+    reason = data.reason.strip()[:500]
+    if not reason:
+        raise HTTPException(status_code=400, detail="Please provide a reason for your refund request.")
+
     await db.refund_requests.insert_one({
         "user_id": str(user["_id"]),
         "email": user.get("email"),
         "plan": user.get("plan"),
-        "reason": data.reason.strip()[:500],
+        "reason": reason,
         "payment_id": data.payment_id,
         "status": "pending",
         "created_at": datetime.now(timezone.utc),

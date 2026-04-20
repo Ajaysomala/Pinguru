@@ -3,7 +3,7 @@ region: blr1
 services:
   - name: api
     github:
-      repo: YOUR_GITHUB_USERNAME/pinguru
+      repo: Ajaysomala/pinguru
       branch: main
       deploy_on_push: true
     build_command: pip install -r requirements.txt
@@ -12,18 +12,20 @@ services:
     health_check:
       http_path: /health
     instance_count: 1
-    instance_size_slug: basic-xxs # cheapest — free with DO credits
+    instance_size_slug: basic-xxs
     envs:
       - key: MONGODB_URI
         value: YOUR_MONGODB_ATLAS_URI
         type: SECRET
       - key: META_APP_ID
         value: "933347079475444"
+        type: SECRET
       - key: META_APP_SECRET
         value: YOUR_META_APP_SECRET
         type: SECRET
       - key: META_WEBHOOK_VERIFY_TOKEN
-        value: pinguru_webhook_2024 # change this to anything secret
+        value: YOUR_WEBHOOK_VERIFY_TOKEN
+        type: SECRET
       - key: JWT_SECRET
         value: YOUR_RANDOM_JWT_SECRET
         type: SECRET
@@ -31,12 +33,19 @@ services:
         value: YOUR_FERNET_ENCRYPTION_KEY
         type: SECRET
       - key: ADMIN_EMAIL
-        value: admin@example.com
+        value: YOUR_ADMIN_EMAIL
+        type: SECRET
       - key: ADMIN_PASSWORD_HASH
         value: YOUR_BCRYPT_HASH
         type: SECRET
+      - key: ADMIN_API_KEY
+        value: YOUR_ADMIN_API_KEY
+        type: SECRET
+      - key: ADMIN_FRONTEND_URLS
+        value: https://admin-pinguru.pages.dev
       - key: RAZORPAY_KEY_ID
         value: YOUR_RAZORPAY_KEY_ID
+        type: SECRET
       - key: RAZORPAY_KEY_SECRET
         value: YOUR_RAZORPAY_KEY_SECRET
         type: SECRET
@@ -44,12 +53,48 @@ services:
         value: plan_xxx_starter
       - key: RAZORPAY_PLAN_PRO
         value: plan_xxx_pro
+      - key: RAZORPAY_PLAN_STARTER_MONTHLY
+        value: plan_xxx_starter_monthly
+      - key: RAZORPAY_PLAN_STARTER_QUARTERLY
+        value: plan_xxx_starter_quarterly
+      - key: RAZORPAY_PLAN_STARTER_YEARLY
+        value: plan_xxx_starter_yearly
+      - key: RAZORPAY_PLAN_PRO_MONTHLY
+        value: plan_xxx_pro_monthly
+      - key: RAZORPAY_PLAN_PRO_QUARTERLY
+        value: plan_xxx_pro_quarterly
+      - key: RAZORPAY_PLAN_PRO_YEARLY
+        value: plan_xxx_pro_yearly
       - key: RAZORPAY_WEBHOOK_SECRET
         value: YOUR_RAZORPAY_WEBHOOK_SECRET
         type: SECRET
+      - key: RAZORPAY_SUBSCRIPTION_TOTAL_COUNT
+        value: "120"
+      - key: RESEND_API_KEY
+        value: YOUR_RESEND_API_KEY
+        type: SECRET
+      - key: SMTP_EMAIL
+        value: YOUR_SMTP_EMAIL
+        type: SECRET
+      - key: SMTP_APP_PASSWORD
+        value: YOUR_SMTP_APP_PASSWORD
+        type: SECRET
+      - key: OTP_FROM_EMAIL
+        value: YOUR_OTP_FROM_EMAIL
+        type: SECRET
+      - key: GOOGLE_CLIENT_ID
+        value: YOUR_GOOGLE_CLIENT_ID
+        type: SECRET
+      - key: DEFAULT_OAUTH_PASSWORD
+        value: YOUR_DEFAULT_OAUTH_PASSWORD
+        type: SECRET
       - key: BASE_URL
-        value: https://pinguru-backend-XXXX.ondigitalocean.app
+        value: https://api.pinguru.me
       - key: FRONTEND_URL
         value: https://pinguru.me
+      - key: INSTAGRAM_REDIRECT_URI
+        value: https://api.pinguru.me/auth/instagram/callback
       - key: ENVIRONMENT
         value: production
+      - key: DISABLE_WEBHOOK_SIGNATURE
+        value: "false"

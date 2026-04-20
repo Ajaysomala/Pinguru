@@ -575,7 +575,8 @@ async def login(request: Request, data: UserLoginRequest, db=Depends(get_db)):
 
 
 @router.get("/me")
-async def me(user=Depends(get_current_user), db: Any = Depends(get_db)):
+@limiter.limit("60/minute")
+async def me(request: Request, user=Depends(get_current_user), db: Any = Depends(get_db)):
     first_name = (user.get("first_name") or "").strip()
     last_name = (user.get("last_name") or "").strip()
     full_name = " ".join(part for part in [first_name, last_name] if part)

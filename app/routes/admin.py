@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
 from passlib.exc import UnknownHashError
@@ -124,11 +124,36 @@ def _user_selector(user_id: str) -> dict[str, Any]:
         return {"_id": user_id}
 
 
-async def get_admin_user(credentials: HTTPAuthorizationCredentials | None = Depends(admin_bearer)):
-    if credentials is None or not credentials.credentials:
+def _set_admin_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key="pg_admin_token",
+        value=token,
+        httponly=True,
+        secure=settings.ENVIRONMENT.lower() == "production",
+        samesite="lax",
+        max_age=3600,
+        path="/",
+    )
+
+
+def _clear_admin_cookie(response: Response) -> None:
+    response.delete_cookie(key="pg_admin_token", path="/")
+
+
+async def get_admin_user(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(admin_bearer),
+):
+    # Cookie-first (httpOnly) — XSS safe
+    token = request.cookies.get("pg_admin_token")
+
+    # Bearer fallback for backward compatibility
+    if not token and credentials and credentials.credentials:
+        token = credentials.credentials
+
+    if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    token = credentials.credentials
     try:
         payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
@@ -148,7 +173,7 @@ async def get_admin_user(credentials: HTTPAuthorizationCredentials | None = Depe
 
 
 @router.post("/login")
-async def admin_login(data: AdminLoginRequest, db=Depends(get_db)):
+async def admin_login(data: AdminLoginRequest, response: Response, db=Depends(get_db)):
     email = data.email.strip().lower()
     password = data.password
     admin_email = settings.ADMIN_EMAIL.strip().lower()
@@ -170,16 +195,20 @@ async def admin_login(data: AdminLoginRequest, db=Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
     token = _create_admin_token(email)
-    return {"token": token}
+    # Set httpOnly cookie — XSS safe, no localStorage exposure
+    _set_admin_cookie(response, token)
+    # Also return token for backward compat (admin frontend will ignore once updated)
+    return {"ok": True, "token": token}
 
 
 @router.post("/auth/login")
-async def admin_login_alias(data: AdminLoginRequest, db=Depends(get_db)):
-    return await admin_login(data, db)
+async def admin_login_alias(data: AdminLoginRequest, response: Response, db=Depends(get_db)):
+    return await admin_login(data, response, db)
 
 
 @router.post("/auth/logout")
-async def admin_logout_alias(_admin=Depends(get_admin_user)):
+async def admin_logout_alias(response: Response, _admin=Depends(get_admin_user)):
+    _clear_admin_cookie(response)
     return {"ok": True}
 
 
