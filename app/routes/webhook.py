@@ -254,15 +254,40 @@ async def _mark_event_if_new(db, event_key: str, source: str) -> bool:
 
 
 async def _find_user_for_ig_account(db, ig_account_id: str) -> dict[str, Any] | None:
-    user = await db.users.find_one({"instagram_user_id": ig_account_id})
+    user = await db.users.find_one(
+        {
+            "$or": [
+                {"instagram_user_id": ig_account_id},
+                {"instagram_account_ids": ig_account_id},
+            ]
+        }
+    )
     if user:
+        current_primary = str(user.get("instagram_user_id") or "").strip()
+        if current_primary != ig_account_id:
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {
+                    "$set": {"instagram_user_id": ig_account_id},
+                    "$addToSet": {"instagram_account_ids": ig_account_id},
+                },
+            )
+            user["instagram_user_id"] = ig_account_id
+            logger.info(
+                "Aligned instagram_user_id to webhook ig_account_id=%s for user_id=%s",
+                ig_account_id,
+                str(user.get("_id")),
+            )
         return user
 
     # Self-heal fallback: if there is exactly one connected Instagram user,
     # map that user to the webhook account id so automation can proceed.
     connected_query = {
         "instagram_access_token": {"$exists": True, "$nin": [None, ""]},
-        "instagram_user_id": {"$exists": True, "$nin": [None, ""]},
+        "$or": [
+            {"instagram_user_id": {"$exists": True, "$nin": [None, ""]}},
+            {"instagram_account_ids": {"$exists": True, "$ne": []}},
+        ],
     }
     connected_count = await db.users.count_documents(connected_query)
     if connected_count != 1:
@@ -281,7 +306,10 @@ async def _find_user_for_ig_account(db, ig_account_id: str) -> dict[str, Any] | 
     old_id = str(fallback_user.get("instagram_user_id") or "")
     await db.users.update_one(
         {"_id": fallback_user["_id"]},
-        {"$set": {"instagram_user_id": ig_account_id}},
+        {
+            "$set": {"instagram_user_id": ig_account_id},
+            "$addToSet": {"instagram_account_ids": ig_account_id},
+        },
     )
     fallback_user["instagram_user_id"] = ig_account_id
     logger.warning(
@@ -625,7 +653,7 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
     dm_rules_query = {
         "user_id": str(user["_id"]),
         "is_active": True,
-        "trigger_type": TriggerType.KEYWORD,
+        "trigger_type": {"$in": [TriggerType.KEYWORD, TriggerType.NEW_DM]},
     }
     logger.info(f"DM rules Mongo query: {json.dumps(dm_rules_query, default=str)}")
 
@@ -648,7 +676,10 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
             use_hinglish,
         )
 
-        if use_hinglish:
+        rule_trigger_type = str(rule.get("trigger_type") or TriggerType.KEYWORD.value)
+        if rule_trigger_type == TriggerType.NEW_DM.value:
+            is_match = True
+        elif use_hinglish:
             is_match = hinglish_keyword_match(message_text, keywords)
         else:
             is_match = any(kw in message_text for kw in keywords)

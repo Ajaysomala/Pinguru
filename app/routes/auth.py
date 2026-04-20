@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import quote, urlencode
 import hashlib
 import json
@@ -179,16 +179,62 @@ def _decode_password_reset_token(token: str) -> dict[str, Any]:
 
 
 async def _ensure_unique_instagram_account(db, instagram_user_id: str, current_user_id: ObjectId | None = None) -> None:
+    instagram_user_id = str(instagram_user_id or "").strip()
     if not instagram_user_id:
         return
 
-    query: dict[str, object] = {"instagram_user_id": instagram_user_id}
+    await _ensure_unique_instagram_accounts(db, [instagram_user_id], current_user_id)
+
+
+def _dedupe_instagram_ids(ids: Sequence[str | None]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw in ids:
+        value = str(raw or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+async def _ensure_unique_instagram_accounts(
+    db,
+    instagram_ids: list[str],
+    current_user_id: ObjectId | None = None,
+) -> None:
+    normalized_ids = _dedupe_instagram_ids(instagram_ids)
+    if not normalized_ids:
+        return
+
+    query: dict[str, object] = {
+        "$or": [
+            {"instagram_user_id": {"$in": normalized_ids}},
+            {"instagram_account_ids": {"$in": normalized_ids}},
+        ]
+    }
     if current_user_id is not None:
         query["_id"] = {"$ne": current_user_id}
 
     linked_user = await db.users.find_one(query)
     if linked_user:
         raise HTTPException(status_code=409, detail="That Instagram account is already connected to another user")
+
+
+def _collect_instagram_account_ids(
+    token_data: dict[str, Any],
+    profile: dict[str, Any],
+    business_account_id: str | None,
+) -> list[str]:
+    # Prefer webhook-facing IDs first for stable webhook matching.
+    return _dedupe_instagram_ids(
+        [
+            str(business_account_id or "").strip(),
+            str(profile.get("user_id") or "").strip(),
+            str(token_data.get("user_id") or "").strip(),
+            str(profile.get("id") or "").strip(),
+        ]
+    )
 
 
 def create_oauth_state(user_id: str) -> str:
@@ -636,19 +682,19 @@ async def instagram_callback(
         ig_username = str(profile.get("username") or "").strip()
         business_account_id = await InstagramService.get_business_account_id(access_token, preferred_username=ig_username)
 
-        # Webhook recipient.id / entry.id uses Instagram Business Account ID.
-        # Resolve it from graph.facebook.com/me/accounts first.
-        ig_user_id = str(business_account_id or "").strip()
-        logger.info(f"IG business account id from /me/accounts: {ig_user_id}, username: {ig_username}")
-
-        if not ig_user_id:
-            ig_user_id = str(token_data.get("user_id") or profile.get("id") or "").strip()
-            logger.info(f"IG user_id fallback: {ig_user_id}")
+        account_ids = _collect_instagram_account_ids(token_data, profile, business_account_id)
+        ig_user_id = account_ids[0] if account_ids else ""
+        logger.info(
+            "IG account ids resolved: primary=%s username=%s candidates=%s",
+            ig_user_id,
+            ig_username,
+            account_ids,
+        )
 
         if not ig_user_id:
             raise HTTPException(status_code=400, detail="Could not resolve Instagram user ID")
 
-        await _ensure_unique_instagram_account(db, ig_user_id, user["_id"])
+        await _ensure_unique_instagram_accounts(db, account_ids, user["_id"])
 
         expires_in = token_data.get("expires_in", 5183944)
         expires_at = _utcnow() + timedelta(seconds=expires_in)
@@ -659,6 +705,7 @@ async def instagram_callback(
             {
                 "$set": {
                     "instagram_user_id": ig_user_id,
+                    "instagram_account_ids": account_ids,
                     "instagram_username": ig_username,
                     "instagram_access_token": encrypted_access_token,
                     "ig_token_expires_at": expires_at,
@@ -724,7 +771,14 @@ async def save_instagram_token(
         except InvalidId:
             raise HTTPException(status_code=400, detail="Invalid user_id format")
     else:
-        linked_user = await db.users.find_one({"instagram_user_id": ig_user_id})
+        linked_user = await db.users.find_one(
+            {
+                "$or": [
+                    {"instagram_user_id": ig_user_id},
+                    {"instagram_account_ids": ig_user_id},
+                ]
+            }
+        )
         if linked_user:
             update_filter = {"_id": linked_user["_id"]}
 
@@ -734,7 +788,7 @@ async def save_instagram_token(
             detail="No matching user found. Provide user_id to link token to an existing account.",
         )
 
-    await _ensure_unique_instagram_account(db, ig_user_id, update_filter["_id"])
+    await _ensure_unique_instagram_accounts(db, [ig_user_id], update_filter["_id"])
 
     encrypted_access_token = InstagramService.encrypt_access_token(access_token)
     result = await db.users.update_one(
@@ -743,6 +797,7 @@ async def save_instagram_token(
             "$set": {
                 "instagram_access_token": encrypted_access_token,
                 "instagram_user_id": ig_user_id,
+                "instagram_account_ids": [ig_user_id],
                 "instagram_username": ig_username or None,
             }
         },
@@ -895,6 +950,7 @@ async def request_data_deletion(
         {
             "$set": {
                 "instagram_user_id": None,
+                "instagram_account_ids": [],
                 "instagram_access_token": None,
                 "ig_token_expires_at": None,
             },

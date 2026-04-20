@@ -466,6 +466,7 @@ async def admin_reset_instagram(user_id: str, admin=Depends(get_admin_user), db=
             "$set": {
                 "instagram_access_token": None,
                 "instagram_user_id": None,
+                "instagram_account_ids": [],
                 "ig_token_expires_at": None,
             }
         },
@@ -555,6 +556,7 @@ async def refresh_instagram_tokens(admin=Depends(get_admin_user), db=Depends(get
                     {"$set": {
                         "instagram_access_token": None,
                         "instagram_user_id": None,
+                        "instagram_account_ids": [],
                         "ig_token_expires_at": None,
                     }},
                 )

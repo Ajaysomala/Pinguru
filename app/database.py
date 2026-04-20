@@ -14,6 +14,7 @@ async def connect_db():
     db_instance.client = AsyncIOMotorClient(settings.MONGODB_URI)
     db_instance.db = db_instance.client[settings.DB_NAME]
     await db_instance.db.users.create_index("instagram_user_id", sparse=True)
+    await db_instance.db.users.create_index("instagram_account_ids", sparse=True)
     logger.info(f"Connected to MongoDB: {settings.DB_NAME}")
 
 async def disconnect_db():

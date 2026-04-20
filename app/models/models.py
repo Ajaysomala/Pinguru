@@ -13,6 +13,7 @@ class PlanType(str, Enum):
 
 class TriggerType(str, Enum):
     KEYWORD      = "keyword"
+    NEW_DM       = "new_dm"
     STORY_REPLY  = "story_reply"
     COMMENT      = "comment"
     POST_COMMENT = "post_comment"

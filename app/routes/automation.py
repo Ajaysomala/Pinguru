@@ -164,6 +164,7 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
         raise HTTPException(status_code=403, detail=f"Rule limit reached. Upgrade your plan.")
 
     is_comment_rule = trigger_type in {TriggerType.COMMENT.value, TriggerType.POST_COMMENT.value, TriggerType.REEL_COMMENT.value}
+    is_new_dm_rule = trigger_type == TriggerType.NEW_DM.value
     comment_target_type = _normalize_comment_target_type(data.comment_target_type) if is_comment_rule else None
     if is_comment_rule and comment_target_type is None:
         comment_target_type = CommentTargetType.ANY.value
@@ -191,6 +192,10 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
 
     if is_comment_rule and not any_comment_keyword and len(keywords) == 0:
         raise HTTPException(status_code=422, detail="Add at least one keyword or enable any_comment_keyword")
+
+    if is_new_dm_rule and len(keywords) > 0:
+        # Keep new-DM automations simple: they fire on every incoming DM.
+        keywords = []
 
     if is_comment_rule and public_comment_reply_enabled and not public_comment_reply_template:
         raise HTTPException(status_code=422, detail="public_comment_reply_template is required when public_comment_reply_enabled is true")
@@ -252,6 +257,7 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
     name, reply_message, keywords = _sanitize_and_validate_rule_payload(data)
     trigger_type = _normalize_trigger_type(data.trigger_type)
     is_comment_rule = trigger_type in {TriggerType.COMMENT.value, TriggerType.POST_COMMENT.value, TriggerType.REEL_COMMENT.value}
+    is_new_dm_rule = trigger_type == TriggerType.NEW_DM.value
     comment_target_type = _normalize_comment_target_type(data.comment_target_type) if is_comment_rule else None
     if is_comment_rule and comment_target_type is None:
         comment_target_type = CommentTargetType.ANY.value
@@ -279,6 +285,9 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
 
     if is_comment_rule and not any_comment_keyword and len(keywords) == 0:
         raise HTTPException(status_code=422, detail="Add at least one keyword or enable any_comment_keyword")
+
+    if is_new_dm_rule:
+        keywords = []
 
     if is_comment_rule and public_comment_reply_enabled and not public_comment_reply_template:
         raise HTTPException(status_code=422, detail="public_comment_reply_template is required when public_comment_reply_enabled is true")
