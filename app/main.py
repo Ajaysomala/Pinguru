@@ -67,6 +67,14 @@ allowed_origins = (
     [settings.FRONTEND_URL] if environment == "production" and settings.FRONTEND_URL else ["http://localhost:3000", "http://127.0.0.1:3000"]
 )
 
+# In production, also allow admin subdomain
+if environment == "production" and settings.FRONTEND_URL:
+     admin_url = settings.FRONTEND_URL.replace("https://pinguru.me", "https://admin.pinguru.me").replace("http://pinguru.me", "http://admin.pinguru.me")
+     allowed_origins = list(set([settings.FRONTEND_URL, admin_url]))
+else:
+     # Local dev: allow both user and admin on localhost
+     allowed_origins.extend(["http://localhost:5173", "http://127.0.0.1:5173"])
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
