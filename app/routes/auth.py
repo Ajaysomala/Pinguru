@@ -22,7 +22,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.models import PLAN_LIMITS, PlanType, UserCreate, get_plan_type
 from app.security import limiter
-from app.services.email import send_otp_email
+from app.services.email import send_otp_email, send_password_reset_email
 from app.services.instagram import InstagramService
 
 router = APIRouter()
@@ -55,6 +55,16 @@ class OTPResendRequest(BaseModel):
     @classmethod
     def normalize_email(cls, v: EmailStr) -> str:
         return str(v).strip().lower()
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    reset_token: str
+    new_password: str
 
 
 def _utcnow() -> datetime:
@@ -113,6 +123,43 @@ def _normalize_text(value: str | None, limit: int) -> str:
 
 def _build_display_name(first_name: str, last_name: str) -> str:
     return " ".join(part for part in [first_name, last_name] if part)
+
+
+def _validate_password_strength(password: str) -> None:
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long")
+    if not any(char.isupper() for char in password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one uppercase letter (A-Z)")
+    if not any(char.islower() for char in password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one lowercase letter (a-z)")
+    if not any(char.isdigit() for char in password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one number (0-9)")
+    if not any(char in "!@#$%^&*()-_=+[]{}|;:,.<>?/" for char in password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one special character (!@#$%^&*...)")
+
+
+def _password_reset_frontend_base() -> str:
+    return (settings.FRONTEND_URL or "http://localhost:5173").rstrip("/")
+
+
+def _create_password_reset_token(email: str) -> str:
+    expire = _utcnow() + timedelta(minutes=30)
+    payload = {"sub": email, "exp": expire, "type": "password_reset"}
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+
+def _decode_password_reset_token(token: str) -> dict[str, Any]:
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Reset token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid reset token")
+
+    if payload.get("type") != "password_reset":
+        raise HTTPException(status_code=401, detail="Invalid reset token")
+
+    return payload
 
 
 async def _ensure_unique_instagram_account(db, instagram_user_id: str, current_user_id: ObjectId | None = None) -> None:
@@ -355,6 +402,58 @@ async def resend_otp(request: Request, data: OTPResendRequest, db=Depends(get_db
         raise HTTPException(status_code=503, detail="Failed to send OTP email. Try again later.")
 
     return {"message": "New verification code sent", "otp_expires_in_seconds": 300}
+
+
+@router.post("/forgot-password/request")
+@limiter.limit("5/minute")
+async def forgot_password_request(request: Request, data: ForgotPasswordRequest, db=Depends(get_db)):
+    email = str(data.email).strip().lower()
+    user = await db.users.find_one({"email": email})
+
+    response: dict[str, Any] = {"message": "If an account exists, a password reset link has been sent."}
+    if not user:
+        return response
+
+    reset_token = _create_password_reset_token(email)
+    reset_url = f"{_password_reset_frontend_base()}/forgot-password?email={quote(email)}&token={quote(reset_token)}"
+
+    email_sent = await send_password_reset_email(email, reset_url)
+    if not email_sent:
+        raise HTTPException(status_code=503, detail="Password reset email is temporarily unavailable")
+
+    if settings.ENVIRONMENT.lower() != "production":
+        response["reset_token"] = reset_token
+        response["reset_url"] = reset_url
+
+    return response
+
+
+@router.post("/forgot-password/reset")
+@limiter.limit("10/minute")
+async def forgot_password_reset(request: Request, data: ResetPasswordRequest, db=Depends(get_db)):
+    email = str(data.email).strip().lower()
+    password = data.new_password or ""
+    _validate_password_strength(password)
+
+    payload = _decode_password_reset_token(data.reset_token)
+    token_email = str(payload.get("sub") or "").strip().lower()
+    if token_email != email:
+        raise HTTPException(status_code=401, detail="Invalid reset token")
+
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "hashed_password": hash_password(password),
+            }
+        },
+    )
+
+    return {"message": "Password updated successfully. You can now sign in."}
 
 
 # ── Login / Session ───────────────────────────────────────────────────────────

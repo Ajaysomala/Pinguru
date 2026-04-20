@@ -26,7 +26,20 @@ def _otp_html(otp: str) -> str:
     """
 
 
-async def _send_via_resend(to_email: str, otp: str) -> bool:
+def _password_reset_html(reset_url: str) -> str:
+    return f"""
+    <div style='font-family: Inter, Arial, sans-serif; max-width: 520px; margin: 0 auto; padding: 28px;'>
+      <h2 style='margin: 0 0 10px; color: #6d28d9;'>Reset your PinGuru password</h2>
+      <p style='margin: 0 0 18px; color: #111827;'>Use the button below to create a new password. This link expires in 30 minutes.</p>
+      <p style='margin: 0 0 18px;'>
+        <a href='{reset_url}' style='display:inline-block; background:#4f46e5; color:#fff; text-decoration:none; padding:12px 18px; border-radius:10px; font-weight:600;'>Reset password</a>
+      </p>
+      <p style='margin: 0; color: #6b7280; font-size: 14px;'>If you did not request this change, you can ignore this email.</p>
+    </div>
+    """
+
+
+async def _send_via_resend_html(to_email: str, subject: str, html: str) -> bool:
     if not settings.RESEND_API_KEY:
         return False
 
@@ -34,8 +47,8 @@ async def _send_via_resend(to_email: str, otp: str) -> bool:
     payload = {
         "from": f"PinGuru <{from_email}>",
         "to": [to_email],
-        "subject": "Verify your PinGuru account",
-        "html": _otp_html(otp),
+        "subject": subject,
+        "html": html,
     }
     headers = {
         "Authorization": f"Bearer {settings.RESEND_API_KEY}",
@@ -52,6 +65,10 @@ async def _send_via_resend(to_email: str, otp: str) -> bool:
     except Exception:
         logger.exception("Resend email send failed")
         return False
+
+
+async def _send_via_resend(to_email: str, otp: str) -> bool:
+    return await _send_via_resend_html(to_email, "Verify your PinGuru account", _otp_html(otp))
 
 
 def _send_via_smtp_sync(to_email: str, otp: str) -> bool:
@@ -82,3 +99,34 @@ async def send_otp_email(to_email: str, otp: str) -> bool:
     if resend_ok:
         return True
     return await asyncio.to_thread(_send_via_smtp_sync, to_email, otp)
+
+
+def _send_via_smtp_html_sync(to_email: str, subject: str, html: str) -> bool:
+    smtp_email = settings.SMTP_EMAIL.strip()
+    smtp_password = settings.SMTP_APP_PASSWORD.strip()
+    if not smtp_email or not smtp_password:
+        return False
+
+    message = MIMEMultipart("alternative")
+    message["Subject"] = subject
+    message["From"] = settings.OTP_FROM_EMAIL.strip() or smtp_email
+    message["To"] = to_email
+    message.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(smtp_email, smtp_password)
+            server.sendmail(message["From"], [to_email], message.as_string())
+        return True
+    except Exception:
+        logger.exception("SMTP email send failed")
+        return False
+
+
+async def send_password_reset_email(to_email: str, reset_url: str) -> bool:
+    subject = "Reset your PinGuru password"
+    html = _password_reset_html(reset_url)
+    resend_ok = await _send_via_resend_html(to_email, subject, html)
+    if resend_ok:
+        return True
+    return await asyncio.to_thread(_send_via_smtp_html_sync, to_email, subject, html)
