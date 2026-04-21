@@ -586,6 +586,8 @@ async def handle_change_event(db, ig_account_id: str, change: dict):
 
     if field == "comments":
         await handle_comment_event(db, ig_account_id, value)
+    elif field == "mentions":
+        await handle_story_mention_event(db, ig_account_id, value)
 
 
 async def handle_dm_event(db, ig_account_id: str, messaging: dict):
@@ -689,7 +691,32 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         if is_match:
             await _send_rule_reply(db, user, sender_id, rule, TriggerType.KEYWORD)
             break
+        
+async def handle_story_mention_event(db, ig_account_id: str, value: dict):
+    # Meta sends: {"media_id": "...", "comment_id": "...", "from": {"id": "..."}}
+    sender_id = (value.get("from") or {}).get("id")
+    if not sender_id:
+        return
 
+    user = await _find_user_for_ig_account(db, ig_account_id)
+    if not user or not user.get("instagram_access_token"):
+        return
+
+    user_plan = get_plan_type(user.get("plan", PlanType.Free))
+    plan_limits = get_plan_limits(user_plan)
+    dm_limit = plan_limits.get("dm_limit")
+    if dm_limit is not None and user.get("dm_count_this_month", 0) >= dm_limit:
+        return
+
+    rules = await db.automation_rules.find({
+        "user_id": str(user["_id"]),
+        "is_active": True,
+        "trigger_type": TriggerType.STORY_REPLY,
+    }).to_list(100)
+
+    for rule in rules:
+        await _send_rule_reply(db, user, sender_id, rule, TriggerType.STORY_REPLY)
+        break
 
 async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
     sender_id = (messaging.get("sender") or {}).get("id")
