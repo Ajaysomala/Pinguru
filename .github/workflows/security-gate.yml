@@ -43,7 +43,7 @@ jobs:
         run: pytest -q
 
       - name: Dependency vulnerability audit
-        run: pip-audit
+        run: pip-audit -r requirements.txt
 
       - name: Static security scan (high severity)
         run: bandit -r app -lll -ii

@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.database import get_db
-from app.models.models import AutomationRuleCreate
+from app.models.models import AutomationRuleCreate, TriggerType
 from app.routes import billing as billing_module
 from app.routes import webhook as webhook_module
 from app.routes.automation import create_rule
@@ -144,7 +144,7 @@ def test_free_rule_limit_enforced():
     user = {"_id": ObjectId(), "plan": "free"}
     payload = AutomationRuleCreate(
         name="Free Limit Test",
-        trigger_type="keyword",
+        trigger_type=TriggerType.KEYWORD,
         keywords=["price"],
         reply_message="Hello",
     )
@@ -161,7 +161,7 @@ def test_follow_up_feature_rejected_even_for_pro():
     user = {"_id": ObjectId(), "plan": "pro"}
     payload = AutomationRuleCreate(
         name="Follow Up Rejection",
-        trigger_type="comment",
+        trigger_type=TriggerType.COMMENT,
         keywords=["price"],
         reply_message="Hello",
         any_comment_keyword=True,

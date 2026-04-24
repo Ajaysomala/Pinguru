@@ -124,7 +124,7 @@ def _validate_signature(signature_header: str | None, raw_body: bytes) -> None:
 
 def _safe_event_hash(payload: dict[str, Any]) -> str:
     compact = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha1(compact.encode("utf-8")).hexdigest()
+    return hashlib.sha256(compact.encode("utf-8")).hexdigest()
 
 
 def _event_key_for_messaging(ig_id: str, messaging: dict[str, Any]) -> str:
