@@ -100,6 +100,11 @@ def _require_comment_starter_or_pro_features(user_plan: PlanType, enabled: bool,
         raise HTTPException(status_code=403, detail=f"{field_name} is available on Starter and Pro plans only")
 
 
+def _reject_follow_up_feature(enabled: bool) -> None:
+    if enabled:
+        raise HTTPException(status_code=403, detail="Follow-up automation is not part of the current plan contract")
+
+
 def _normalize_comment_media_filter(value: str | CommentMediaFilterType | None) -> str:
     if value is None:
         return "all"
@@ -179,7 +184,7 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
     public_comment_reply_enabled = bool(data.public_comment_reply_enabled) if is_comment_rule else False
     public_comment_reply_template = _sanitize_public_comment_reply_template(data.public_comment_reply_template) if is_comment_rule else None
     ask_follow_before_dm = bool(data.ask_follow_before_dm) if is_comment_rule else False
-    send_follow_up_message = bool(data.send_follow_up_message) if is_comment_rule else False
+    send_follow_up_message = False
 
     if dm_attachment_type and dm_attachment_type not in {"image"}:
         raise HTTPException(status_code=422, detail="Only image attachments are supported for DM attachments")
@@ -188,7 +193,7 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
 
     _require_comment_pro_features(user_plan, public_comment_reply_enabled, "Public comment reply")
     _require_comment_starter_or_pro_features(user_plan, ask_follow_before_dm, "Follow-before-DM automation")
-    _require_comment_pro_features(user_plan, send_follow_up_message, "Follow-up automation")
+    _reject_follow_up_feature(bool(data.send_follow_up_message))
 
     if is_comment_rule and not any_comment_keyword and len(keywords) == 0:
         raise HTTPException(status_code=422, detail="Add at least one keyword or enable any_comment_keyword")
@@ -272,7 +277,7 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
     public_comment_reply_enabled = bool(data.public_comment_reply_enabled) if is_comment_rule else False
     public_comment_reply_template = _sanitize_public_comment_reply_template(data.public_comment_reply_template) if is_comment_rule else None
     ask_follow_before_dm = bool(data.ask_follow_before_dm) if is_comment_rule else False
-    send_follow_up_message = bool(data.send_follow_up_message) if is_comment_rule else False
+    send_follow_up_message = False
 
     if dm_attachment_type and dm_attachment_type not in {"image"}:
         raise HTTPException(status_code=422, detail="Only image attachments are supported for DM attachments")
@@ -281,7 +286,7 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
 
     _require_comment_pro_features(user_plan, public_comment_reply_enabled, "Public comment reply")
     _require_comment_starter_or_pro_features(user_plan, ask_follow_before_dm, "Follow-before-DM automation")
-    _require_comment_pro_features(user_plan, send_follow_up_message, "Follow-up automation")
+    _reject_follow_up_feature(bool(data.send_follow_up_message))
 
     if is_comment_rule and not any_comment_keyword and len(keywords) == 0:
         raise HTTPException(status_code=422, detail="Add at least one keyword or enable any_comment_keyword")

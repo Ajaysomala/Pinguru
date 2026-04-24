@@ -215,6 +215,21 @@ def _apply_plan_footer(message: str, user_plan: PlanType) -> str:
     return base
 
 
+async def _ensure_contact_create_allowed(db, user: dict[str, Any], ig_user_id: str) -> None:
+    user_plan = get_plan_type(user.get("plan", PlanType.Free))
+    if user_plan != PlanType.Free:
+        return
+
+    existing = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": ig_user_id})
+    if existing:
+        return
+
+    contact_limit = int(get_plan_limits(PlanType.Free).get("contacts_limit") or 0)
+    total_contacts = await db.contacts.count_documents({"user_id": str(user["_id"])})
+    if contact_limit and total_contacts >= contact_limit:
+        raise HTTPException(status_code=403, detail="Free plan contact limit reached. Upgrade to continue automations.")
+
+
 def _is_follow_confirmation_message(message_text: str) -> bool:
     normalized = _normalize_text(message_text or "")
     if not normalized:
@@ -371,6 +386,7 @@ async def _send_rule_reply(db, user: dict[str, Any], recipient_id: str, rule: di
 
             if prompt_result["success"]:
                 now = datetime.now(timezone.utc)
+                await _ensure_contact_create_allowed(db, user, recipient_id)
                 await db.contacts.update_one(
                     {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
                     {
@@ -416,6 +432,7 @@ async def _send_rule_reply(db, user: dict[str, Any], recipient_id: str, rule: di
         await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
         await db.automation_rules.update_one({"_id": rule["_id"]}, {"$inc": {"sent_count": 1}})
         now = datetime.now(timezone.utc)
+        await _ensure_contact_create_allowed(db, user, recipient_id)
         await db.contacts.update_one(
             {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
             {

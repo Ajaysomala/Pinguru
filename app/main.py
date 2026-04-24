@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import hmac
 from app.config import settings
 from app.database import connect_db, disconnect_db
 from app.routes import webhook, auth, automation, dashboard, plans, admin, contacts, billing
@@ -12,6 +13,7 @@ import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -41,11 +43,34 @@ async def rate_limit_handler(request, exc):
 
 @app.middleware("http")
 async def add_security_headers(request, call_next):
+    has_user_cookie = bool(request.cookies.get("pg_token"))
+    has_admin_cookie = bool(request.cookies.get("pg_admin_token"))
+
+    if request.method.upper() not in SAFE_HTTP_METHODS and (has_user_cookie or has_admin_cookie):
+        origin = (request.headers.get("origin") or "").rstrip("/")
+        if origin:
+            allowed_origin_values = {value.rstrip("/") for value in allowed_origins}
+            frontend_origin = (settings.FRONTEND_URL or "").strip().rstrip("/")
+            if frontend_origin:
+                allowed_origin_values.add(frontend_origin)
+            if origin not in allowed_origin_values:
+                return JSONResponse(status_code=403, content={"detail": "Invalid request origin"})
+
+        csrf_header = request.headers.get("X-CSRF-Token") or ""
+        csrf_cookie_name = "pg_admin_csrf" if has_admin_cookie else "pg_csrf"
+        csrf_cookie = request.cookies.get(csrf_cookie_name) or ""
+        if not csrf_header or not csrf_cookie or not hmac.compare_digest(csrf_header, csrf_cookie):
+            return JSONResponse(status_code=403, content={"detail": "Invalid CSRF token"})
+
     response = await call_next(request)
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-site"
+    if settings.ENVIRONMENT.lower() == "production":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     if request.url.path in {"/docs", "/redoc", "/openapi.json"}:
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "

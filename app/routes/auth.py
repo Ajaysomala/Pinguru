@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 import hashlib
 import json
 import secrets
@@ -100,6 +100,21 @@ def _session_version(user_doc: dict[str, Any]) -> int:
         return 0
 
 
+def _shared_cookie_domain() -> str | None:
+    if settings.ENVIRONMENT.lower() != "production":
+        return None
+    frontend_url = (settings.FRONTEND_URL or "").strip()
+    if not frontend_url:
+        return None
+    host = (urlparse(frontend_url).hostname or "").strip().lower()
+    if not host or host in {"localhost", "127.0.0.1"}:
+        return None
+    host_parts = host.split(".")
+    if len(host_parts) < 2:
+        return None
+    return f".{'.'.join(host_parts[-2:])}"
+
+
 def _login_lockout_until(user_doc: dict[str, Any]) -> datetime | None:
     return _as_aware_utc(user_doc.get("login_lockout_until"))
 
@@ -110,6 +125,8 @@ def _is_login_locked(user_doc: dict[str, Any]) -> bool:
 
 
 def _set_auth_cookie(response: Response, token: str) -> None:
+    csrf_token = secrets.token_urlsafe(32)
+    cookie_domain = _shared_cookie_domain()
     response.set_cookie(
         key="pg_token",
         value=token,
@@ -118,11 +135,24 @@ def _set_auth_cookie(response: Response, token: str) -> None:
         samesite="lax",
         max_age=604800,
         path="/",
+        domain=cookie_domain,
+    )
+    response.set_cookie(
+        key="pg_csrf",
+        value=csrf_token,
+        httponly=False,
+        secure=settings.ENVIRONMENT.lower() == "production",
+        samesite="lax",
+        max_age=604800,
+        path="/",
+        domain=cookie_domain,
     )
 
 
 def _clear_auth_cookie(response: Response) -> None:
-    response.delete_cookie(key="pg_token", path="/")
+    cookie_domain = _shared_cookie_domain()
+    response.delete_cookie(key="pg_token", path="/", domain=cookie_domain)
+    response.delete_cookie(key="pg_csrf", path="/", domain=cookie_domain)
 
 
 def generate_otp() -> str:

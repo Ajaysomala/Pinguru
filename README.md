@@ -83,13 +83,44 @@ Go to Meta Developer → Your App → Instagram → Webhooks:
 
 ## 💰 Plans
 
-| Plan    | Price | DMs/month | Rules     |
-| ------- | ----- | --------- | --------- |
-| Free    | ₹0    | 200       | 1         |
-| Starter | ₹199  | 3,000     | 5         |
-| Pro     | ₹399  | 15,000    | Unlimited |
+| Plan    | Price | Rules               | DMs       | Contacts           |
+| ------- | ----- | ------------------- | --------- | ------------------ |
+| Free    | ₹0    | 5 automation flows  | Unlimited | 500 contacts/month |
+| Starter | ₹199  | 15 automation flows | Unlimited | Unlimited          |
+| Pro     | ₹499  | Unlimited flows     | Unlimited | Unlimited          |
 
-Starter and Pro use flat-rate billing. Pro includes unlimited automation rules.
+Starter and Pro support monthly, quarterly, and yearly billing cycles where enabled.
+
+---
+
+## 🔐 Security Controls
+
+- Cookie-first auth with `HttpOnly`, `Secure` (production), and `SameSite=Lax`
+- CSRF protection for state-changing cookie-auth requests (`X-CSRF-Token` required)
+- Origin allowlist checks for browser cookie-auth mutations
+- Rate limiting on auth and sensitive billing/status routes
+- Webhook signature verification for Meta and Razorpay events
+- Security headers: CSP, HSTS (production), frame deny, nosniff, referrer-policy
+
+### CSRF Header Requirement
+
+For browser calls that mutate state with auth cookies, include:
+
+`X-CSRF-Token: <value from pg_csrf cookie>`
+
+---
+
+## 🛡️ Security Checks
+
+Run these regularly:
+
+```bash
+# Python dependency review
+pip list --outdated
+
+# Frontend dependency audit (from frontend repo)
+npm run audit
+```
 
 ---
 
