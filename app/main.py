@@ -14,6 +14,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
+CSRF_EXEMPT_PATHS = {"/auth/logout", "/admin/auth/logout"}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -45,8 +46,9 @@ async def rate_limit_handler(request, exc):
 async def add_security_headers(request, call_next):
     has_user_cookie = bool(request.cookies.get("pg_token"))
     has_admin_cookie = bool(request.cookies.get("pg_admin_token"))
+    path = request.url.path
 
-    if request.method.upper() not in SAFE_HTTP_METHODS and (has_user_cookie or has_admin_cookie):
+    if request.method.upper() not in SAFE_HTTP_METHODS and (has_user_cookie or has_admin_cookie) and path not in CSRF_EXEMPT_PATHS:
         origin = (request.headers.get("origin") or "").rstrip("/")
         if origin:
             allowed_origin_values = {value.rstrip("/") for value in allowed_origins}

@@ -70,7 +70,7 @@ def client(monkeypatch):
 
 def test_csrf_required_for_cookie_post(client):
     response = client.post(
-        "/auth/logout",
+        "/billing/cancel-pending",
         cookies={"pg_token": "dummy_token", "pg_csrf": "csrf_value"},
     )
 
@@ -80,7 +80,7 @@ def test_csrf_required_for_cookie_post(client):
 
 def test_origin_rejected_for_cookie_post(client):
     response = client.post(
-        "/auth/logout",
+        "/billing/cancel-pending",
         headers={"Origin": "https://evil.example", "X-CSRF-Token": "csrf_value"},
         cookies={"pg_token": "dummy_token", "pg_csrf": "csrf_value"},
     )
@@ -91,8 +91,18 @@ def test_origin_rejected_for_cookie_post(client):
 
 def test_cookie_post_allows_valid_origin_and_csrf(client):
     response = client.post(
-        "/auth/logout",
+        "/billing/cancel-pending",
         headers={"Origin": "http://localhost:5173", "X-CSRF-Token": "csrf_value"},
+        cookies={"pg_token": "dummy_token", "pg_csrf": "csrf_value"},
+    )
+
+    # Auth can still fail for dummy cookie, but middleware should not block with CSRF/origin errors.
+    assert response.status_code != 403
+
+
+def test_logout_allowed_without_csrf(client):
+    response = client.post(
+        "/auth/logout",
         cookies={"pg_token": "dummy_token", "pg_csrf": "csrf_value"},
     )
 
