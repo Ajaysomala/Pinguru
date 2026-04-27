@@ -91,17 +91,27 @@ if environment == "production" and not settings.FRONTEND_URL:
     raise RuntimeError("FRONTEND_URL must be set in production")
 
 if environment == "production" and settings.FRONTEND_URL:
+    frontend_origin = settings.FRONTEND_URL.strip()
+    frontend_host = (frontend_origin.split("//", 1)[1] if "//" in frontend_origin else frontend_origin).split("/", 1)[0].strip()
+    frontend_scheme = "https://" if frontend_origin.startswith("https://") else "http://"
+    frontend_non_www = frontend_host[4:] if frontend_host.startswith("www.") else frontend_host
+    frontend_www = frontend_host if frontend_host.startswith("www.") else f"www.{frontend_host}"
+
     configured_admin_origins = [
         origin.strip()
         for origin in settings.ADMIN_FRONTEND_URLS.split(",")
         if origin.strip()
     ]
-    derived_admin_origin = (
-        settings.FRONTEND_URL
-        .replace("https://pinguru.me", "https://admin.pinguru.me")
-        .replace("http://pinguru.me", "http://admin.pinguru.me")
-    )
-    allowed_origins = list({settings.FRONTEND_URL, derived_admin_origin, *configured_admin_origins})
+    derived_admin_origins = {
+        f"{frontend_scheme}admin.{frontend_non_www}",
+        f"{frontend_scheme}admin.{frontend_www}",
+    }
+    allowed_origins = list({
+        f"{frontend_scheme}{frontend_non_www}",
+        f"{frontend_scheme}{frontend_www}",
+        *derived_admin_origins,
+        *configured_admin_origins,
+    })
 else:
     allowed_origins = [
         "http://localhost:3000",

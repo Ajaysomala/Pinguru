@@ -115,6 +115,25 @@ def _shared_cookie_domain() -> str | None:
     return f".{'.'.join(host_parts[-2:])}"
 
 
+def _cookie_cleanup_domains() -> list[str | None]:
+    domains: set[str] = set()
+
+    shared_domain = _shared_cookie_domain()
+    if shared_domain:
+        domains.add(shared_domain)
+        domains.add(shared_domain.lstrip("."))
+
+    for source in (settings.FRONTEND_URL, settings.BASE_URL):
+        host = (urlparse(source or "").hostname or "").strip().lower()
+        if not host or host in {"localhost", "127.0.0.1"}:
+            continue
+        domains.add(host)
+        if host.startswith("www."):
+            domains.add(host[4:])
+
+    return [None, *sorted(domains)]
+
+
 def _login_lockout_until(user_doc: dict[str, Any]) -> datetime | None:
     return _as_aware_utc(user_doc.get("login_lockout_until"))
 
@@ -150,9 +169,9 @@ def _set_auth_cookie(response: Response, token: str) -> None:
 
 
 def _clear_auth_cookie(response: Response) -> None:
-    cookie_domain = _shared_cookie_domain()
-    response.delete_cookie(key="pg_token", path="/", domain=cookie_domain)
-    response.delete_cookie(key="pg_csrf", path="/", domain=cookie_domain)
+    for domain in _cookie_cleanup_domains():
+        response.delete_cookie(key="pg_token", path="/", domain=domain)
+        response.delete_cookie(key="pg_csrf", path="/", domain=domain)
 
 
 def generate_otp() -> str:
