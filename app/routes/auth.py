@@ -984,6 +984,78 @@ async def update_profile(
     }
 
 
+# ── Instagram Disconnect ───────────────────────────────────────────────────────
+
+@router.post("/instagram/disconnect")
+@limiter.limit("5/minute")
+async def disconnect_instagram(
+    request: Request,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Remove Instagram connection from the user account.
+    Does NOT delete automation rules — they stay saved for reconnection.
+    """
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "instagram_user_id": None,
+                "instagram_account_ids": [],
+                "instagram_access_token": None,
+                "ig_token_expires_at": None,
+                "instagram_username": None,
+            }
+        },
+    )
+    return {"disconnected": True, "message": "Instagram account disconnected successfully."}
+
+
+# ── Instagram Token Refresh ────────────────────────────────────────────────────
+
+@router.post("/instagram/refresh-token")
+@limiter.limit("10/minute")
+async def refresh_instagram_token(
+    request: Request,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Refresh the long-lived Instagram access token (valid 60 days).
+    Call this every 30–45 days to keep the connection alive.
+    """
+    encrypted_token = str(user.get("instagram_access_token") or "").strip()
+    if not encrypted_token:
+        raise HTTPException(status_code=400, detail="No Instagram account connected.")
+
+    result = await InstagramService.refresh_long_lived_token(encrypted_token)
+    new_token = result.get("access_token")
+    if not new_token:
+        raise HTTPException(
+            status_code=400,
+            detail="Token refresh failed. Please reconnect your Instagram account.",
+        )
+
+    expires_in = int(result.get("expires_in") or 5183944)
+    expires_at = _utcnow() + timedelta(seconds=expires_in)
+    encrypted_new_token = InstagramService.encrypt_access_token(new_token)
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "instagram_access_token": encrypted_new_token,
+                "ig_token_expires_at": expires_at,
+            }
+        },
+    )
+
+    return {
+        "refreshed": True,
+        "expires_at": expires_at.isoformat(),
+        "message": "Instagram token refreshed successfully.",
+    }
+
+
 # ── Data Deletion ──────────────────────────────────────────────────────────────
 
 @router.post("/data-deletion")
