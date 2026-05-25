@@ -38,7 +38,7 @@ def _sanitize_text(value: str) -> str:
 
 def _sanitize_and_validate_rule_payload(data: AutomationRuleCreate) -> tuple[str, str, list[str]]:
     name = _sanitize_text(data.name)
-    reply_message = _sanitize_text(data.reply_message)
+    reply_message = _sanitize_text(data.resolved_reply_message)
     keywords = [_sanitize_text(k) for k in data.keywords if _sanitize_text(k)]
 
     if len(name) > 100:

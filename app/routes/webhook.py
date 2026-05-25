@@ -349,9 +349,35 @@ def _is_story_reply(messaging: dict[str, Any]) -> bool:
     return False
 
 
-async def _send_rule_reply(db, user: dict[str, Any], recipient_id: str, rule: dict[str, Any], trigger_type: TriggerType):
+async def _render_template(db, user: dict, recipient_id: str, rule: dict, matched_keyword: str = "") -> str:
+    """Replace {{name}}, {{username}}, {{keyword}} with real values."""
+    template = str(rule.get("reply_message") or "").strip()
+    if not template:
+        return template
+
+    # Try to get stored contact info for this recipient
+    contact = await db.contacts.find_one(
+        {"user_id": str(user["_id"]), "ig_user_id": recipient_id}
+    )
+    ig_name     = str(contact.get("ig_name")     or recipient_id) if contact else recipient_id
+    ig_username = str(contact.get("ig_username") or recipient_id) if contact else recipient_id
+    keyword_val = matched_keyword or (rule.get("keywords") or [""])[0]
+
+    return (
+        template
+        .replace("{{name}}",     ig_name)
+        .replace("{{username}}", ig_username)
+        .replace("{{keyword}}",  keyword_val)
+        # also handle single-brace variants (legacy)
+        .replace("{name}",       ig_name)
+        .replace("{username}",   ig_username)
+        .replace("{keyword}",    keyword_val)
+    )
+
+
+async def _send_rule_reply(db, user: dict[str, Any], recipient_id: str, rule: dict[str, Any], trigger_type: TriggerType, matched_keyword: str = ""):
     user_plan = get_plan_type(user.get("plan", PlanType.Free))
-    base_reply = str(rule.get("reply_message") or "").replace("{{username}}", recipient_id)
+    base_reply = await _render_template(db, user, recipient_id, rule, matched_keyword)
     reply = _apply_plan_footer(base_reply, user_plan)
 
     follow_gate_requested = bool(rule.get("ask_follow_before_dm", False))
@@ -706,7 +732,8 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         logger.info("DM keyword match result: sender_id=%s, rule_id=%s, is_match=%s", sender_id, rule.get("_id"), is_match)
 
         if is_match:
-            await _send_rule_reply(db, user, sender_id, rule, TriggerType.KEYWORD)
+            matched_kw = next((kw for kw in keywords if kw in message_text), "")
+            await _send_rule_reply(db, user, sender_id, rule, TriggerType.KEYWORD, matched_keyword=matched_kw)
             break
         
 async def handle_story_mention_event(db, ig_account_id: str, value: dict):

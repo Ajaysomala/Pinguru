@@ -140,7 +140,13 @@ class AutomationRuleCreate(BaseModel):
     trigger_type: TriggerType
     keywords: List[str] = []
     match_mode: str = "exact"
-    reply_message: str
+    reply_message: Optional[str] = None       # legacy field name
+    response_template: Optional[str] = None   # frontend field name
+
+    @property
+    def resolved_reply_message(self) -> str:
+        """Return whichever field the caller populated."""
+        return (self.response_template or self.reply_message or "").strip()
     comment_target_type: Optional[CommentTargetType] = None
     comment_media_filter: Optional[CommentMediaFilterType] = None
     comment_media_id: Optional[str] = None
