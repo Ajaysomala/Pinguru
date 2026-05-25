@@ -25,6 +25,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
@@ -35,11 +36,17 @@ jobs:
       - name: Run enforcement tests
         env:
           MONGODB_URI: mongodb://localhost:27017
+          DB_NAME: pinguru_test
           META_APP_ID: test-meta-app-id
           META_APP_SECRET: test-meta-app-secret
           META_WEBHOOK_VERIFY_TOKEN: test-meta-verify-token
-          JWT_SECRET: test-jwt-secret
-          ENCRYPTION_KEY: test-encryption-key
+          JWT_SECRET: test-jwt-secret-for-ci-only
+          ENCRYPTION_KEY: cGluZ3VydS1jaS10ZXN0LWtleS0zMi1ieXRlcyEhISE=
+          ENVIRONMENT: test
+          DISABLE_WEBHOOK_SIGNATURE: "true"
+          RESEND_API_KEY: test-resend-key
+          BASE_URL: http://localhost:8000
+          FRONTEND_URL: http://localhost:5173
         run: pytest -q
 
       - name: Dependency vulnerability audit
