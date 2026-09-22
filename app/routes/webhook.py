@@ -359,8 +359,14 @@ async def _render_template(db, user: dict, recipient_id: str, rule: dict, matche
     contact = await db.contacts.find_one(
         {"user_id": str(user["_id"]), "ig_user_id": recipient_id}
     )
-    ig_name     = str(contact.get("ig_name")     or recipient_id) if contact else recipient_id
-    ig_username = str(contact.get("ig_username") or recipient_id) if contact else recipient_id
+    ig_name = str((contact or {}).get("display_name") or (contact or {}).get("ig_name") or "")
+    ig_username = str((contact or {}).get("ig_username") or "")
+    if not ig_name or not ig_username:
+        profile = await InstagramService.get_messaging_user_profile(
+            user["instagram_access_token"], recipient_id
+        )
+        ig_name = ig_name or str(profile.get("name") or "")
+        ig_username = ig_username or str(profile.get("username") or "")
     keyword_val = matched_keyword or (rule.get("keywords") or [""])[0]
 
     return (

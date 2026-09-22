@@ -122,6 +122,25 @@ class InstagramService:
             return {}
 
     @staticmethod
+    async def get_messaging_user_profile(access_token: str, instagram_scoped_user_id: str) -> dict:
+        """Get the display name and username for a user who sent a message."""
+        url = f"{BASE_GRAPH_FB}/{instagram_scoped_user_id}"
+        params = {
+            "fields": "name,username",
+            "access_token": InstagramService.decrypt_access_token(access_token),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                resp = await client.get(url, params=params)
+            if resp.status_code != 200:
+                logger.warning("Instagram messaging user profile lookup returned %s", resp.status_code)
+                return {}
+            return resp.json() or {}
+        except httpx.RequestError:
+            logger.exception("Instagram messaging user profile lookup failed")
+            return {}
+
+    @staticmethod
     async def get_business_account_id(access_token: str, preferred_username: str | None = None) -> str | None:
         """Resolve Instagram Business Account ID that matches webhook entry.id/recipient.id."""
         decrypted = InstagramService.decrypt_access_token(access_token)
