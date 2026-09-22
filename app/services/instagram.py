@@ -101,8 +101,8 @@ class InstagramService:
             data = {}
 
         if resp.status_code != 200:
-            logger.error("DM failed with non-200 response from Instagram API: %s", resp.status_code)
-            return {"success": False, "error": "Instagram API request failed", "status_code": resp.status_code}
+            logger.error("DM failed: status=%s body=%s", resp.status_code, data)
+            return {"success": False, "error": data.get("error", {}).get("message", "Instagram API request failed"), "status_code": resp.status_code}
         return {"success": True, "data": data}
 
     @staticmethod
