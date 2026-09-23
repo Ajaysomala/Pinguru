@@ -68,12 +68,21 @@ class InstagramService:
             return encrypted_access_token
 
     @staticmethod
-    async def send_dm(access_token: str, recipient_ig_id: str, message: str, ig_user_id: str, attachment_url: str | None = None, attachment_type: str = "image") -> dict:
+    async def send_dm(
+        access_token: str,
+        recipient_ig_id: str,
+        message: str,
+        ig_user_id: str,
+        attachment_url: str | None = None,
+        attachment_type: str = "image",
+        comment_id: str | None = None,
+    ) -> dict:
         """Send a DM to an Instagram user via Graph API."""
         access_token = InstagramService.decrypt_access_token(access_token)
         url = f"{BASE_GRAPH_IG}/{ig_user_id}/messages"
+        recipient_payload = {"comment_id": comment_id} if comment_id else {"id": recipient_ig_id}
         payload: dict = {
-            "recipient": {"id": recipient_ig_id},
+            "recipient": recipient_payload,
             "access_token": access_token,
         }
         message_payload: dict = {}

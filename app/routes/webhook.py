@@ -381,27 +381,51 @@ async def _render_template(db, user: dict, recipient_id: str, rule: dict, matche
     )
 
 
-async def _send_rule_reply(db, user: dict[str, Any], recipient_id: str, rule: dict[str, Any], trigger_type: TriggerType, matched_keyword: str = ""):
+async def _send_rule_reply(
+    db,
+    user: dict[str, Any],
+    recipient_id: str,
+    rule: dict[str, Any],
+    trigger_type: TriggerType,
+    matched_keyword: str = "",
+    comment_id: str | None = None,
+    skip_follow_gate: bool = False,
+):
     user_plan = get_plan_type(user.get("plan", PlanType.Free))
     base_reply = await _render_template(db, user, recipient_id, rule, matched_keyword)
     reply = _apply_plan_footer(base_reply, user_plan)
 
+    allowed_follow_gate_triggers = {
+        TriggerType.COMMENT,
+        TriggerType.POST_COMMENT,
+        TriggerType.REEL_COMMENT,
+        TriggerType.KEYWORD,
+        TriggerType.NEW_DM,
+    }
+
     follow_gate_requested = bool(rule.get("ask_follow_before_dm", False))
     if (
-        follow_gate_requested
+        not skip_follow_gate
+        and follow_gate_requested
         and user_plan in {PlanType.Starter, PlanType.Pro}
-        and trigger_type in {TriggerType.COMMENT, TriggerType.POST_COMMENT, TriggerType.REEL_COMMENT}
+        and trigger_type in allowed_follow_gate_triggers
     ):
         contact = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": recipient_id})
-        is_awaiting_for_rule = bool(contact) and str(contact.get("follow_gate_status") or "") == "awaiting" and str(contact.get("follow_gate_rule_id") or "") == str(rule.get("_id"))
+        is_completed = bool(contact) and str(contact.get("follow_gate_status") or "") == "completed"
+        is_awaiting_for_rule = (
+            bool(contact)
+            and str(contact.get("follow_gate_status") or "") == "awaiting"
+            and str(contact.get("follow_gate_rule_id") or "") == str(rule.get("_id"))
+        )
 
-        if not is_awaiting_for_rule:
+        if not is_awaiting_for_rule and not is_completed:
             prompt_message = _build_follow_prompt(user)
             prompt_result = await InstagramService.send_dm(
                 access_token=user["instagram_access_token"],
                 recipient_ig_id=recipient_id,
                 message=prompt_message,
                 ig_user_id=user["instagram_user_id"],
+                comment_id=comment_id,
             )
 
             await db.dm_logs.insert_one(
@@ -446,6 +470,7 @@ async def _send_rule_reply(db, user: dict[str, Any], recipient_id: str, rule: di
         ig_user_id=user["instagram_user_id"],
         attachment_url=str(rule.get("dm_attachment_url") or "").strip() or None,
         attachment_type=str(rule.get("dm_attachment_type") or "image").strip().lower() or "image",
+        comment_id=comment_id,
     )
 
     await db.dm_logs.insert_one(
@@ -688,7 +713,14 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
                 }
             )
             if pending_rule:
-                await _send_rule_reply(db, user, sender_id, pending_rule, pending_trigger)
+                await _send_rule_reply(
+                    db,
+                    user,
+                    sender_id,
+                    pending_rule,
+                    pending_trigger,
+                    skip_follow_gate=True,
+                )
 
         await db.contacts.update_one(
             {"_id": contact["_id"]},
@@ -856,5 +888,5 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
                             message=public_reply,
                         )
 
-            await _send_rule_reply(db, user, commenter_id, rule, trigger_type)
-            break
+            await _send_rule_reply(db, user, commenter_id, rule, trigger_type, comment_id=comment_id)
+            break

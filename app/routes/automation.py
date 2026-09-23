@@ -183,7 +183,7 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
     any_comment_keyword = bool(data.any_comment_keyword) if is_comment_rule and data.any_comment_keyword is not None else (True if is_comment_rule else False)
     public_comment_reply_enabled = bool(data.public_comment_reply_enabled) if is_comment_rule else False
     public_comment_reply_template = _sanitize_public_comment_reply_template(data.public_comment_reply_template) if is_comment_rule else None
-    ask_follow_before_dm = bool(data.ask_follow_before_dm) if is_comment_rule else False
+    ask_follow_before_dm = bool(data.ask_follow_before_dm)
     send_follow_up_message = False
 
     if dm_attachment_type and dm_attachment_type not in {"image"}:
@@ -276,7 +276,7 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
     any_comment_keyword = bool(data.any_comment_keyword) if is_comment_rule and data.any_comment_keyword is not None else (True if is_comment_rule else False)
     public_comment_reply_enabled = bool(data.public_comment_reply_enabled) if is_comment_rule else False
     public_comment_reply_template = _sanitize_public_comment_reply_template(data.public_comment_reply_template) if is_comment_rule else None
-    ask_follow_before_dm = bool(data.ask_follow_before_dm) if is_comment_rule else False
+    ask_follow_before_dm = bool(data.ask_follow_before_dm)
     send_follow_up_message = False
 
     if dm_attachment_type and dm_attachment_type not in {"image"}:

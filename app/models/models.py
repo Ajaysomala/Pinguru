@@ -11,6 +11,19 @@ class PlanType(str, Enum):
     Starter = "starter"
     Pro     = "pro"
 
+
+def get_plan_type(plan: str | PlanType) -> PlanType:
+    if isinstance(plan, PlanType):
+        return plan
+    if not plan:
+        return PlanType.Free
+    normalized = str(plan).strip().lower()
+    try:
+        return PlanType(normalized)
+    except ValueError:
+        return PlanType.Free
+
+
 class TriggerType(str, Enum):
     KEYWORD      = "keyword"
     NEW_DM       = "new_dm"
@@ -95,6 +108,12 @@ class UserInDB(BaseModel):
     login_lockout_until: Optional[datetime] = None
     session_version: int = 0
     plan: PlanType = PlanType.Free
+
+    @field_validator('plan', mode='before')
+    @classmethod
+    def normalize_plan(cls, v):
+        return get_plan_type(v)
+
     instagram_user_id: Optional[str] = None
     instagram_access_token: Optional[str] = None
     ig_token_expires_at: Optional[datetime] = None
@@ -209,14 +228,6 @@ PLAN_LIMITS = {
 }
 
 
-def get_plan_type(plan: str | PlanType) -> PlanType:
-    if isinstance(plan, PlanType):
-        return plan
-    try:
-        return PlanType(plan)
-    except ValueError:
-        return PlanType.Free
-
-
 def get_plan_limits(plan: str | PlanType) -> dict:
     return PLAN_LIMITS[get_plan_type(plan)]
+
