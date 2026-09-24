@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from app.config import settings
 from app.database import get_db
+from app.security import limiter
 from app.services.instagram import InstagramService
 
 router = APIRouter()
@@ -61,10 +62,15 @@ def _admin_display_name(email: str) -> str:
 
 
 async def _get_effective_admin_password_hash(db) -> str:
-    override = await db.admin_config.find_one({"_id": "admin_credentials"}, {"password_hash": 1})
-    override_hash = str((override or {}).get("password_hash", "")).strip()
-    if override_hash:
-        return override_hash
+    admin_config = getattr(db, "admin_config", None)
+    if admin_config is not None:
+        try:
+            override = await admin_config.find_one({"_id": "admin_credentials"}, {"password_hash": 1})
+            override_hash = str((override or {}).get("password_hash", "")).strip()
+            if override_hash:
+                return override_hash
+        except Exception:
+            pass
     return settings.ADMIN_PASSWORD_HASH.strip()
 
 
@@ -224,7 +230,8 @@ async def get_admin_user(
 
 
 @router.post("/login")
-async def admin_login(data: AdminLoginRequest, response: Response, db=Depends(get_db)):
+@limiter.limit("5/minute")
+async def admin_login(request: Request, data: AdminLoginRequest, response: Response, db=Depends(get_db)):
     email = data.email.strip().lower()
     password = data.password
     admin_email = settings.ADMIN_EMAIL.strip().lower()
@@ -253,8 +260,9 @@ async def admin_login(data: AdminLoginRequest, response: Response, db=Depends(ge
 
 
 @router.post("/auth/login")
-async def admin_login_alias(data: AdminLoginRequest, response: Response, db=Depends(get_db)):
-    return await admin_login(data, response, db)
+@limiter.limit("5/minute")
+async def admin_login_alias(request: Request, data: AdminLoginRequest, response: Response, db=Depends(get_db)):
+    return await admin_login(request, data, response, db)
 
 
 @router.post("/auth/logout")

@@ -12,6 +12,7 @@ from app.database import get_db
 from app.models.models import AutomationRuleCreate, TriggerType
 from app.routes import billing as billing_module
 from app.routes import webhook as webhook_module
+from app.routes import admin as admin_module
 from app.routes.automation import create_rule
 from app.routes.webhook import _ensure_contact_create_allowed
 import app.main as main_module
@@ -194,3 +195,160 @@ def test_free_contact_limit_enforced():
 
     assert exc.value.status_code == 403
     assert "contact limit reached" in str(exc.value.detail).lower()
+
+
+def test_verify_email_constant_time_otp_verification():
+    from app.routes.auth import verify_email, OTPVerifyRequest, hash_otp
+    from datetime import datetime, timedelta, timezone
+    from starlette.requests import Request
+
+    otp = "123456"
+    user_id = ObjectId()
+    fake_user = {
+        "_id": user_id,
+        "email": "test@example.com",
+        "email_verified": False,
+        "otp_hash": hash_otp(otp),
+        "otp_expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+        "otp_attempts": 0,
+    }
+
+    class _FakeUsers:
+        def __init__(self, doc):
+            self.doc = doc
+            self.updated = []
+        async def find_one(self, q):
+            return self.doc if q.get("email") == self.doc["email"] else None
+        async def update_one(self, f, u):
+            self.updated.append((f, u))
+            return SimpleNamespace(matched_count=1)
+
+    db = SimpleNamespace(users=_FakeUsers(fake_user))
+    payload = OTPVerifyRequest(email="test@example.com", otp="123456")
+    scope = {"type": "http", "method": "POST", "path": "/auth/verify-email", "headers": [], "client": ("127.0.0.1", 12345)}
+    req = Request(scope)
+    resp = asyncio.run(verify_email(request=req, data=payload, db=db))
+    assert resp.status_code == 200
+
+
+def test_me_returns_id_and_onboarding_complete():
+    from app.routes.auth import me
+    from starlette.requests import Request
+    user_id = ObjectId()
+    fake_user = {
+        "_id": user_id,
+        "email": "user@example.com",
+        "first_name": "Jane",
+        "last_name": "Doe",
+        "onboarding_complete": True,
+        "plan": "pro",
+    }
+    scope = {"type": "http", "method": "GET", "path": "/auth/me", "headers": [], "client": ("127.0.0.1", 12345)}
+    req = Request(scope)
+    res = asyncio.run(me(request=req, user=fake_user, db=SimpleNamespace()))
+    assert res["id"] == str(user_id)
+    assert res["onboarding_complete"] is True
+    assert res["display_name"] == "Jane Doe"
+
+
+def test_profile_update_recomputes_display_name():
+    from app.routes.auth import update_profile, ProfileUpdateRequest
+    from fastapi import Response
+    user_id = ObjectId()
+    fake_user = {
+        "_id": user_id,
+        "email": "user@example.com",
+        "first_name": "Old",
+        "last_name": "Name",
+        "display_name": "Old Name",
+    }
+    updated_doc = dict(fake_user)
+
+    class _FakeUsers:
+        async def update_one(self, f, u):
+            if "$set" in u:
+                updated_doc.update(u["$set"])
+            return SimpleNamespace(matched_count=1)
+        async def find_one(self, q):
+            return updated_doc
+
+    db = SimpleNamespace(users=_FakeUsers())
+    payload = ProfileUpdateRequest(first_name="NewFirst", last_name="NewLast")
+    res = asyncio.run(update_profile(data=payload, response=Response(), user=fake_user, db=db))
+    assert updated_doc["display_name"] == "NewFirst NewLast"
+
+
+def test_dashboard_contacts_aliases():
+    from app.routes.dashboard import dashboard_contacts, dashboard_contact_stats
+
+    user_id = ObjectId()
+    fake_user = {"_id": user_id, "plan": "free"}
+
+    class _FakeContacts:
+        def __init__(self):
+            pass
+        async def count_documents(self, q):
+            return 42
+        def find(self, q):
+            class _FakeCursor:
+                def sort(self, *a, **kw): return self
+                def skip(self, *a, **kw): return self
+                def limit(self, *a, **kw): return self
+                def __aiter__(self):
+                    self._items = iter([{"_id": ObjectId(), "name": "tester"}])
+                    return self
+                async def __anext__(self):
+                    try:
+                        return next(self._items)
+                    except StopIteration:
+                        raise StopAsyncIteration
+            return _FakeCursor()
+
+    db = SimpleNamespace(contacts=_FakeContacts())
+    res = asyncio.run(dashboard_contacts(page=1, limit=20, user=fake_user, db=db))
+    assert res["total"] == 42
+    assert len(res["contacts"]) == 1
+
+    stats_res = asyncio.run(dashboard_contact_stats(user=fake_user, db=db))
+    assert stats_res["total"] == 42
+    assert stats_res["limit"] == 500
+
+
+def test_admin_login_rate_limited(client):
+    admin_module.settings.ADMIN_EMAIL = "admin@example.com"
+    admin_module.settings.ADMIN_PASSWORD_HASH = "$2b$12$e80yVjJ8.VbI8hN8PuhN0.0XU6E.C1L.7lY0w/aR7s2wR1m6B8y1."
+
+    responses = [
+        client.post("/admin/login", json={"email": "wrong@example.com", "password": "wrong"})
+        for _ in range(6)
+    ]
+    # First 5 should be 401 Unauthorized
+    for r in responses[:5]:
+        assert r.status_code == 401
+    # 6th request must be 429 Too Many Requests
+    assert responses[5].status_code == 429
+    assert "Too many requests" in responses[5].json()["detail"]
+
+
+def test_admin_auth_login_alias_rate_limited(client):
+    admin_module.settings.ADMIN_EMAIL = "admin@example.com"
+    pwd = "valid-admin-password"
+    admin_module.settings.ADMIN_PASSWORD_HASH = admin_module.pwd_ctx.hash(pwd)
+
+    responses = []
+    for _ in range(6):
+        resp = client.post("/admin/auth/login", json={"email": "admin@example.com", "password": pwd})
+        client.cookies.clear()
+        responses.append(resp)
+
+    # First 5 should succeed (HTTP 200)
+    for r in responses[:5]:
+        assert r.status_code == 200
+        assert r.json().get("ok") is True
+    # 6th request must be 429 Too Many Requests
+    assert responses[5].status_code == 429
+    assert "Too many requests" in responses[5].json()["detail"]
+
+
+
+

@@ -124,3 +124,35 @@ async def get_dm_logs(limit: int = Query(default=50, le=500), db=Depends(get_db)
         log["_id"] = str(log["_id"])
         if "sent_at" in log: log["sent_at"] = log["sent_at"].isoformat()
     return {"logs": logs, "total": len(logs)}
+
+
+@router.get("/contacts")
+async def dashboard_contacts(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    from app.routes.contacts import list_contacts
+    return await list_contacts(page=page, limit=limit, user=user, db=db)
+
+
+@router.get("/contact-stats")
+async def dashboard_contact_stats(
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    from app.routes.contacts import contact_stats
+    return await contact_stats(user=user, db=db)
+
+
+@router.get("/contacts/export")
+@router.get("/contacts/export-csv")
+async def dashboard_contacts_export(
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    from app.routes.contacts import export_contacts_csv
+    return await export_contacts_csv(user=user, db=db)
+
+

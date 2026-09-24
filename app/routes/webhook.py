@@ -26,6 +26,9 @@ FOLLOW_CONFIRMATION_TOKENS = {
     "i followed",
     "following",
     "yes followed",
+    "im following",
+    "i am following",
+    "i m following",
 }
 
 
@@ -129,7 +132,13 @@ def _safe_event_hash(payload: dict[str, Any]) -> str:
 
 def _event_key_for_messaging(ig_id: str, messaging: dict[str, Any]) -> str:
     message_obj = messaging.get("message") or {}
-    mid = message_obj.get("mid") or message_obj.get("id") or str(messaging.get("timestamp") or "")
+    postback_obj = messaging.get("postback") or {}
+    mid = (
+        message_obj.get("mid")
+        or message_obj.get("id")
+        or postback_obj.get("mid")
+        or str(messaging.get("timestamp") or "")
+    )
     sender_id = (messaging.get("sender") or {}).get("id", "unknown")
     return f"msg:{ig_id}:{sender_id}:{mid}"
 
@@ -239,18 +248,27 @@ def _is_follow_confirmation_message(message_text: str) -> bool:
     return any(token in normalized for token in FOLLOW_CONFIRMATION_TOKENS)
 
 
+def _build_follow_buttons(user: dict[str, Any]) -> list[dict[str, str]]:
+    username = str(user.get("instagram_username") or "").strip().lstrip("@")
+    profile_url = f"https://www.instagram.com/{username}/" if username else "https://www.instagram.com/"
+    return [
+        {
+            "type": "web_url",
+            "url": profile_url,
+            "title": "Visit Profile",
+        },
+        {
+            "type": "postback",
+            "title": "I'm following ✅",
+            "payload": "FOLLOWED",
+        },
+    ]
+
+
 def _build_follow_prompt(user: dict[str, Any]) -> str:
-    username = str(user.get("instagram_username") or "").strip()
-    if username:
-        return (
-            f"Please follow @{username} first to unlock this DM.\n\n"
-            f"1) Visit profile: https://instagram.com/{username}\n"
-            f"2) After following, reply here with: FOLLOWED"
-        )
     return (
-        "Please follow our Instagram account first to unlock this DM.\n\n"
-        "1) Visit our profile\n"
-        "2) After following, reply here with: FOLLOWED"
+        "Oh no! It seems you're not following me 😭 It would really mean a lot if you visit my profile and hit the follow button 🥺 . "
+        "Once you have done that, click on the 'I'm following' button below and you will get the link ✨ ."
     )
 
 
@@ -390,6 +408,7 @@ async def _send_rule_reply(
     matched_keyword: str = "",
     comment_id: str | None = None,
     skip_follow_gate: bool = False,
+    skip_email_capture: bool = False,
 ):
     user_plan = get_plan_type(user.get("plan", PlanType.Free))
     base_reply = await _render_template(db, user, recipient_id, rule, matched_keyword)
@@ -420,12 +439,14 @@ async def _send_rule_reply(
 
         if not is_awaiting_for_rule and not is_completed:
             prompt_message = _build_follow_prompt(user)
+            follow_buttons = _build_follow_buttons(user)
             prompt_result = await InstagramService.send_dm(
                 access_token=user["instagram_access_token"],
                 recipient_ig_id=recipient_id,
                 message=prompt_message,
                 ig_user_id=user["instagram_user_id"],
                 comment_id=comment_id,
+                buttons=follow_buttons,
             )
 
             await db.dm_logs.insert_one(
@@ -463,6 +484,83 @@ async def _send_rule_reply(
                 await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
             return
 
+    # Check In-DM Email Capture (if enabled and not skipped)
+    email_capture_requested = bool(rule.get("capture_email_enabled", False))
+    if (
+        not skip_email_capture
+        and email_capture_requested
+        and user_plan in {PlanType.Starter, PlanType.Pro}
+    ):
+        contact = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": recipient_id})
+        has_email = bool(contact and contact.get("captured_email"))
+        is_awaiting_email = (
+            bool(contact)
+            and str(contact.get("email_capture_status") or "") == "awaiting"
+            and str(contact.get("email_capture_rule_id") or "") == str(rule.get("_id"))
+        )
+
+        if not has_email and not is_awaiting_email:
+            prompt_message = str(rule.get("email_capture_prompt") or "What's the best email address to send your link to? 📩").strip()
+            prompt_message = _apply_plan_footer(prompt_message, user_plan)
+            prompt_result = await InstagramService.send_dm(
+                access_token=user["instagram_access_token"],
+                recipient_ig_id=recipient_id,
+                message=prompt_message,
+                ig_user_id=user["instagram_user_id"],
+                comment_id=comment_id,
+            )
+
+            await db.dm_logs.insert_one(
+                {
+                    "user_id": str(user["_id"]),
+                    "rule_id": str(rule["_id"]),
+                    "recipient_ig_id": recipient_id,
+                    "message_sent": prompt_message,
+                    "trigger_type": trigger_type,
+                    "status": "sent" if prompt_result["success"] else "failed",
+                    "sent_at": datetime.now(timezone.utc),
+                }
+            )
+
+            if prompt_result["success"]:
+                now = datetime.now(timezone.utc)
+                await _ensure_contact_create_allowed(db, user, recipient_id)
+                await db.contacts.update_one(
+                    {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
+                    {
+                        "$set": {
+                            "last_seen_at": now,
+                            "last_triggered_rule_id": str(rule["_id"]),
+                            "trigger_type": trigger_type,
+                            "email_capture_status": "awaiting",
+                            "email_capture_rule_id": str(rule["_id"]),
+                            "email_capture_trigger_type": trigger_type.value,
+                            "email_capture_prompted_at": now,
+                        },
+                        "$inc": {"dm_count": 1},
+                        "$setOnInsert": {"user_id": str(user["_id"]), "ig_user_id": recipient_id, "first_seen_at": now},
+                    },
+                    upsert=True,
+                )
+                await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
+            return
+
+    # Optional simulated human jitter delay
+    delay_secs = int(rule.get("reply_delay_seconds") or 0)
+    if delay_secs > 0:
+        await asyncio.sleep(min(delay_secs, 15))
+
+    # Format DM buttons if configured
+    dm_buttons = None
+    if rule.get("dm_buttons"):
+        dm_buttons = []
+        for btn in rule.get("dm_buttons", []):
+            b_type = str(btn.get("type") or "web_url").strip().lower()
+            if b_type == "web_url" and btn.get("url"):
+                dm_buttons.append({"type": "web_url", "url": btn["url"], "title": str(btn.get("title") or "Open Link")[:20]})
+            elif b_type == "postback":
+                dm_buttons.append({"type": "postback", "title": str(btn.get("title") or "Select")[:20], "payload": str(btn.get("payload") or btn.get("title") or "Select")[:100]})
+
     result = await InstagramService.send_dm(
         access_token=user["instagram_access_token"],
         recipient_ig_id=recipient_id,
@@ -471,6 +569,7 @@ async def _send_rule_reply(
         attachment_url=str(rule.get("dm_attachment_url") or "").strip() or None,
         attachment_type=str(rule.get("dm_attachment_type") or "image").strip().lower() or "image",
         comment_id=comment_id,
+        buttons=dm_buttons,
     )
 
     await db.dm_logs.insert_one(
@@ -645,9 +744,16 @@ async def sample_payloads():
 
 
 async def handle_messaging_event(db, ig_account_id: str, messaging: dict):
-    message_text = (messaging.get("message") or {}).get("text", "").strip()
+    message_obj = messaging.get("message") or {}
+    postback_obj = messaging.get("postback") or {}
+    has_content = bool(
+        message_obj.get("text")
+        or postback_obj.get("payload")
+        or postback_obj.get("title")
+        or (message_obj.get("quick_reply") or {}).get("payload")
+    )
 
-    if message_text:
+    if has_content:
         await handle_dm_event(db, ig_account_id, messaging)
 
     if _is_story_reply(messaging):
@@ -666,6 +772,7 @@ async def handle_change_event(db, ig_account_id: str, change: dict):
 
 async def handle_dm_event(db, ig_account_id: str, messaging: dict):
     message_obj = messaging.get("message", {})
+    postback_obj = messaging.get("postback", {})
 
     # Ignore echoes of our own sent messages
     if message_obj.get("is_echo"):
@@ -673,7 +780,14 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         return
 
     sender_id = messaging.get("sender", {}).get("id")
-    message_text = message_obj.get("text", "").lower()
+    raw_text = (
+        postback_obj.get("payload")
+        or (message_obj.get("quick_reply") or {}).get("payload")
+        or message_obj.get("text")
+        or postback_obj.get("title")
+        or ""
+    )
+    message_text = raw_text.strip().lower()
 
     if not sender_id or not message_text:
         return
@@ -713,6 +827,10 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
                 }
             )
             if pending_rule:
+                await db.automation_rules.update_one(
+                    {"_id": pending_rule["_id"]},
+                    {"$inc": {"follow_gate_completed_count": 1}},
+                )
                 await _send_rule_reply(
                     db,
                     user,
@@ -732,6 +850,70 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
             },
         )
         return
+
+    # Check awaiting email capture
+    if contact and str(contact.get("email_capture_status") or "") == "awaiting":
+        pending_rule_id = str(contact.get("email_capture_rule_id") or "").strip()
+        email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', message_text)
+        if email_match:
+            captured_email = email_match.group(0).lower()
+            now = datetime.now(timezone.utc)
+            await db.contacts.update_one(
+                {"_id": contact["_id"]},
+                {
+                    "$set": {
+                        "email_capture_status": "captured",
+                        "captured_email": captured_email,
+                        "email_captured_at": now,
+                    }
+                },
+            )
+            if ObjectId.is_valid(pending_rule_id):
+                pending_rule = await db.automation_rules.find_one(
+                    {
+                        "_id": ObjectId(pending_rule_id),
+                        "user_id": str(user["_id"]),
+                        "is_active": True,
+                    }
+                )
+                if pending_rule:
+                    await db.automation_rules.update_one(
+                        {"_id": pending_rule["_id"]},
+                        {"$inc": {"email_captured_count": 1}},
+                    )
+                    success_msg = str(pending_rule.get("email_capture_success_message") or "").strip()
+                    if success_msg:
+                        formatted_success = success_msg.replace("{{email}}", captured_email).replace("{email}", captured_email)
+                        formatted_success = _apply_plan_footer(formatted_success, user_plan)
+                        await InstagramService.send_dm(
+                            access_token=user["instagram_access_token"],
+                            recipient_ig_id=sender_id,
+                            message=formatted_success,
+                            ig_user_id=user["instagram_user_id"],
+                        )
+                    pending_trigger_raw = str(contact.get("email_capture_trigger_type") or TriggerType.COMMENT.value)
+                    pending_trigger = TriggerType(pending_trigger_raw) if pending_trigger_raw in {t.value for t in TriggerType} else TriggerType.COMMENT
+                    await _send_rule_reply(
+                        db,
+                        user,
+                        sender_id,
+                        pending_rule,
+                        pending_trigger,
+                        skip_follow_gate=True,
+                        skip_email_capture=True,
+                    )
+            return
+        else:
+            retry_msg = "Please reply with a valid email address (e.g. name@example.com) to receive your link! 📩"
+            retry_msg = _apply_plan_footer(retry_msg, user_plan)
+            await InstagramService.send_dm(
+                access_token=user["instagram_access_token"],
+                recipient_ig_id=sender_id,
+                message=retry_msg,
+                ig_user_id=user["instagram_user_id"],
+            )
+            return
+
 
     dm_rules_query = {
         "user_id": str(user["_id"]),
@@ -770,6 +952,7 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         logger.info("DM keyword match result: sender_id=%s, rule_id=%s, is_match=%s", sender_id, rule.get("_id"), is_match)
 
         if is_match:
+            await db.automation_rules.update_one({"_id": rule["_id"]}, {"$inc": {"triggers_count": 1}})
             matched_kw = next((kw for kw in keywords if kw in message_text), "")
             await _send_rule_reply(db, user, sender_id, rule, TriggerType.KEYWORD, matched_keyword=matched_kw)
             break
@@ -877,10 +1060,16 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
             raw_trigger = str(rule.get("trigger_type") or TriggerType.POST_COMMENT)
             trigger_type = TriggerType(raw_trigger) if raw_trigger in {t.value for t in TriggerType} else TriggerType.POST_COMMENT
 
+            await db.automation_rules.update_one({"_id": rule["_id"]}, {"$inc": {"triggers_count": 1}})
+
             if bool(rule.get("public_comment_reply_enabled", False)) and comment_id:
-                public_template = str(rule.get("public_comment_reply_template") or "").strip()
-                if public_template:
-                    public_reply = _render_comment_template(public_template, commenter_id, raw_comment_text)
+                templates = list(rule.get("public_comment_reply_templates") or [])
+                if not templates and rule.get("public_comment_reply_template"):
+                    templates = [rule["public_comment_reply_template"]]
+                if templates:
+                    import random
+                    chosen_template = random.choice(templates)
+                    public_reply = _render_comment_template(chosen_template, commenter_id, raw_comment_text)
                     if public_reply:
                         await InstagramService.reply_to_comment(
                             access_token=user["instagram_access_token"],

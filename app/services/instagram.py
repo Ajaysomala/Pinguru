@@ -76,6 +76,7 @@ class InstagramService:
         attachment_url: str | None = None,
         attachment_type: str = "image",
         comment_id: str | None = None,
+        buttons: list[dict] | None = None,
     ) -> dict:
         """Send a DM to an Instagram user via Graph API."""
         access_token = InstagramService.decrypt_access_token(access_token)
@@ -86,17 +87,28 @@ class InstagramService:
             "access_token": access_token,
         }
         message_payload: dict = {}
-        if message:
-            message_payload["text"] = message
-        if attachment_url:
+        if buttons:
+            message_payload["attachment"] = {
+                "type": "template",
+                "payload": {
+                    "template_type": "button",
+                    "text": message or "Please follow our profile to continue.",
+                    "buttons": buttons,
+                },
+            }
+        elif attachment_url:
             message_payload["attachment"] = {
                 "type": attachment_type,
                 "payload": {"url": attachment_url},
             }
-        if not message_payload:
+            if message:
+                message_payload["text"] = message
+        elif message:
+            message_payload["text"] = message
+        else:
             message_payload["text"] = ""
         payload["message"] = message_payload
-        logger.info("Sending Instagram DM request")
+        logger.info("Sending Instagram DM request (has_buttons=%s, comment_id=%s)", bool(buttons), comment_id)
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 resp = await client.post(url, json=payload)
@@ -111,6 +123,18 @@ class InstagramService:
 
         if resp.status_code != 200:
             logger.error("DM failed: status=%s body=%s", resp.status_code, data)
+            if buttons:
+                logger.warning("Button template DM failed, retrying with standard text message fallback")
+                return await InstagramService.send_dm(
+                    access_token=access_token,
+                    recipient_ig_id=recipient_ig_id,
+                    message=message,
+                    ig_user_id=ig_user_id,
+                    attachment_url=attachment_url,
+                    attachment_type=attachment_type,
+                    comment_id=comment_id,
+                    buttons=None,
+                )
             return {"success": False, "error": data.get("error", {}).get("message", "Instagram API request failed"), "status_code": resp.status_code}
         return {"success": True, "data": data}
 

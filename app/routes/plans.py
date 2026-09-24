@@ -74,12 +74,14 @@ async def get_plans():
 
 @router.post("/checkout/{plan}")
 async def create_checkout(
+    request: Request,
     plan: PlanType,
     billing_cycle: str = Query(default="monthly"),
     db=Depends(get_db),
     user=Depends(get_current_user),
 ):
     return await create_checkout_session(
+        request=request,
         payload=CheckoutRequest(plan=plan.value, billing_cycle=billing_cycle),
         user=user,
         db=db,

@@ -16,6 +16,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.models import PlanType, get_plan_limits, get_plan_type
 from app.routes.auth import get_current_user
+from app.security import limiter
 from app.services.email import send_subscription_expired_email
 
 router = APIRouter()
@@ -140,7 +141,9 @@ async def _clear_stale_pending_checkout(db, user: dict[str, Any]) -> bool:
 
 
 @router.post("/create-checkout")
+@limiter.limit("10/minute")
 async def create_checkout_session(
+    request: Request,
     payload: CheckoutRequest,
     user=Depends(get_current_user),
     db=Depends(get_db),
@@ -223,7 +226,12 @@ async def get_customer_portal_url(user=Depends(get_current_user)):
 
 
 @router.post("/cancel-pending")
-async def cancel_pending_checkout(user=Depends(get_current_user), db=Depends(get_db)):
+@limiter.limit("10/minute")
+async def cancel_pending_checkout(
+    request: Request,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
     pending_plan = user.get("pending_plan")
     sub_id = user.get("razorpay_subscription_id")
     current_plan = _normalize_user_plan(user)
@@ -296,11 +304,11 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
         incoming_sub_id = payload.get("id")
         billing_cycle = _normalize_billing_cycle(notes.get("billing_cycle"))
         if user_id and plan_str:
-            if plan_str not in {PlanType.Starter.value, PlanType.Pro.value}:
+            plan_enum = get_plan_type(plan_str)
+            if plan_enum not in {PlanType.Starter, PlanType.Pro}:
                 logger.warning("Ignoring unsupported plan in webhook notes: %s", plan_str)
                 return {"status": "ignored"}
 
-            plan_enum = get_plan_type(plan_str)
             try:
                 user_object_id = ObjectId(user_id)
             except InvalidId:
@@ -326,7 +334,7 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
                 {"_id": user_object_id},
                 {
                     "$set": {
-                        "plan": plan_enum,
+                        "plan": plan_enum.value,
                         "dm_limit": get_plan_limits(plan_enum).get("dm_limit"),
                         "razorpay_subscription_id": incoming_sub_id,
                         "pending_plan": None,
@@ -393,7 +401,13 @@ async def get_billing_status(user=Depends(get_current_user)):
 
 
 @router.post("/refund")
-async def request_refund(data: RefundRequest, user=Depends(get_current_user), db=Depends(get_db)):
+@limiter.limit("5/minute")
+async def request_refund(
+    request: Request,
+    data: RefundRequest,
+    user=Depends(get_current_user),
+    db=Depends(get_db),
+):
     current_plan = _normalize_user_plan(user)
 
     # Free plan users have nothing to refund

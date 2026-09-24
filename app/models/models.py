@@ -43,6 +43,12 @@ class CommentMediaFilterType(str, Enum):
     REEL = "reel"
     ALL = "all"
 
+class RuleButton(BaseModel):
+    type: str = "web_url"  # "web_url" or "postback"
+    title: str
+    url: Optional[str] = None
+    payload: Optional[str] = None
+
 # ── Contact ───────────────────────────────────────────────────────────────────
 
 class Contact(BaseModel):
@@ -54,8 +60,13 @@ class Contact(BaseModel):
     last_triggered_rule_id: Optional[str] = None
     trigger_type: Optional[TriggerType] = None
     dm_count: int = 0
+    captured_email: Optional[str] = None
+    email_captured_at: Optional[datetime] = None
+    email_capture_status: Optional[str] = None  # None, "awaiting", "captured"
+    email_capture_rule_id: Optional[str] = None
     first_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
 
 # ── User ──────────────────────────────────────────────────────────────────────
 
@@ -148,10 +159,19 @@ class AutomationRule(BaseModel):
     any_comment_keyword: bool = True
     public_comment_reply_enabled: bool = False
     public_comment_reply_template: Optional[str] = None
+    public_comment_reply_templates: List[str] = []
+    dm_buttons: List[RuleButton] = []
+    capture_email_enabled: bool = False
+    email_capture_prompt: Optional[str] = None
+    email_capture_success_message: Optional[str] = None
+    reply_delay_seconds: int = 0
     ask_follow_before_dm: bool = False
     send_follow_up_message: bool = False
     is_active: bool = True
     sent_count: int = 0
+    triggers_count: int = 0
+    follow_gate_completed_count: int = 0
+    email_captured_count: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class AutomationRuleCreate(BaseModel):
@@ -177,6 +197,12 @@ class AutomationRuleCreate(BaseModel):
     any_comment_keyword: Optional[bool] = None
     public_comment_reply_enabled: Optional[bool] = None
     public_comment_reply_template: Optional[str] = None
+    public_comment_reply_templates: Optional[List[str]] = None
+    dm_buttons: Optional[List[RuleButton]] = None
+    capture_email_enabled: Optional[bool] = None
+    email_capture_prompt: Optional[str] = None
+    email_capture_success_message: Optional[str] = None
+    reply_delay_seconds: Optional[int] = None
     ask_follow_before_dm: Optional[bool] = None
     send_follow_up_message: Optional[bool] = None
 

@@ -187,6 +187,21 @@ def test_send_dm_recipient_comment_id(monkeypatch):
         url2, payload2 = captured_payloads[1]
         assert payload2["recipient"] == {"id": "ig_user_1"}
 
+        # Call with buttons
+        buttons_payload = [{"type": "web_url", "url": "https://instagram.com/my_brand", "title": "Visit Profile"}]
+        res3 = await InstagramService.send_dm(
+            access_token="tok_abc",
+            recipient_ig_id="ig_user_1",
+            message="Check out profile",
+            ig_user_id="biz_page_id",
+            buttons=buttons_payload,
+        )
+        assert res3["success"] is True
+        url3, payload3 = captured_payloads[2]
+        assert payload3["message"]["attachment"]["type"] == "template"
+        assert payload3["message"]["attachment"]["payload"]["template_type"] == "button"
+        assert payload3["message"]["attachment"]["payload"]["buttons"] == buttons_payload
+
     asyncio.run(_run())
 
 
@@ -293,11 +308,12 @@ def test_keyword_follow_gate_prompts_user_then_unblocks_on_followed(monkeypatch)
 
     sent_messages = []
 
-    async def fake_send_dm(access_token, recipient_ig_id, message, ig_user_id, attachment_url=None, attachment_type="image", comment_id=None):
+    async def fake_send_dm(access_token, recipient_ig_id, message, ig_user_id, attachment_url=None, attachment_type="image", comment_id=None, buttons=None):
         sent_messages.append({
             "recipient_ig_id": recipient_ig_id,
             "message": message,
             "comment_id": comment_id,
+            "buttons": buttons,
         })
         return {"success": True}
 
@@ -309,10 +325,13 @@ def test_keyword_follow_gate_prompts_user_then_unblocks_on_followed(monkeypatch)
         # 1. Trigger rule reply for keyword
         await _send_rule_reply(db, user, "fan_001", rule, TriggerType.KEYWORD, matched_keyword="guide")
 
-        # Should have sent follow prompt
+        # Should have sent follow prompt with interactive buttons
         assert len(sent_messages) == 1
-        assert "Please follow @my_brand first" in sent_messages[0]["message"]
-        assert "reply here with: FOLLOWED" in sent_messages[0]["message"]
+        assert "Oh no! It seems you're not following me" in sent_messages[0]["message"]
+        assert sent_messages[0]["buttons"] == [
+            {"type": "web_url", "url": "https://www.instagram.com/my_brand/", "title": "Visit Profile"},
+            {"type": "postback", "title": "I'm following ✅", "payload": "FOLLOWED"},
+        ]
 
         # Contact should now be awaiting
         contact = await contacts_col.find_one({"user_id": str(user_id), "ig_user_id": "fan_001"})
@@ -320,14 +339,14 @@ def test_keyword_follow_gate_prompts_user_then_unblocks_on_followed(monkeypatch)
         assert contact["follow_gate_status"] == "awaiting"
         assert contact["follow_gate_rule_id"] == str(rule_id)
 
-        # 2. Fan responds in DM with "FOLLOWED"
-        messaging_event = {
+        # 2. Fan clicks "I'm following ✅" button (Meta sends postback event)
+        postback_event = {
             "sender": {"id": "fan_001"},
             "recipient": {"id": "biz_123"},
-            "message": {"text": "FOLLOWED"},
+            "postback": {"title": "I'm following ✅", "payload": "FOLLOWED"},
         }
 
-        await handle_messaging_event(db, "biz_123", messaging_event)
+        await handle_messaging_event(db, "biz_123", postback_event)
 
         # Should have triggered the un-gated final reply
         assert len(sent_messages) == 2
@@ -382,11 +401,12 @@ def test_comment_event_passes_comment_id_to_send_dm(monkeypatch):
 
     sent_messages = []
 
-    async def fake_send_dm(access_token, recipient_ig_id, message, ig_user_id, attachment_url=None, attachment_type="image", comment_id=None):
+    async def fake_send_dm(access_token, recipient_ig_id, message, ig_user_id, attachment_url=None, attachment_type="image", comment_id=None, buttons=None):
         sent_messages.append({
             "recipient_ig_id": recipient_ig_id,
             "message": message,
             "comment_id": comment_id,
+            "buttons": buttons,
         })
         return {"success": True}
 
@@ -407,6 +427,59 @@ def test_comment_event_passes_comment_id_to_send_dm(monkeypatch):
         assert sent_messages[0]["recipient_ig_id"] == "commenter_888"
         assert sent_messages[0]["comment_id"] == "comm_unique_777"
         assert "Price is $10" in sent_messages[0]["message"]
+
+    asyncio.run(_run())
+
+
+def test_razorpay_webhook_writes_canonical_lowercase_plan(monkeypatch):
+    import json
+    import hmac
+    import hashlib
+    from fastapi import Request
+    from app.config import settings
+    from app.routes.billing import razorpay_webhook
+
+    monkeypatch.setattr(settings, "RAZORPAY_WEBHOOK_SECRET", "test_secret_123")
+
+    user_id = ObjectId()
+    user = {
+        "_id": user_id,
+        "email": "customer@example.com",
+        "plan": "free",
+        "razorpay_subscription_id": "sub_test_001",
+    }
+    users_col = _MockCollection([user])
+    db = SimpleNamespace(users=users_col)
+
+    payload_dict = {
+        "event": "subscription.activated",
+        "payload": {
+            "subscription": {
+                "entity": {
+                    "id": "sub_test_001",
+                    "notes": {
+                        "user_id": str(user_id),
+                        "plan": "Starter",  # Capitalized string from webhook payload
+                        "billing_cycle": "monthly",
+                    },
+                }
+            }
+        },
+    }
+    raw_body = json.dumps(payload_dict).encode("utf-8")
+    sig = hmac.new("test_secret_123".encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+
+    mock_request = AsyncMock(spec=Request)
+    mock_request.body = AsyncMock(return_value=raw_body)
+    mock_request.headers = {"X-Razorpay-Signature": sig}
+
+    async def _run():
+        res = await razorpay_webhook(request=mock_request, db=db)
+        assert res == {"status": "ok"}
+        updated_user = await users_col.find_one({"_id": user_id})
+        assert updated_user["plan"] == "starter"
+        assert updated_user["plan"] == PlanType.Starter.value
+        assert isinstance(updated_user["plan"], str)
 
     asyncio.run(_run())
 

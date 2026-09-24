@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 from urllib.parse import quote, urlencode, urlparse
 import hashlib
+import hmac
 import json
 import secrets
 import logging
@@ -382,7 +383,7 @@ async def register(request: Request, data: UserCreate, db=Depends(get_db)):
     user_doc = {
         "email": email,
         "hashed_password": hash_password(data.password),
-        "plan": PlanType.Free,
+        "plan": PlanType.Free.value,
         "dm_limit": PLAN_LIMITS[PlanType.Free]["dm_limit"],
         "dm_count_this_month": 0,
         "is_active": True,
@@ -451,7 +452,7 @@ async def verify_email(request: Request, data: OTPVerifyRequest, db=Depends(get_
         raise HTTPException(status_code=400, detail="Code expired. Request a new one.")
 
     expected_hash = user.get("otp_hash")
-    if not expected_hash or hash_otp(otp) != expected_hash:
+    if not expected_hash or not hmac.compare_digest(hash_otp(otp), str(expected_hash)):
         await db.users.update_one({"_id": user["_id"]}, {"$inc": {"otp_attempts": 1}})
         raise HTTPException(status_code=400, detail="Invalid verification code")
 
@@ -644,11 +645,13 @@ async def me(request: Request, user=Depends(get_current_user), db: Any = Depends
             instagram_username = str(user.get("instagram_username") or "").strip()
 
     return {
+        "id": str(user["_id"]),
         "email": user.get("email"),
         "first_name": first_name,
         "last_name": last_name,
         "business_category": user.get("business_category", ""),
         "display_name": user.get("display_name") or full_name,
+        "onboarding_complete": bool(user.get("onboarding_complete", False)),
         "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
         "instagram_connected": bool(user.get("instagram_user_id")),
         "instagram_user_id": user.get("instagram_user_id", ""),
@@ -777,7 +780,7 @@ async def save_instagram_token(
     db=Depends(get_db),
     x_admin_key: str = Header(None),
 ):
-    if x_admin_key != settings.admin_api_key:
+    if not settings.admin_api_key or not hmac.compare_digest(x_admin_key or "", settings.admin_api_key):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     access_token = data.access_token.strip()
@@ -860,7 +863,9 @@ async def save_instagram_token(
 
 
 @router.get("/instagram/media")
+@limiter.limit("20/minute")
 async def instagram_media(
+    request: Request,
     media_type: str = Query("all"),
     limit: int = Query(25, ge=1, le=50),
     user=Depends(get_current_user),
@@ -900,7 +905,7 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
             user_doc = {
                 "email": email,
                 "hashed_password": hash_password(settings.DEFAULT_OAUTH_PASSWORD),
-                "plan": PlanType.Free,
+                "plan": PlanType.Free.value,
                 "dm_limit": PLAN_LIMITS[PlanType.Free]["dm_limit"],
                 "dm_count_this_month": 0,
                 "is_active": True,
@@ -963,6 +968,10 @@ async def update_profile(
         update["first_name"] = data.first_name.strip()[:80]
     if data.last_name is not None:
         update["last_name"] = data.last_name.strip()[:80]
+    if data.first_name is not None or data.last_name is not None:
+        effective_first = update.get("first_name", user.get("first_name", ""))
+        effective_last = update.get("last_name", user.get("last_name", ""))
+        update["display_name"] = _build_display_name(effective_first, effective_last)
     if data.business_category is not None:
         update["business_category"] = data.business_category.strip()[:100]
     if data.onboarding_complete is not None:
