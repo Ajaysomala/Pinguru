@@ -9,6 +9,14 @@ BASE_GRAPH_FB = f"https://graph.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSI
 BASE_GRAPH_IG = "https://graph.instagram.com"  # for IG Business Login — NO version in URL
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
+class InstagramTokenExpiredError(Exception):
+    """Raised when Instagram Graph API returns error code 190 or 102 indicating expired or revoked token."""
+    def __init__(self, error_message: str = "Instagram token expired or invalid", error_code: int = 190):
+        super().__init__(error_message)
+        self.error_message = error_message
+        self.error_code = error_code
+
+
 class InstagramService:
 
     @staticmethod
@@ -63,8 +71,12 @@ class InstagramService:
             return ""
         try:
             return InstagramService._fernet().decrypt(encrypted_access_token.encode("utf-8")).decode("utf-8")
-        except InvalidToken:
-            # Backward compatibility: allow pre-hardening plain-text tokens.
+        except (InvalidToken, ValueError) as exc:
+            if settings.ENVIRONMENT.lower() == "production":
+                logger.error("Failed to decrypt Instagram access token in production: %s", exc)
+                raise
+            # In development/test environments, allow plain-text mock tokens
+            logger.warning("Decryption failed; returning raw token (development fallback): %s", exc)
             return encrypted_access_token
 
     @staticmethod
@@ -79,7 +91,11 @@ class InstagramService:
         buttons: list[dict] | None = None,
     ) -> dict:
         """Send a DM to an Instagram user via Graph API."""
-        access_token = InstagramService.decrypt_access_token(access_token)
+        try:
+            access_token = InstagramService.decrypt_access_token(access_token)
+        except (InvalidToken, ValueError) as exc:
+            logger.error("Failed to decrypt access token in send_dm: %s", exc)
+            return {"success": False, "error": "Invalid or corrupted access token", "status_code": 401}
         url = f"{BASE_GRAPH_IG}/{ig_user_id}/messages"
         recipient_payload = {"comment_id": comment_id} if comment_id else {"id": recipient_ig_id}
         payload: dict = {
@@ -141,6 +157,11 @@ class InstagramService:
     @staticmethod
     async def get_user_profile(access_token: str) -> dict:
         """Get Instagram business account info."""
+        try:
+            access_token = InstagramService.decrypt_access_token(access_token)
+        except (InvalidToken, ValueError) as exc:
+            logger.error("Failed to decrypt access token in get_user_profile: %s", exc)
+            return {}
         url = f"{BASE_GRAPH_IG}/me"
         params = {
             "fields": "id,name,username,user_id",
@@ -157,16 +178,25 @@ class InstagramService:
     @staticmethod
     async def get_messaging_user_profile(access_token: str, instagram_scoped_user_id: str) -> dict:
         """Get the display name and username for a user who sent a message."""
-        url = f"{BASE_GRAPH_FB}/{instagram_scoped_user_id}"
+        try:
+            decrypted = InstagramService.decrypt_access_token(access_token)
+        except (InvalidToken, ValueError) as exc:
+            logger.error("Failed to decrypt access token in get_messaging_user_profile: %s", exc)
+            return {}
+        url = f"{BASE_GRAPH_IG}/{instagram_scoped_user_id}"
         params = {
             "fields": "name,username",
-            "access_token": InstagramService.decrypt_access_token(access_token),
+            "access_token": decrypted,
         }
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 resp = await client.get(url, params=params)
             if resp.status_code != 200:
-                logger.warning("Instagram messaging user profile lookup returned %s", resp.status_code)
+                logger.warning(
+                    "Instagram messaging user profile lookup returned %s: %s",
+                    resp.status_code,
+                    resp.text[:300],
+                )
                 return {}
             return resp.json() or {}
         except httpx.RequestError:
@@ -176,7 +206,11 @@ class InstagramService:
     @staticmethod
     async def get_business_account_id(access_token: str, preferred_username: str | None = None) -> str | None:
         """Resolve Instagram Business Account ID that matches webhook entry.id/recipient.id."""
-        decrypted = InstagramService.decrypt_access_token(access_token)
+        try:
+            decrypted = InstagramService.decrypt_access_token(access_token)
+        except (InvalidToken, ValueError) as exc:
+            logger.error("Failed to decrypt access token in get_business_account_id: %s", exc)
+            return None
         url = f"{BASE_GRAPH_FB}/me/accounts"
         params = {
             "fields": "instagram_business_account{id,username}",
@@ -221,7 +255,14 @@ class InstagramService:
     @staticmethod
     async def get_user_media(access_token: str, limit: int = 25, media_type: str = "all") -> list[dict]:
         """Fetch recent Instagram media for the connected business account."""
-        decrypted = InstagramService.decrypt_access_token(access_token)
+        try:
+            decrypted = InstagramService.decrypt_access_token(access_token)
+        except (InvalidToken, ValueError) as exc:
+            logger.error("Failed to decrypt access token in get_user_media: %s", exc)
+            raise InstagramTokenExpiredError(
+                error_message="Invalid or corrupted Instagram access token",
+                error_code=190,
+            ) from exc
         url = f"{BASE_GRAPH_IG}/me/media"
         params = {
             "fields": "id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp",
@@ -232,7 +273,19 @@ class InstagramService:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 resp = await client.get(url, params=params)
             if resp.status_code != 200:
-                logger.warning("Instagram media fetch returned %s", resp.status_code)
+                body_sample = resp.text[:300]
+                logger.warning("Instagram media fetch returned %s: %s", resp.status_code, body_sample)
+                try:
+                    payload = resp.json() or {}
+                except ValueError:
+                    payload = {}
+                error_obj = payload.get("error") or {}
+                error_code = error_obj.get("code")
+                if error_code in (190, 102) or (resp.status_code == 401 and "token" in body_sample.lower()):
+                    raise InstagramTokenExpiredError(
+                        error_message=str(error_obj.get("message") or "Instagram token expired or invalid"),
+                        error_code=error_code or 190,
+                    )
                 return []
 
             payload = resp.json() or {}
@@ -255,6 +308,8 @@ class InstagramService:
                     }
                 )
             return items
+        except InstagramTokenExpiredError:
+            raise
         except httpx.RequestError:
             logger.exception("Instagram media fetch failed")
             return []
@@ -336,7 +391,11 @@ class InstagramService:
     async def reply_to_comment(access_token: str, comment_id: str, message: str) -> dict:
         """Reply to an Instagram comment (not DM — comment reply)."""
         url = f"{BASE_GRAPH_IG}/{comment_id}/replies"
-        decrypted = InstagramService.decrypt_access_token(access_token)
+        try:
+            decrypted = InstagramService.decrypt_access_token(access_token)
+        except (InvalidToken, ValueError) as exc:
+            logger.error("Failed to decrypt access token in reply_to_comment: %s", exc)
+            return {"success": False, "error": "Invalid or corrupted access token"}
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 resp = await client.post(url, data={
@@ -351,7 +410,11 @@ class InstagramService:
     @staticmethod
     async def refresh_long_lived_token(access_token: str) -> dict:
         """Refresh a long-lived token. Call every 30-45 days."""
-        decrypted = InstagramService.decrypt_access_token(access_token)
+        try:
+            decrypted = InstagramService.decrypt_access_token(access_token)
+        except (InvalidToken, ValueError) as exc:
+            logger.error("Failed to decrypt access token in refresh_long_lived_token: %s", exc)
+            return {"error": "Invalid or corrupted access token"}
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{BASE_GRAPH_IG}/refresh_access_token", params={
                 "grant_type": "ig_refresh_token",

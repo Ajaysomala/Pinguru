@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
@@ -212,8 +212,15 @@ def _comment_rule_matches(rule: dict[str, Any], media_id: str, media_kind: str |
 
 
 def _render_comment_template(template: str, commenter_id: str, comment_text: str) -> str:
-    rendered = template.replace("{username}", commenter_id).replace("{name}", commenter_id)
-    rendered = rendered.replace("{comment}", comment_text)
+    rendered = (
+        template
+        .replace("{{username}}", commenter_id)
+        .replace("{{name}}", commenter_id)
+        .replace("{username}", commenter_id)
+        .replace("{name}", commenter_id)
+        .replace("{{comment}}", comment_text)
+        .replace("{comment}", comment_text)
+    )
     return rendered.strip()
 
 
@@ -383,8 +390,42 @@ async def _render_template(db, user: dict, recipient_id: str, rule: dict, matche
         profile = await InstagramService.get_messaging_user_profile(
             user["instagram_access_token"], recipient_id
         )
-        ig_name = ig_name or str(profile.get("name") or "")
-        ig_username = ig_username or str(profile.get("username") or "")
+        fetched_name = str(profile.get("name") or "").strip()
+        fetched_username = str(profile.get("username") or "").strip()
+
+        new_info_fetched = False
+        if not ig_name and fetched_name:
+            ig_name = fetched_name
+            new_info_fetched = True
+        if not ig_username and fetched_username:
+            ig_username = fetched_username
+            new_info_fetched = True
+
+        # Fallback display_name to username if display_name is not set
+        if not ig_name and ig_username:
+            ig_name = ig_username
+
+        if new_info_fetched:
+            update_fields = {}
+            if ig_name:
+                update_fields["display_name"] = ig_name
+            if ig_username:
+                update_fields["ig_username"] = ig_username
+            if update_fields:
+                now = datetime.now(timezone.utc)
+                await db.contacts.update_one(
+                    {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
+                    {
+                        "$set": update_fields,
+                        "$setOnInsert": {
+                            "user_id": str(user["_id"]),
+                            "ig_user_id": recipient_id,
+                            "first_seen_at": now,
+                        },
+                    },
+                    upsert=True,
+                )
+
     keyword_val = matched_keyword or (rule.get("keywords") or [""])[0]
 
     return (
@@ -584,6 +625,24 @@ async def _send_rule_reply(
         }
     )
 
+    if not result["success"] and result.get("status_code") == 401:
+        logger.warning(
+            "DM failed with 401/token error for user %s (%s). Flagging token as needing reauth.",
+            user.get("_id"),
+            result.get("error"),
+        )
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {
+                "$set": {
+                    "instagram_access_token": None,
+                    "instagram_user_id": None,
+                    "instagram_account_ids": [],
+                    "ig_token_expires_at": None,
+                }
+            },
+        )
+
     if result["success"]:
         await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
         await db.automation_rules.update_one({"_id": rule["_id"]}, {"$inc": {"sent_count": 1}})
@@ -601,40 +660,59 @@ async def _send_rule_reply(
 
 
 async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) -> dict[str, int]:
-    entries = body.get("entry", [])
-    logger.info(f"Webhook received: {len(raw_body)} bytes, {len(entries)} entries")
+    # NOTE ON SCALING & DURABILITY:
+    # When dispatched via FastAPI BackgroundTasks, this runs in-process on the active asyncio event loop.
+    # This is non-durable (if the process restarts mid-task, that task is lost).
+    # If PinGuru scales past a few hundred DMs/day, this should graduate to a real queue
+    # (e.g. a simple Mongo-backed job collection polled by a worker loop, or Redis+arq if budget allows).
+    try:
+        entries = body.get("entry", [])
+        logger.info(f"Webhook received: {len(raw_body)} bytes, {len(entries)} entries")
 
-    processed_events = 0
-    deduped_events = 0
+        processed_events = 0
+        deduped_events = 0
 
-    for entry in entries:
-        ig_id = entry.get("id")
-        messaging_events = entry.get("messaging") or []
-        change_events = entry.get("changes") or []
+        for entry in entries:
+            ig_id = entry.get("id")
+            messaging_events = entry.get("messaging") or []
+            change_events = entry.get("changes") or []
 
-        for messaging in messaging_events:
-            event_key = _event_key_for_messaging(ig_id, messaging)
-            if not await _mark_event_if_new(db, event_key, "messaging"):
-                deduped_events += 1
-                continue
+            for messaging in messaging_events:
+                event_key = _event_key_for_messaging(ig_id, messaging)
+                if not await _mark_event_if_new(db, event_key, "messaging"):
+                    deduped_events += 1
+                    continue
 
-            sender_id = (messaging.get("sender") or {}).get("id")
-            recipient_id = (messaging.get("recipient") or {}).get("id") or ig_id
-            message_text = (messaging.get("message") or {}).get("text")
-            logger.info("Messaging webhook event received: sender_id=%s, recipient_id=%s", sender_id, recipient_id)
+                sender_id = (messaging.get("sender") or {}).get("id")
+                recipient_id = (messaging.get("recipient") or {}).get("id") or ig_id
+                message_text = (messaging.get("message") or {}).get("text")
+                logger.info("Messaging webhook event received: sender_id=%s, recipient_id=%s", sender_id, recipient_id)
 
-            await handle_messaging_event(db, str(recipient_id or ig_id), messaging)
-            processed_events += 1
+                try:
+                    await handle_messaging_event(db, str(recipient_id or ig_id), messaging)
+                    processed_events += 1
+                except Exception:
+                    logger.exception(
+                        "Failed to process messaging event in webhook: sender_id=%s, recipient_id=%s",
+                        sender_id,
+                        recipient_id,
+                    )
 
-        for change in change_events:
-            event_key = _event_key_for_change(ig_id, change)
-            if not await _mark_event_if_new(db, event_key, "change"):
-                deduped_events += 1
-                continue
-            await handle_change_event(db, ig_id, change)
-            processed_events += 1
+            for change in change_events:
+                event_key = _event_key_for_change(ig_id, change)
+                if not await _mark_event_if_new(db, event_key, "change"):
+                    deduped_events += 1
+                    continue
+                try:
+                    await handle_change_event(db, ig_id, change)
+                    processed_events += 1
+                except Exception:
+                    logger.exception("Failed to process change event in webhook: ig_id=%s", ig_id)
 
-    return {"processed_events": processed_events, "deduped_events": deduped_events}
+        return {"processed_events": processed_events, "deduped_events": deduped_events}
+    except Exception:
+        logger.exception("Failed to process webhook payload")
+        return {"processed_events": 0, "deduped_events": 0}
 
 
 @router.get("/instagram")
@@ -650,7 +728,11 @@ async def verify_webhook(
 
 
 @router.post("/instagram")
-async def handle_webhook(request: Request):
+async def handle_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db=Depends(get_db),
+):
     raw_body = await request.body()
 
     if settings.ENVIRONMENT.lower() == "production" and settings.DISABLE_WEBHOOK_SIGNATURE:
@@ -663,13 +745,13 @@ async def handle_webhook(request: Request):
         logger.warning("Webhook signature verification disabled in development")
 
     body = await request.json()
-    db = get_db()
-    result = await _process_webhook_payload(db, body, raw_body)
-    return {"status": "ok", **result}
+    database = db if db is not None else get_db()
+    background_tasks.add_task(_process_webhook_payload, database, body, raw_body)
+    return {"status": "ok"}
 
 
 @router.post("/dev/simulate")
-async def simulate_webhook(data: WebhookSimulateRequest):
+async def simulate_webhook(data: WebhookSimulateRequest, db=Depends(get_db)):
     if settings.ENVIRONMENT.lower() != "development":
         raise HTTPException(status_code=403, detail="Simulator is available only in development")
 
@@ -681,7 +763,6 @@ async def simulate_webhook(data: WebhookSimulateRequest):
 
     result = {"processed_events": 0, "deduped_events": 0}
     if data.process_payload:
-        db = get_db()
         result = await _process_webhook_payload(db, data.payload, raw_body)
 
     return {
@@ -717,7 +798,7 @@ async def sample_payloads():
                         {
                             "field": "comments",
                             "value": {
-                                "from": {"id": "<customer_ig_id>"},
+                                "from": {"id": "<customer_ig_id>", "username": "<customer_ig_username>"},
                                 "text": "price?",
                                 "comment_id": "1789",
                             },
@@ -1019,7 +1100,10 @@ async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
 
 
 async def handle_comment_event(db, ig_account_id: str, value: dict):
-    commenter_id = value.get("from", {}).get("id")
+    from_obj = value.get("from", {}) or {}
+    commenter_id = from_obj.get("id")
+    commenter_username = str(from_obj.get("username") or "").strip()
+    commenter_name = str(from_obj.get("name") or "").strip()
     raw_comment_text = str(value.get("text", "") or "")
     comment_text = raw_comment_text.lower()
     comment_id = str(value.get("comment_id") or value.get("id") or "").strip()
@@ -1062,6 +1146,28 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
 
             await db.automation_rules.update_one({"_id": rule["_id"]}, {"$inc": {"triggers_count": 1}})
 
+            # Enrich contact record with username/display_name directly from comment webhook payload
+            if commenter_username or commenter_name:
+                contact_update = {}
+                display_val = commenter_name or commenter_username
+                if display_val:
+                    contact_update["display_name"] = display_val
+                if commenter_username:
+                    contact_update["ig_username"] = commenter_username
+                now = datetime.now(timezone.utc)
+                await db.contacts.update_one(
+                    {"user_id": str(user["_id"]), "ig_user_id": commenter_id},
+                    {
+                        "$set": contact_update,
+                        "$setOnInsert": {
+                            "user_id": str(user["_id"]),
+                            "ig_user_id": commenter_id,
+                            "first_seen_at": now,
+                        },
+                    },
+                    upsert=True,
+                )
+
             if bool(rule.get("public_comment_reply_enabled", False)) and comment_id:
                 templates = list(rule.get("public_comment_reply_templates") or [])
                 if not templates and rule.get("public_comment_reply_template"):
@@ -1069,7 +1175,8 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
                 if templates:
                     import random
                     chosen_template = random.choice(templates)
-                    public_reply = _render_comment_template(chosen_template, commenter_id, raw_comment_text)
+                    commenter_handle = commenter_username or commenter_id
+                    public_reply = _render_comment_template(chosen_template, commenter_handle, raw_comment_text)
                     if public_reply:
                         await InstagramService.reply_to_comment(
                             access_token=user["instagram_access_token"],

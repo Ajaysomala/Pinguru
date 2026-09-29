@@ -24,7 +24,8 @@ from app.database import get_db
 from app.models.models import PLAN_LIMITS, PlanType, UserCreate, get_plan_type
 from app.security import limiter
 from app.services.email import send_otp_email, send_password_reset_email
-from app.services.instagram import InstagramService
+from app.services.instagram import InstagramService, InstagramTokenExpiredError
+from cryptography.fernet import InvalidToken
 
 router = APIRouter()
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -869,6 +870,7 @@ async def instagram_media(
     media_type: str = Query("all"),
     limit: int = Query(25, ge=1, le=50),
     user=Depends(get_current_user),
+    db=Depends(get_db),
 ):
     access_token = str(user.get("instagram_access_token") or "").strip()
     instagram_user_id = str(user.get("instagram_user_id") or "").strip()
@@ -876,7 +878,44 @@ async def instagram_media(
     if not access_token or not instagram_user_id:
         return {"media": [], "source": "unavailable", "connected": False}
 
-    media = await InstagramService.get_user_media(access_token, limit=limit, media_type=media_type)
+    expires_at = user.get("ig_token_expires_at")
+    if expires_at:
+        if isinstance(expires_at, str):
+            try:
+                expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            except Exception:
+                expires_at = None
+        if isinstance(expires_at, datetime):
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= datetime.now(timezone.utc):
+                logger.warning("Instagram token expired at %s for user %s", expires_at, user.get("_id"))
+                return {"media": [], "source": "token_expired", "connected": True}
+
+    try:
+        media = await InstagramService.get_user_media(access_token, limit=limit, media_type=media_type)
+    except (InstagramTokenExpiredError, InvalidToken, ValueError) as exc:
+        error_code = getattr(exc, "error_code", 190)
+        error_message = getattr(exc, "error_message", str(exc))
+        logger.warning(
+            "Instagram token invalid/expired (code %s) for user %s: %s. Flagging token as needing reauth.",
+            error_code,
+            user.get("_id"),
+            error_message,
+        )
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {
+                "$set": {
+                    "instagram_access_token": None,
+                    "instagram_user_id": None,
+                    "instagram_account_ids": [],
+                    "ig_token_expires_at": None,
+                }
+            },
+        )
+        return {"media": [], "source": "token_expired", "connected": True}
+
     return {
         "media": media,
         "source": "instagram" if media else "fallback",

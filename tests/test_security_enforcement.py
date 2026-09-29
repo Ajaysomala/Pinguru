@@ -1,6 +1,7 @@
 import asyncio
-import hmac
 import hashlib
+import hmac
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -119,6 +120,73 @@ def test_meta_webhook_rejects_invalid_signature(client):
     )
 
     assert response.status_code == 403
+
+
+def test_meta_webhook_fast_ack_non_blocking(monkeypatch):
+    called = []
+
+    async def mock_slow_process(db, body, raw_body):
+        await asyncio.sleep(0.3)
+        called.append(True)
+        return {"processed_events": 1, "deduped_events": 0}
+
+    monkeypatch.setattr(webhook_module, "_process_webhook_payload", mock_slow_process)
+
+    bg = webhook_module.BackgroundTasks()
+    payload = b'{"entry":[]}'
+    sig = f"sha256={hmac.new(webhook_module.settings.META_APP_SECRET.encode(), payload, hashlib.sha256).hexdigest()}"
+
+    class MockRequest:
+        def __init__(self):
+            self.headers = {"X-Hub-Signature-256": sig}
+
+        async def body(self):
+            return payload
+
+        async def json(self):
+            return {"entry": []}
+
+    mock_req = MockRequest()
+
+    t0 = time.perf_counter()
+    resp = asyncio.run(webhook_module.handle_webhook(mock_req, bg, db=SimpleNamespace()))
+    elapsed = time.perf_counter() - t0
+
+    # Must return fast ack immediately without awaiting the 0.3s slow pipeline
+    assert elapsed < 0.1
+    assert resp == {"status": "ok"}
+    assert "processed_events" not in resp
+    assert len(bg.tasks) == 1
+    assert called == []  # Not yet executed
+
+    # Executing background tasks runs the processing
+    asyncio.run(bg())
+    assert called == [True]
+
+
+def test_meta_webhook_accepts_valid_signature_fast_ack_http(client, monkeypatch):
+    called = []
+
+    async def mock_process(db, body, raw_body):
+        called.append(body)
+        return {"processed_events": 1, "deduped_events": 0}
+
+    monkeypatch.setattr(webhook_module, "_process_webhook_payload", mock_process)
+
+    payload = b'{"entry":[{"id":"meta_biz_1"}]}'
+    sig = f"sha256={hmac.new(webhook_module.settings.META_APP_SECRET.encode(), payload, hashlib.sha256).hexdigest()}"
+
+    response = client.post(
+        "/webhook/instagram",
+        content=payload,
+        headers={"Content-Type": "application/json", "X-Hub-Signature-256": sig},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert "processed_events" not in response.json()
+    assert len(called) == 1
+
 
 
 def test_razorpay_webhook_rejects_invalid_signature(client):
