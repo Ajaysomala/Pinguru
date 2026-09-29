@@ -14,6 +14,7 @@ from app.models.models import (
     UserInDB,
     get_plan_type,
 )
+from app.routes import webhook as webhook_module
 from app.routes.automation import create_rule, update_rule
 from app.routes.webhook import _send_rule_reply, handle_comment_event, handle_messaging_event
 from app.services.instagram import InstagramService
@@ -482,4 +483,55 @@ def test_razorpay_webhook_writes_canonical_lowercase_plan(monkeypatch):
         assert isinstance(updated_user["plan"], str)
 
     asyncio.run(_run())
+
+
+def test_delayed_reply_executes_asyncio_sleep(monkeypatch):
+    user_id = ObjectId()
+    rule_id = ObjectId()
+    user = {
+        "_id": user_id,
+        "instagram_user_id": "biz_123",
+        "instagram_access_token": "token_abc",
+        "plan": "Starter",
+    }
+    rule = {
+        "_id": rule_id,
+        "user_id": str(user_id),
+        "name": "Delayed Rule",
+        "trigger_type": TriggerType.KEYWORD,
+        "keywords": ["fast"],
+        "reply_message": "Delayed response",
+        "reply_delay_seconds": 3,
+        "is_active": True,
+    }
+
+    contacts_col = _MockCollection()
+    dm_logs_col = _MockCollection()
+    rules_col = _MockCollection([rule])
+    users_col = _MockCollection([user])
+    db = SimpleNamespace(
+        contacts=contacts_col,
+        dm_logs=dm_logs_col,
+        automation_rules=rules_col,
+        users=users_col,
+    )
+
+    sleep_called = []
+    real_sleep = asyncio.sleep
+
+    async def mock_sleep(secs):
+        sleep_called.append(secs)
+        return await real_sleep(0)
+
+    monkeypatch.setattr(webhook_module.asyncio, "sleep", mock_sleep)
+    monkeypatch.setattr(InstagramService, "send_dm", AsyncMock(return_value={"success": True}))
+    monkeypatch.setattr(InstagramService, "decrypt_access_token", lambda tok: tok)
+    monkeypatch.setattr(InstagramService, "get_messaging_user_profile", AsyncMock(return_value={"name": "Fan", "username": "fan_001"}))
+
+    async def _run():
+        await _send_rule_reply(db, user, "fan_001", rule, TriggerType.KEYWORD, matched_keyword="fast")
+
+    asyncio.run(_run())
+    assert sleep_called == [3]
+
 
