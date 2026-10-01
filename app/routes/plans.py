@@ -25,6 +25,8 @@ PLAN_FEATURES = {
         "Premium analytics",
         "Ask-to-follow before DM delivery",
         "Interactive DM buttons (up to 3)",
+        "In-DM Phone & Email lead capture",
+        "Contact tagging & segmentation",
         "Priority email support",
     ],
     PlanType.Pro: [
@@ -36,6 +38,9 @@ PLAN_FEATURES = {
         "No footer branding",
         "Ask-to-follow before DM delivery",
         "Interactive DM buttons (up to 3)",
+        "In-DM Phone & Email lead capture",
+        "Contact tagging & segmentation",
+        "Hinglish AI/slang keyword matching",
     ],
 }
 
@@ -63,6 +68,8 @@ async def get_plans():
                 "branding": limits.get("branding", "footer_copyright"),
                 "ask_follow_before_dm": bool(limits.get("ask_follow_before_dm", False)),
                 "interactive_dm_buttons": bool(limits.get("interactive_dm_buttons", False)),
+                "capture_phone_enabled": bool(limits.get("capture_phone_enabled", False)),
+                "contact_tags": bool(limits.get("contact_tags", False)),
                 "features": PLAN_FEATURES.get(plan, []),
                 "pricing": {
                     cycle: (limits["price_inr"] * multiplier)

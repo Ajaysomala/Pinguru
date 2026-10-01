@@ -246,3 +246,208 @@ def test_contacts_csv_export():
     content = asyncio.run(_read_chunks())
     assert "Instagram Username,Display Name,Captured Email" in content
     assert "john_doe,John Doe,john@example.com" in content
+
+
+def test_in_dm_phone_capture_plan_gating():
+    class _FakeRules:
+        async def count_documents(self, _q):
+            return 0
+        async def insert_one(self, doc):
+            doc["_id"] = ObjectId()
+            return SimpleNamespace(inserted_id=doc["_id"])
+
+    db = SimpleNamespace(automation_rules=_FakeRules())
+    free_user = {"_id": ObjectId(), "plan": "free"}
+    starter_user = {"_id": ObjectId(), "plan": "starter"}
+
+    payload = AutomationRuleCreate(
+        name="Phone Capture Gate Test",
+        trigger_type=TriggerType.KEYWORD,
+        keywords=["phone"],
+        reply_message="Here are your details!",
+        capture_phone_enabled=True,
+        capture_phone_prompt="What is your WhatsApp number? 📱",
+    )
+
+    # Free user should be rejected (403)
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(create_rule(data=payload, db=db, user=free_user))
+    assert exc_info.value.status_code == 403
+    assert "In-DM phone capture" in exc_info.value.detail
+
+    # Starter user should succeed
+    res = asyncio.run(create_rule(data=payload, db=db, user=starter_user))
+    rule = res["rule"]
+    assert rule["capture_phone_enabled"] is True
+    assert rule["capture_phone_prompt"] == "What is your WhatsApp number? 📱"
+
+
+def test_contact_tagging_plan_gating_and_serialization():
+    class _FakeRules:
+        async def count_documents(self, _q):
+            return 0
+        async def insert_one(self, doc):
+            doc["_id"] = ObjectId()
+            return SimpleNamespace(inserted_id=doc["_id"])
+
+    db = SimpleNamespace(automation_rules=_FakeRules())
+    free_user = {"_id": ObjectId(), "plan": "free"}
+    starter_user = {"_id": ObjectId(), "plan": "starter"}
+
+    payload = AutomationRuleCreate(
+        name="Tagging Test",
+        trigger_type=TriggerType.KEYWORD,
+        keywords=["ebook"],
+        reply_message="Here is your ebook!",
+        add_contact_tags=["vip", "ebook_lead"],
+    )
+
+    # Free user should be rejected
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(create_rule(data=payload, db=db, user=free_user))
+    assert exc_info.value.status_code == 403
+    assert "Contact tagging" in exc_info.value.detail
+
+    # Starter user should succeed
+    res = asyncio.run(create_rule(data=payload, db=db, user=starter_user))
+    rule = res["rule"]
+    assert rule["add_contact_tags"] == ["vip", "ebook_lead"]
+
+
+def test_comment_anti_spam_cooldown_validation():
+    class _FakeRules:
+        async def count_documents(self, _q):
+            return 0
+        async def insert_one(self, doc):
+            doc["_id"] = ObjectId()
+            return SimpleNamespace(inserted_id=doc["_id"])
+
+    db = SimpleNamespace(automation_rules=_FakeRules())
+    pro_user = {"_id": ObjectId(), "plan": "pro"}
+
+    # Invalid cooldown (< 0 or > 168)
+    bad_payload = AutomationRuleCreate(
+        name="Bad Cooldown",
+        trigger_type=TriggerType.COMMENT,
+        keywords=["test"],
+        reply_message="test",
+        comment_cooldown_hours=200,
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(create_rule(data=bad_payload, db=db, user=pro_user))
+    assert exc_info.value.status_code == 422
+
+    # Valid cooldown (48 hours)
+    valid_payload = AutomationRuleCreate(
+        name="Valid Cooldown",
+        trigger_type=TriggerType.COMMENT,
+        keywords=["test"],
+        reply_message="test",
+        comment_cooldown_hours=48,
+    )
+    res = asyncio.run(create_rule(data=valid_payload, db=db, user=pro_user))
+    assert res["rule"]["comment_cooldown_hours"] == 48
+
+
+def test_keyword_match_modes():
+    from app.routes.webhook import _evaluate_keyword_match
+
+    # Exact match mode
+    is_match, kw = _evaluate_keyword_match("pricing", ["pricing"], "exact", PlanType.Free)
+    assert is_match is True
+    assert kw == "pricing"
+
+    is_match, _ = _evaluate_keyword_match("what is your pricing?", ["pricing"], "exact", PlanType.Free)
+    assert is_match is False
+
+    # Starts with match mode
+    is_match, kw = _evaluate_keyword_match("pricing details please", ["pricing"], "starts_with", PlanType.Free)
+    assert is_match is True
+    assert kw == "pricing"
+
+    is_match, _ = _evaluate_keyword_match("details about pricing", ["pricing"], "starts_with", PlanType.Free)
+    assert is_match is False
+
+    # Contains match mode with word boundary
+    is_match, kw = _evaluate_keyword_match("tell me the pricing now", ["pricing"], "contains", PlanType.Free)
+    assert is_match is True
+    assert kw == "pricing"
+
+    # Hinglish match mode (Pro only)
+    is_match, _ = _evaluate_keyword_match("bhai link bhejo na", ["link"], "hinglish", PlanType.Free)
+    assert is_match is True  # Falls back to contains for Free user
+
+    is_match, _ = _evaluate_keyword_match("bhai link bhejo na", ["link"], "hinglish", PlanType.Pro)
+    assert is_match is True
+
+
+def test_story_mention_trigger_creation():
+    class _FakeRules:
+        async def count_documents(self, _q):
+            return 0
+        async def insert_one(self, doc):
+            doc["_id"] = ObjectId()
+            return SimpleNamespace(inserted_id=doc["_id"])
+
+    db = SimpleNamespace(automation_rules=_FakeRules())
+    starter_user = {"_id": ObjectId(), "plan": "starter"}
+
+    payload = AutomationRuleCreate(
+        name="Story Mention Thanks",
+        trigger_type=TriggerType.STORY_MENTION,
+        reply_message="Thanks for mentioning us in your story! 🌟",
+    )
+    res = asyncio.run(create_rule(data=payload, db=db, user=starter_user))
+    rule = res["rule"]
+    assert rule["trigger_type"] == TriggerType.STORY_MENTION.value
+    assert "mentioning us in your story" in rule["reply_message"]
+
+
+def test_contact_is_window_active_calculation():
+    from app.routes.contacts import list_contacts
+    from datetime import timedelta
+
+    user_id = ObjectId()
+    fake_user = {"_id": user_id, "plan": "starter"}
+    now = datetime.now(timezone.utc)
+
+    active_contact = {
+        "_id": ObjectId(),
+        "user_id": str(user_id),
+        "ig_username": "active_user",
+        "last_seen_at": now - timedelta(hours=2),
+        "tags": ["lead"],
+    }
+    expired_contact = {
+        "_id": ObjectId(),
+        "user_id": str(user_id),
+        "ig_username": "cold_user",
+        "last_seen_at": now - timedelta(hours=28),
+        "tags": ["cold"],
+    }
+
+    class _FakeContacts:
+        async def count_documents(self, _q):
+            return 2
+        def find(self, _q):
+            class _FakeCursor:
+                def sort(self, *a, **kw): return self
+                def skip(self, *a, **kw): return self
+                def limit(self, *a, **kw): return self
+                def __aiter__(self):
+                    self._items = iter([active_contact, expired_contact])
+                    return self
+                async def __anext__(self):
+                    try:
+                        return next(self._items)
+                    except StopIteration:
+                        raise StopAsyncIteration
+            return _FakeCursor()
+
+    db = SimpleNamespace(contacts=_FakeContacts())
+    res = asyncio.run(list_contacts(page=1, limit=20, tag=None, user=fake_user, db=db))
+    contacts = res["contacts"]
+    assert len(contacts) == 2
+    assert contacts[0]["is_window_active"] is True
+    assert contacts[1]["is_window_active"] is False
+

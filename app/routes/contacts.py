@@ -11,16 +11,28 @@ router = APIRouter()
 async def list_contacts(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
+    tag: str | None = Query(None),
     user=Depends(get_current_user),
     db=Depends(get_db),
 ):
     user_id = str(user["_id"])
     skip = (page - 1) * limit
-    total = await db.contacts.count_documents({"user_id": user_id})
-    cursor = db.contacts.find({"user_id": user_id}).sort("last_seen_at", -1).skip(skip).limit(limit)
+    query = {"user_id": user_id}
+    tag_val = tag if isinstance(tag, str) else None
+    if tag_val:
+        query["tags"] = tag_val.strip().lower()
+
+    total = await db.contacts.count_documents(query)
+    cursor = db.contacts.find(query).sort("last_seen_at", -1).skip(skip).limit(limit)
     contacts = []
+    now = datetime.now(timezone.utc)
     async for c in cursor:
         c["id"] = str(c.pop("_id"))
+        last_seen = c.get("last_seen_at")
+        if last_seen and getattr(last_seen, "tzinfo", None) is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        c["is_window_active"] = bool(last_seen and (now - last_seen).total_seconds() <= 86400)
+        c.setdefault("tags", [])
         contacts.append(c)
     return {"contacts": contacts, "total": total, "page": page, "limit": limit}
 
@@ -58,7 +70,11 @@ async def export_contacts_csv(
         "Instagram Username",
         "Display Name",
         "Captured Email",
+        "Captured Phone",
+        "Tags",
+        "24h Window Active",
         "Email Captured At",
+        "Phone Captured At",
         "Instagram User ID",
         "DM Count",
         "Follow Gate Status",
@@ -66,15 +82,28 @@ async def export_contacts_csv(
         "Last Seen At",
     ])
 
+    now = datetime.now(timezone.utc)
     async for c in cursor:
         captured_at_str = c.get("email_captured_at").isoformat() if c.get("email_captured_at") and hasattr(c.get("email_captured_at"), "isoformat") else str(c.get("email_captured_at") or "")
+        phone_captured_at_str = c.get("phone_captured_at").isoformat() if c.get("phone_captured_at") and hasattr(c.get("phone_captured_at"), "isoformat") else str(c.get("phone_captured_at") or "")
         first_seen_str = c.get("first_seen_at").isoformat() if c.get("first_seen_at") and hasattr(c.get("first_seen_at"), "isoformat") else str(c.get("first_seen_at") or "")
         last_seen_str = c.get("last_seen_at").isoformat() if c.get("last_seen_at") and hasattr(c.get("last_seen_at"), "isoformat") else str(c.get("last_seen_at") or "")
+        
+        last_seen = c.get("last_seen_at")
+        if last_seen and getattr(last_seen, "tzinfo", None) is None:
+            last_seen = last_seen.replace(tzinfo=timezone.utc)
+        window_active = "Yes" if bool(last_seen and (now - last_seen).total_seconds() <= 86400) else "No"
+        tags_str = ", ".join(c.get("tags") or [])
+
         writer.writerow([
             c.get("ig_username") or "",
             c.get("display_name") or "",
             c.get("captured_email") or "",
+            c.get("captured_phone") or "",
+            tags_str,
+            window_active,
             captured_at_str,
+            phone_captured_at_str,
             c.get("ig_user_id") or "",
             c.get("dm_count") or 0,
             c.get("follow_gate_status") or "none",

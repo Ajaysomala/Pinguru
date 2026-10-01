@@ -19,15 +19,17 @@ router = APIRouter()
 
 
 def _normalize_match_mode(match_mode: str | None) -> str:
-    mode = (match_mode or "exact").strip().lower()
-    return "hinglish" if mode == "hinglish" else "exact"
+    mode = (match_mode or "contains").strip().lower()
+    if mode in {"exact", "contains", "starts_with", "hinglish"}:
+        return mode
+    return "contains"
 
 
 def _resolve_match_mode_for_plan(user_plan: PlanType, requested_mode: str | None) -> str:
     requested = _normalize_match_mode(requested_mode)
-    if user_plan == PlanType.Pro:
-        return requested
-    return "exact"
+    if requested == "hinglish" and user_plan != PlanType.Pro:
+        return "contains"
+    return requested
 
 
 def _sanitize_text(value: str) -> str:
@@ -165,6 +167,11 @@ def _serialize_rule(rule: dict) -> dict:
     serialized["capture_email_enabled"] = bool(rule.get("capture_email_enabled", False))
     serialized["email_capture_prompt"] = (rule.get("email_capture_prompt") or "").strip() or None
     serialized["email_capture_success_message"] = (rule.get("email_capture_success_message") or "").strip() or None
+    serialized["capture_phone_enabled"] = bool(rule.get("capture_phone_enabled", False))
+    serialized["capture_phone_prompt"] = (rule.get("capture_phone_prompt") or "").strip() or None
+    serialized["capture_phone_success_message"] = (rule.get("capture_phone_success_message") or "").strip() or None
+    serialized["add_contact_tags"] = list(rule.get("add_contact_tags") or [])
+    serialized["comment_cooldown_hours"] = int(rule.get("comment_cooldown_hours") if rule.get("comment_cooldown_hours") is not None else 24)
     serialized["reply_delay_seconds"] = int(rule.get("reply_delay_seconds") or 0)
 
     serialized["ask_follow_before_dm"] = bool(rule.get("ask_follow_before_dm", False))
@@ -175,13 +182,15 @@ def _serialize_rule(rule: dict) -> dict:
     sent = int(rule.get("sent_count") or 0)
     unlocked = int(rule.get("follow_gate_completed_count") or 0)
     emails = int(rule.get("email_captured_count") or 0)
+    phones = int(rule.get("phone_captured_count") or 0)
     base = max(triggers, sent, 1)
     serialized["analytics"] = {
         "triggers": triggers,
         "dms_sent": sent,
         "follows_unlocked": unlocked,
         "emails_captured": emails,
-        "conversion_rate": round(((emails or unlocked or sent) / base) * 100, 1) if (triggers > 0 or sent > 0) else 0.0,
+        "phones_captured": phones,
+        "conversion_rate": round(((emails or phones or unlocked or sent) / base) * 100, 1) if (triggers > 0 or sent > 0) else 0.0,
     }
 
     if "created_at" in serialized and hasattr(serialized["created_at"], "isoformat"):
@@ -274,6 +283,27 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
         if len(email_capture_success_message) > 500:
             raise HTTPException(status_code=422, detail="Email capture success message must be 500 characters or fewer")
 
+    capture_phone_enabled = bool(data.capture_phone_enabled)
+    capture_phone_prompt = None
+    capture_phone_success_message = None
+    if capture_phone_enabled:
+        _require_comment_starter_or_pro_features(user_plan, capture_phone_enabled, "In-DM phone capture")
+        capture_phone_prompt = _sanitize_text(data.capture_phone_prompt or "What's your WhatsApp or phone number so we can text you the details? 📱")
+        if len(capture_phone_prompt) > 500:
+            raise HTTPException(status_code=422, detail="Phone capture prompt must be 500 characters or fewer")
+        capture_phone_success_message = _sanitize_text(data.capture_phone_success_message or "Thank you! We've saved your phone number. 🎉")
+        if len(capture_phone_success_message) > 500:
+            raise HTTPException(status_code=422, detail="Phone capture success message must be 500 characters or fewer")
+
+    raw_tags = data.add_contact_tags or []
+    add_contact_tags = [_sanitize_text(str(t).lower())[:30] for t in raw_tags if _sanitize_text(str(t))][:10]
+    if add_contact_tags:
+        _require_comment_starter_or_pro_features(user_plan, True, "Contact tagging")
+
+    comment_cooldown_hours = int(data.comment_cooldown_hours if data.comment_cooldown_hours is not None else 24)
+    if comment_cooldown_hours < 0 or comment_cooldown_hours > 168:
+        raise HTTPException(status_code=422, detail="Comment cooldown must be between 0 and 168 hours (7 days)")
+
     reply_delay_seconds = int(data.reply_delay_seconds or 0)
     if reply_delay_seconds < 0 or reply_delay_seconds > 15:
         raise HTTPException(status_code=422, detail="Reply delay must be between 0 and 15 seconds")
@@ -322,6 +352,11 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
         "capture_email_enabled": capture_email_enabled,
         "email_capture_prompt": email_capture_prompt,
         "email_capture_success_message": email_capture_success_message,
+        "capture_phone_enabled": capture_phone_enabled,
+        "capture_phone_prompt": capture_phone_prompt,
+        "capture_phone_success_message": capture_phone_success_message,
+        "add_contact_tags": add_contact_tags,
+        "comment_cooldown_hours": comment_cooldown_hours,
         "reply_delay_seconds": reply_delay_seconds,
         "ask_follow_before_dm": ask_follow_before_dm,
         "send_follow_up_message": send_follow_up_message,
@@ -330,6 +365,7 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
         "triggers_count": 0,
         "follow_gate_completed_count": 0,
         "email_captured_count": 0,
+        "phone_captured_count": 0,
         "created_at": datetime.now(timezone.utc),
     }
     result = await db.automation_rules.insert_one(rule_doc)
@@ -402,6 +438,27 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
         if len(email_capture_success_message) > 500:
             raise HTTPException(status_code=422, detail="Email capture success message must be 500 characters or fewer")
 
+    capture_phone_enabled = bool(data.capture_phone_enabled)
+    capture_phone_prompt = None
+    capture_phone_success_message = None
+    if capture_phone_enabled:
+        _require_comment_starter_or_pro_features(user_plan, capture_phone_enabled, "In-DM phone capture")
+        capture_phone_prompt = _sanitize_text(data.capture_phone_prompt or "What's your WhatsApp or phone number so we can text you the details? 📱")
+        if len(capture_phone_prompt) > 500:
+            raise HTTPException(status_code=422, detail="Phone capture prompt must be 500 characters or fewer")
+        capture_phone_success_message = _sanitize_text(data.capture_phone_success_message or "Thank you! We've saved your phone number. 🎉")
+        if len(capture_phone_success_message) > 500:
+            raise HTTPException(status_code=422, detail="Phone capture success message must be 500 characters or fewer")
+
+    raw_tags = data.add_contact_tags or []
+    add_contact_tags = [_sanitize_text(str(t).lower())[:30] for t in raw_tags if _sanitize_text(str(t))][:10]
+    if add_contact_tags:
+        _require_comment_starter_or_pro_features(user_plan, True, "Contact tagging")
+
+    comment_cooldown_hours = int(data.comment_cooldown_hours if data.comment_cooldown_hours is not None else 24)
+    if comment_cooldown_hours < 0 or comment_cooldown_hours > 168:
+        raise HTTPException(status_code=422, detail="Comment cooldown must be between 0 and 168 hours (7 days)")
+
     reply_delay_seconds = int(data.reply_delay_seconds or 0)
     if reply_delay_seconds < 0 or reply_delay_seconds > 15:
         raise HTTPException(status_code=422, detail="Reply delay must be between 0 and 15 seconds")
@@ -451,6 +508,11 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
             "capture_email_enabled": capture_email_enabled,
             "email_capture_prompt": email_capture_prompt,
             "email_capture_success_message": email_capture_success_message,
+            "capture_phone_enabled": capture_phone_enabled,
+            "capture_phone_prompt": capture_phone_prompt,
+            "capture_phone_success_message": capture_phone_success_message,
+            "add_contact_tags": add_contact_tags,
+            "comment_cooldown_hours": comment_cooldown_hours,
             "reply_delay_seconds": reply_delay_seconds,
             "ask_follow_before_dm": ask_follow_before_dm,
             "send_follow_up_message": send_follow_up_message,

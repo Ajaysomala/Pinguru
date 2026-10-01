@@ -130,11 +130,13 @@ async def get_dm_logs(limit: int = Query(default=50, le=500), db=Depends(get_db)
 async def dashboard_contacts(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
+    tag: str | None = Query(None),
     user=Depends(get_current_user),
     db=Depends(get_db),
 ):
     from app.routes.contacts import list_contacts
-    return await list_contacts(page=page, limit=limit, user=user, db=db)
+    tag_val = tag if isinstance(tag, str) else None
+    return await list_contacts(page=page, limit=limit, tag=tag_val, user=user, db=db)
 
 
 @router.get("/contact-stats")

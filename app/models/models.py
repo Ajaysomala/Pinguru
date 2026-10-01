@@ -25,12 +25,13 @@ def get_plan_type(plan: str | PlanType) -> PlanType:
 
 
 class TriggerType(str, Enum):
-    KEYWORD      = "keyword"
-    NEW_DM       = "new_dm"
-    STORY_REPLY  = "story_reply"
-    COMMENT      = "comment"
-    POST_COMMENT = "post_comment"
-    REEL_COMMENT = "reel_comment"
+    KEYWORD       = "keyword"
+    NEW_DM        = "new_dm"
+    STORY_REPLY   = "story_reply"
+    STORY_MENTION = "story_mention"
+    COMMENT       = "comment"
+    POST_COMMENT  = "post_comment"
+    REEL_COMMENT  = "reel_comment"
 
 
 class CommentTargetType(str, Enum):
@@ -64,6 +65,13 @@ class Contact(BaseModel):
     email_captured_at: Optional[datetime] = None
     email_capture_status: Optional[str] = None  # None, "awaiting", "captured"
     email_capture_rule_id: Optional[str] = None
+    captured_phone: Optional[str] = None
+    phone_captured_at: Optional[datetime] = None
+    phone_capture_status: Optional[str] = None  # None, "awaiting", "captured"
+    phone_capture_rule_id: Optional[str] = None
+    tags: List[str] = []
+    is_following: Optional[bool] = None
+    follow_gate_status: Optional[str] = None
     first_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_seen_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -146,7 +154,7 @@ class AutomationRule(BaseModel):
     name: str
     trigger_type: TriggerType
     keywords: List[str] = []
-    match_mode: str = "exact"
+    match_mode: str = "contains"
     reply_message: str
     comment_target_type: Optional[CommentTargetType] = None
     comment_media_filter: CommentMediaFilterType = CommentMediaFilterType.ALL
@@ -164,6 +172,11 @@ class AutomationRule(BaseModel):
     capture_email_enabled: bool = False
     email_capture_prompt: Optional[str] = None
     email_capture_success_message: Optional[str] = None
+    capture_phone_enabled: bool = False
+    capture_phone_prompt: Optional[str] = None
+    capture_phone_success_message: Optional[str] = None
+    add_contact_tags: List[str] = []
+    comment_cooldown_hours: int = 24
     reply_delay_seconds: int = 0
     ask_follow_before_dm: bool = False
     send_follow_up_message: bool = False
@@ -172,13 +185,14 @@ class AutomationRule(BaseModel):
     triggers_count: int = 0
     follow_gate_completed_count: int = 0
     email_captured_count: int = 0
+    phone_captured_count: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class AutomationRuleCreate(BaseModel):
     name: str
     trigger_type: TriggerType
     keywords: List[str] = []
-    match_mode: str = "exact"
+    match_mode: str = "contains"
     reply_message: Optional[str] = None       # legacy field name
     response_template: Optional[str] = None   # frontend field name
 
@@ -202,6 +216,11 @@ class AutomationRuleCreate(BaseModel):
     capture_email_enabled: Optional[bool] = None
     email_capture_prompt: Optional[str] = None
     email_capture_success_message: Optional[str] = None
+    capture_phone_enabled: Optional[bool] = None
+    capture_phone_prompt: Optional[str] = None
+    capture_phone_success_message: Optional[str] = None
+    add_contact_tags: Optional[List[str]] = None
+    comment_cooldown_hours: Optional[int] = None
     reply_delay_seconds: Optional[int] = None
     ask_follow_before_dm: Optional[bool] = None
     send_follow_up_message: Optional[bool] = None
@@ -231,6 +250,8 @@ PLAN_LIMITS = {
         "branding": "footer_copyright",
         "ask_follow_before_dm": False,
         "interactive_dm_buttons": False,
+        "capture_phone_enabled": False,
+        "contact_tags": False,
     },
     PlanType.Starter: {
         "dm_limit": None,
@@ -242,6 +263,8 @@ PLAN_LIMITS = {
         "branding": "none",
         "ask_follow_before_dm": True,
         "interactive_dm_buttons": True,
+        "capture_phone_enabled": True,
+        "contact_tags": True,
     },
     PlanType.Pro: {
         "dm_limit": None,
@@ -253,6 +276,8 @@ PLAN_LIMITS = {
         "branding": "none",
         "ask_follow_before_dm": True,
         "interactive_dm_buttons": True,
+        "capture_phone_enabled": True,
+        "contact_tags": True,
     },
 }
 

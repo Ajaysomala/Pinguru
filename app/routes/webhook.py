@@ -108,6 +108,46 @@ def hinglish_keyword_match(message: str, keywords: list[str]) -> bool:
     return False
 
 
+def _evaluate_keyword_match(
+    message_text: str,
+    keywords: list[str],
+    match_mode: str = "contains",
+    user_plan: PlanType = PlanType.Free,
+) -> tuple[bool, str]:
+    if not message_text or not keywords:
+        return False, ""
+
+    cleaned_msg = message_text.strip().lower()
+    norm_mode = (match_mode or "contains").strip().lower()
+
+    if norm_mode == "hinglish" and user_plan == PlanType.Pro:
+        if hinglish_keyword_match(cleaned_msg, keywords):
+            matched_kw = next((kw for kw in keywords if kw.lower() in cleaned_msg), (keywords[0] if keywords else ""))
+            return True, matched_kw
+        return False, ""
+
+    for raw_kw in keywords:
+        kw = str(raw_kw or "").strip().lower()
+        if not kw:
+            continue
+        if norm_mode == "exact":
+            if cleaned_msg == kw or cleaned_msg.strip("!?. ,#") == kw:
+                return True, raw_kw
+        elif norm_mode == "starts_with":
+            if cleaned_msg.startswith(kw):
+                return True, raw_kw
+        else:
+            # "contains" or default: word boundary match first
+            pattern = rf"(?:\b|^){re.escape(kw)}(?:\b|$)"
+            if re.search(pattern, cleaned_msg):
+                return True, raw_kw
+            elif kw in cleaned_msg:
+                return True, raw_kw
+
+    return False, ""
+
+
+
 def _compute_signature(raw_body: bytes) -> str:
     return hmac.new(
         settings.META_APP_SECRET.encode("utf-8"),
@@ -500,16 +540,22 @@ async def _render_template(db, user: dict, recipient_id: str, rule: dict, matche
                 )
 
     keyword_val = matched_keyword or (rule.get("keywords") or [""])[0]
+    contact_email = str((contact or {}).get("captured_email") or "")
+    contact_phone = str((contact or {}).get("captured_phone") or "")
 
     return (
         template
         .replace("{{name}}",     ig_name)
         .replace("{{username}}", ig_username)
         .replace("{{keyword}}",  keyword_val)
+        .replace("{{email}}",    contact_email)
+        .replace("{{phone}}",    contact_phone)
         # also handle single-brace variants (legacy)
         .replace("{name}",       ig_name)
         .replace("{username}",   ig_username)
         .replace("{keyword}",    keyword_val)
+        .replace("{email}",      contact_email)
+        .replace("{phone}",      contact_phone)
     )
 
 
@@ -523,6 +569,7 @@ async def _send_rule_reply(
     comment_id: str | None = None,
     skip_follow_gate: bool = False,
     skip_email_capture: bool = False,
+    skip_phone_capture: bool = False,
 ):
     user_plan = get_plan_type(user.get("plan", PlanType.Free))
     base_reply = await _render_template(db, user, recipient_id, rule, matched_keyword)
@@ -535,6 +582,7 @@ async def _send_rule_reply(
         TriggerType.KEYWORD,
         TriggerType.NEW_DM,
         TriggerType.STORY_REPLY,
+        TriggerType.STORY_MENTION,
     }
 
     follow_gate_requested = bool(rule.get("ask_follow_before_dm", False))
@@ -707,6 +755,67 @@ async def _send_rule_reply(
                 await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
             return
 
+    # Check In-DM Phone Capture (if enabled and not skipped)
+    phone_capture_requested = bool(rule.get("capture_phone_enabled", False))
+    if (
+        not skip_phone_capture
+        and phone_capture_requested
+        and user_plan in {PlanType.Starter, PlanType.Pro}
+    ):
+        contact = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": recipient_id})
+        has_phone = bool(contact and contact.get("captured_phone"))
+        is_awaiting_phone = (
+            bool(contact)
+            and str(contact.get("phone_capture_status") or "") == "awaiting"
+            and str(contact.get("phone_capture_rule_id") or "") == str(rule.get("_id"))
+        )
+
+        if not has_phone and not is_awaiting_phone:
+            prompt_message = str(rule.get("capture_phone_prompt") or "What's your WhatsApp or phone number so we can text you the details? 📱").strip()
+            prompt_message = _apply_plan_footer(prompt_message, user_plan)
+            prompt_result = await InstagramService.send_dm(
+                access_token=user["instagram_access_token"],
+                recipient_ig_id=recipient_id,
+                message=prompt_message,
+                ig_user_id=user["instagram_user_id"],
+                comment_id=comment_id,
+            )
+
+            await db.dm_logs.insert_one(
+                {
+                    "user_id": str(user["_id"]),
+                    "rule_id": str(rule["_id"]),
+                    "recipient_ig_id": recipient_id,
+                    "message_sent": prompt_message,
+                    "trigger_type": trigger_type,
+                    "status": "sent" if prompt_result["success"] else "failed",
+                    "sent_at": datetime.now(timezone.utc),
+                }
+            )
+
+            if prompt_result["success"]:
+                now = datetime.now(timezone.utc)
+                await _ensure_contact_create_allowed(db, user, recipient_id)
+                await db.contacts.update_one(
+                    {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
+                    {
+                        "$set": {
+                            "last_seen_at": now,
+                            "last_triggered_rule_id": str(rule["_id"]),
+                            "trigger_type": trigger_type,
+                            "phone_capture_status": "awaiting",
+                            "phone_capture_rule_id": str(rule["_id"]),
+                            "phone_capture_trigger_type": trigger_type.value,
+                            "phone_capture_prompted_at": now,
+                        },
+                        "$inc": {"dm_count": 1},
+                        "$setOnInsert": {"user_id": str(user["_id"]), "ig_user_id": recipient_id, "first_seen_at": now},
+                    },
+                    upsert=True,
+                )
+                await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
+            return
+
     # Optional simulated human jitter delay
     delay_secs = int(rule.get("reply_delay_seconds") or 0)
     if delay_secs > 0:
@@ -745,6 +854,15 @@ async def _send_rule_reply(
             "sent_at": datetime.now(timezone.utc),
         }
     )
+
+    # Assign contact tags if configured on rule
+    rule_tags = [str(t).strip().lower() for t in (rule.get("add_contact_tags") or []) if str(t).strip()]
+    if rule_tags:
+        await db.contacts.update_one(
+            {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
+            {"$addToSet": {"tags": {"$each": rule_tags}}},
+            upsert=True,
+        )
 
     if not result["success"] and result.get("status_code") == 401:
         logger.warning(
@@ -1177,6 +1295,69 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
             )
             return
 
+    # Check awaiting phone capture
+    if contact and str(contact.get("phone_capture_status") or "") == "awaiting":
+        pending_rule_id = str(contact.get("phone_capture_rule_id") or "").strip()
+        phone_match = re.search(r'(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}|\+?\d{10,15}', raw_text)
+        if phone_match:
+            captured_phone = re.sub(r'[^\d+]', '', phone_match.group(0))
+            now = datetime.now(timezone.utc)
+            await db.contacts.update_one(
+                {"_id": contact["_id"]},
+                {
+                    "$set": {
+                        "phone_capture_status": "captured",
+                        "captured_phone": captured_phone,
+                        "phone_captured_at": now,
+                    }
+                },
+            )
+            if ObjectId.is_valid(pending_rule_id):
+                pending_rule = await db.automation_rules.find_one(
+                    {
+                        "_id": ObjectId(pending_rule_id),
+                        "user_id": str(user["_id"]),
+                        "is_active": True,
+                    }
+                )
+                if pending_rule:
+                    await db.automation_rules.update_one(
+                        {"_id": pending_rule["_id"]},
+                        {"$inc": {"phone_captured_count": 1}},
+                    )
+                    success_msg = str(pending_rule.get("capture_phone_success_message") or "").strip()
+                    if success_msg:
+                        formatted_success = success_msg.replace("{{phone}}", captured_phone).replace("{phone}", captured_phone)
+                        formatted_success = _apply_plan_footer(formatted_success, user_plan)
+                        await InstagramService.send_dm(
+                            access_token=user["instagram_access_token"],
+                            recipient_ig_id=sender_id,
+                            message=formatted_success,
+                            ig_user_id=user["instagram_user_id"],
+                        )
+                    pending_trigger_raw = str(contact.get("phone_capture_trigger_type") or TriggerType.COMMENT.value)
+                    pending_trigger = TriggerType(pending_trigger_raw) if pending_trigger_raw in {t.value for t in TriggerType} else TriggerType.COMMENT
+                    await _send_rule_reply(
+                        db,
+                        user,
+                        sender_id,
+                        pending_rule,
+                        pending_trigger,
+                        skip_follow_gate=True,
+                        skip_email_capture=True,
+                        skip_phone_capture=True,
+                    )
+            return
+        else:
+            retry_msg = "Please reply with a valid phone or WhatsApp number to receive your details! 📱"
+            retry_msg = _apply_plan_footer(retry_msg, user_plan)
+            await InstagramService.send_dm(
+                access_token=user["instagram_access_token"],
+                recipient_ig_id=sender_id,
+                message=retry_msg,
+                ig_user_id=user["instagram_user_id"],
+            )
+            return
 
     dm_rules_query = {
         "user_id": str(user["_id"]),
@@ -1200,29 +1381,23 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
 
     matched_keyword_rule = False
     for rule in keyword_rules:
-        keywords = [k.lower() for k in rule.get("keywords", [])]
-        match_mode = str(rule.get("match_mode", "exact")).lower()
-        use_hinglish = match_mode == "hinglish" and user_plan == PlanType.Pro
+        keywords = [k for k in rule.get("keywords", []) if k]
+        match_mode = str(rule.get("match_mode") or "contains").lower()
 
         logger.info(
-            "DM keyword match run: sender_id=%s, rule_id=%s, match_mode=%s, use_hinglish=%s",
+            "DM keyword match run: sender_id=%s, rule_id=%s, match_mode=%s",
             sender_id,
             rule.get("_id"),
             match_mode,
-            use_hinglish,
         )
 
-        if use_hinglish:
-            is_match = hinglish_keyword_match(message_text, keywords)
-        else:
-            is_match = any(kw in message_text for kw in keywords)
+        is_match, matched_kw = _evaluate_keyword_match(message_text, keywords, match_mode, user_plan)
 
-        logger.info("DM keyword match result: sender_id=%s, rule_id=%s, is_match=%s", sender_id, rule.get("_id"), is_match)
+        logger.info("DM keyword match result: sender_id=%s, rule_id=%s, is_match=%s, matched_kw=%s", sender_id, rule.get("_id"), is_match, matched_kw)
 
         if is_match:
             matched_keyword_rule = True
             await db.automation_rules.update_one({"_id": rule["_id"]}, {"$inc": {"triggers_count": 1}})
-            matched_kw = next((kw for kw in keywords if kw in message_text), "")
             await _send_rule_reply(db, user, sender_id, rule, TriggerType.KEYWORD, matched_keyword=matched_kw)
             break
 
@@ -1252,13 +1427,22 @@ async def handle_story_mention_event(db, ig_account_id: str, value: dict):
     rules = await db.automation_rules.find({
         "user_id": str(user["_id"]),
         "is_active": True,
-        "trigger_type": TriggerType.STORY_REPLY,
+        "trigger_type": {"$in": [
+            TriggerType.STORY_MENTION.value,
+            TriggerType.STORY_REPLY.value,
+            TriggerType.STORY_MENTION,
+            TriggerType.STORY_REPLY,
+        ]},
     }).to_list(100)
 
-    for rule in rules:
-        matched_kw = (rule.get("keywords") or [""])[0]
-        await _send_rule_reply(db, user, sender_id, rule, TriggerType.STORY_REPLY, matched_keyword=matched_kw)
-        break
+    mention_rules = [r for r in rules if str(r.get("trigger_type")) in {TriggerType.STORY_MENTION.value, str(TriggerType.STORY_MENTION)}]
+    target_rule = mention_rules[0] if mention_rules else (rules[0] if rules else None)
+
+    if target_rule:
+        matched_kw = (target_rule.get("keywords") or ["story_mention"])[0]
+        actual_tt = TriggerType.STORY_MENTION if str(target_rule.get("trigger_type")) in {TriggerType.STORY_MENTION.value, str(TriggerType.STORY_MENTION)} else TriggerType.STORY_REPLY
+        await db.automation_rules.update_one({"_id": target_rule["_id"]}, {"$inc": {"triggers_count": 1}})
+        await _send_rule_reply(db, user, sender_id, target_rule, actual_tt, matched_keyword=matched_kw)
 
 async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
     sender_id = (messaging.get("sender") or {}).get("id")
@@ -1339,9 +1523,20 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
     for rule in rules:
         if not _comment_rule_matches(rule, media_id, media_kind):
             continue
-        keywords = [k.lower() for k in rule.get("keywords", [])]
+
         any_comment_keyword = bool(rule.get("any_comment_keyword", True))
-        keyword_match = True if any_comment_keyword else (len(keywords) > 0 and any(kw in comment_text for kw in keywords))
+        rule_keywords = [k for k in rule.get("keywords", []) if k]
+        match_mode = str(rule.get("match_mode") or "contains").lower()
+        keyword_match, matched_kw = _evaluate_keyword_match(raw_comment_text, rule_keywords, match_mode, user_plan)
+
+        if not keyword_match and any_comment_keyword:
+            keyword_match = True
+            if rule_keywords:
+                matched_kw = rule_keywords[0]
+            else:
+                first_word = raw_comment_text.strip().split()[0] if raw_comment_text.strip() else ""
+                matched_kw = first_word.strip("!?. ,#")
+
         if keyword_match:
             raw_trigger = str(rule.get("trigger_type") or TriggerType.POST_COMMENT)
             trigger_type = TriggerType(raw_trigger) if raw_trigger in {t.value for t in TriggerType} else TriggerType.POST_COMMENT
@@ -1370,6 +1565,7 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
                     upsert=True,
                 )
 
+            # 1. Public comment reply (if enabled)
             if bool(rule.get("public_comment_reply_enabled", False)) and comment_id:
                 templates = list(rule.get("public_comment_reply_templates") or [])
                 if not templates and rule.get("public_comment_reply_template"):
@@ -1386,20 +1582,55 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
                             message=public_reply,
                         )
 
-            matched_kw = next((kw for kw in (rule.get("keywords") or []) if kw.lower() in comment_text), "")
-            if not matched_kw and rule.get("keywords"):
-                matched_kw = rule["keywords"][0]
-            if not matched_kw:
-                first_word = raw_comment_text.strip().split()[0] if raw_comment_text.strip() else ""
-                matched_kw = first_word
+            # 2. Smart Anti-Spam Cooldown check for In-DM delivery
+            cooldown_hours = int(rule.get("comment_cooldown_hours") or 0)
+            skip_dm_cooldown = False
+            if cooldown_hours > 0 and media_id:
+                contact = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": commenter_id})
+                if contact:
+                    comment_dm_hist = contact.get("comment_dm_history", {}) or {}
+                    media_key = str(media_id).replace(".", "_")
+                    last_dm_time = comment_dm_hist.get(media_key)
+                    if last_dm_time:
+                        if isinstance(last_dm_time, str):
+                            try:
+                                last_dm_time = datetime.fromisoformat(last_dm_time.replace("Z", "+00:00"))
+                            except Exception:
+                                last_dm_time = None
+                        if last_dm_time:
+                            diff_seconds = (datetime.now(timezone.utc) - last_dm_time).total_seconds()
+                            if diff_seconds < cooldown_hours * 3600:
+                                skip_dm_cooldown = True
+                                logger.info(
+                                    "Comment DM skipped for commenter=%s on media=%s due to anti-spam cooldown (%s hrs)",
+                                    commenter_id,
+                                    media_id,
+                                    cooldown_hours,
+                                )
 
-            await _send_rule_reply(
-                db,
-                user,
-                commenter_id,
-                rule,
-                trigger_type,
-                matched_keyword=matched_kw,
-                comment_id=comment_id,
-            )
+            if not skip_dm_cooldown:
+                if not matched_kw and rule.get("keywords"):
+                    matched_kw = rule["keywords"][0]
+                if not matched_kw:
+                    first_word = raw_comment_text.strip().split()[0] if raw_comment_text.strip() else ""
+                    matched_kw = first_word
+
+                await _send_rule_reply(
+                    db,
+                    user,
+                    commenter_id,
+                    rule,
+                    trigger_type,
+                    matched_keyword=matched_kw,
+                    comment_id=comment_id,
+                )
+
+                if media_id:
+                    media_key = str(media_id).replace(".", "_")
+                    now = datetime.now(timezone.utc)
+                    await db.contacts.update_one(
+                        {"user_id": str(user["_id"]), "ig_user_id": commenter_id},
+                        {"$set": {f"comment_dm_history.{media_key}": now}},
+                        upsert=True,
+                    )
             break
