@@ -249,6 +249,11 @@ class _MockCollection:
         if existing:
             if "$set" in update_query:
                 existing.update(update_query["$set"])
+            if "$addToSet" in update_query:
+                for ak, av in update_query["$addToSet"].items():
+                    cur = existing.setdefault(ak, [])
+                    if av not in cur:
+                        cur.append(av)
             return SimpleNamespace(matched_count=1)
         elif upsert:
             new_doc = dict(filter_query)
@@ -256,6 +261,11 @@ class _MockCollection:
                 new_doc.update(update_query["$set"])
             if "$setOnInsert" in update_query:
                 new_doc.update(update_query["$setOnInsert"])
+            if "$addToSet" in update_query:
+                for ak, av in update_query["$addToSet"].items():
+                    cur = new_doc.setdefault(ak, [])
+                    if av not in cur:
+                        cur.append(av)
             new_doc["_id"] = ObjectId()
             self.data.append(new_doc)
             return SimpleNamespace(matched_count=0, upserted_id=new_doc["_id"])
@@ -269,6 +279,9 @@ class _MockCollection:
 class _MockCursor:
     def __init__(self, items):
         self.items = items
+
+    def sort(self, *args, **kwargs):
+        return self
 
     async def to_list(self, _length):
         return list(self.items)

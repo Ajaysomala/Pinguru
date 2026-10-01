@@ -96,7 +96,8 @@ class InstagramService:
         except (InvalidToken, ValueError) as exc:
             logger.error("Failed to decrypt access token in send_dm: %s", exc)
             return {"success": False, "error": "Invalid or corrupted access token", "status_code": 401}
-        url = f"{BASE_GRAPH_IG}/{ig_user_id}/messages"
+        endpoint_id = ig_user_id or "me"
+        url = f"{BASE_GRAPH_IG}/{endpoint_id}/messages"
         recipient_payload = {"comment_id": comment_id} if comment_id else {"id": recipient_ig_id}
         payload: dict = {
             "recipient": recipient_payload,
@@ -139,6 +140,22 @@ class InstagramService:
 
         if resp.status_code != 200:
             logger.error("DM failed: status=%s body=%s", resp.status_code, data)
+            # If a specific user ID was used and failed with 400/404, retry via /me/messages
+            if endpoint_id != "me" and resp.status_code in {400, 404}:
+                logger.info("Retrying DM request via /me/messages fallback")
+                fallback_url = f"{BASE_GRAPH_IG}/me/messages"
+                try:
+                    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                        resp_fallback = await client.post(fallback_url, json=payload)
+                    if resp_fallback.status_code == 200:
+                        try:
+                            fb_data = resp_fallback.json()
+                        except ValueError:
+                            fb_data = {}
+                        return {"success": True, "data": fb_data}
+                except httpx.RequestError:
+                    pass
+
             if buttons:
                 logger.warning("Button template DM failed, retrying with standard text message fallback")
                 return await InstagramService.send_dm(
@@ -153,6 +170,34 @@ class InstagramService:
                 )
             return {"success": False, "error": data.get("error", {}).get("message", "Instagram API request failed"), "status_code": resp.status_code}
         return {"success": True, "data": data}
+
+    @staticmethod
+    async def verify_account_ownership(access_token: str, ig_account_id: str) -> dict | None:
+        """Check if the provided access token owns or can access the given ig_account_id.
+        Returns dict with 'id' and 'username' if verified, None otherwise.
+        """
+        try:
+            token = InstagramService.decrypt_access_token(access_token)
+        except (InvalidToken, ValueError) as exc:
+            logger.error("Failed to decrypt access token in verify_account_ownership: %s", exc)
+            return None
+
+        url = f"{BASE_GRAPH_IG}/{ig_account_id}"
+        params = {
+            "fields": "id,username,name",
+            "access_token": token,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+                resp = await client.get(url, params=params)
+            if resp.status_code == 200:
+                data = resp.json() or {}
+                if data.get("id") or data.get("username"):
+                    return data
+            return None
+        except httpx.RequestError:
+            logger.warning("Network error while verifying ig_account_id=%s via Graph API", ig_account_id)
+            return None
 
     @staticmethod
     async def get_user_profile(access_token: str) -> dict:

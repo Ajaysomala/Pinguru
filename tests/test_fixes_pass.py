@@ -81,6 +81,11 @@ class _MockCollection:
                     if "$inc" in update_query:
                         for ik, iv in update_query["$inc"].items():
                             self.data[i][ik] = self.data[i].get(ik, 0) + iv
+                    if "$addToSet" in update_query:
+                        for ak, av in update_query["$addToSet"].items():
+                            cur = self.data[i].setdefault(ak, [])
+                            if av not in cur:
+                                cur.append(av)
                     break
             return SimpleNamespace(matched_count=1)
         elif upsert:
@@ -92,6 +97,11 @@ class _MockCollection:
             if "$inc" in update_query:
                 for ik, iv in update_query["$inc"].items():
                     new_doc[ik] = new_doc.get(ik, 0) + iv
+            if "$addToSet" in update_query:
+                for ak, av in update_query["$addToSet"].items():
+                    cur = new_doc.setdefault(ak, [])
+                    if av not in cur:
+                        cur.append(av)
             new_doc["_id"] = ObjectId()
             self.data.append(new_doc)
             return SimpleNamespace(matched_count=0, upserted_id=new_doc["_id"])
@@ -108,6 +118,9 @@ class _MockCollection:
 class _MockCursor:
     def __init__(self, items):
         self.items = items
+
+    def sort(self, *args, **kwargs):
+        return self
 
     async def to_list(self, _length):
         return list(self.items)
@@ -691,5 +704,469 @@ def test_corrupted_token_service_callers_fail_gracefully_in_production(monkeypat
         )
     )
     assert profile_res == {}
+
+
+def test_find_user_for_ig_account_verifies_via_graph_api(monkeypatch):
+    """Verify that when multiple candidates exist, _find_user_for_ig_account calls
+    verify_account_ownership and matches the correct user."""
+    from app.routes.webhook import _find_user_for_ig_account
+
+    user1_id = ObjectId()
+    user2_id = ObjectId()
+    user1 = {
+        "_id": user1_id,
+        "email": "user1@example.com",
+        "instagram_user_id": "scoped_user_1",
+        "instagram_account_ids": ["scoped_user_1"],
+        "instagram_username": "account_one",
+        "instagram_access_token": "token_1",
+    }
+    user2 = {
+        "_id": user2_id,
+        "email": "user2@example.com",
+        "instagram_user_id": "scoped_user_2",
+        "instagram_account_ids": ["scoped_user_2"],
+        "instagram_username": "account_two",
+        "instagram_access_token": "token_2",
+    }
+
+    users_col = _MockCollection([user1, user2])
+    db = SimpleNamespace(users=users_col)
+
+    async def mock_verify(token, ig_account_id):
+        if token == "token_1" and ig_account_id == "178414999999":
+            return {"id": "scoped_user_1", "username": "account_one"}
+        return None
+
+    monkeypatch.setattr(InstagramService, "verify_account_ownership", mock_verify)
+
+    matched_user = asyncio.run(_find_user_for_ig_account(db, "178414999999"))
+
+    assert matched_user is not None
+    assert matched_user["_id"] == user1_id
+    assert "178414999999" in matched_user["instagram_account_ids"]
+
+
+def test_find_user_for_ig_account_skips_expired_candidates(monkeypatch):
+    """Verify that if Graph API is inconclusive, candidates with expired tokens are excluded."""
+    from app.routes.webhook import _find_user_for_ig_account
+
+    user_active_id = ObjectId()
+    user_expired_id = ObjectId()
+    now = datetime.now(timezone.utc)
+    user_active = {
+        "_id": user_active_id,
+        "email": "active@example.com",
+        "instagram_user_id": "scoped_active",
+        "instagram_account_ids": ["scoped_active"],
+        "instagram_username": "active_user",
+        "instagram_access_token": "token_active",
+        "ig_token_expires_at": now + timedelta(days=30),
+    }
+    user_expired = {
+        "_id": user_expired_id,
+        "email": "expired@example.com",
+        "instagram_user_id": "scoped_expired",
+        "instagram_account_ids": ["scoped_expired"],
+        "instagram_username": "expired_user",
+        "instagram_access_token": "token_expired",
+        "ig_token_expires_at": now - timedelta(days=2),
+    }
+
+    users_col = _MockCollection([user_active, user_expired])
+    db = SimpleNamespace(users=users_col)
+
+    monkeypatch.setattr(InstagramService, "verify_account_ownership", AsyncMock(return_value=None))
+
+    matched_user = asyncio.run(_find_user_for_ig_account(db, "178414888888"))
+
+    assert matched_user is not None
+    assert matched_user["_id"] == user_active_id
+    assert matched_user["instagram_user_id"] == "178414888888"
+
+
+def test_end_to_end_new_user_workflow_triggers_automations(monkeypatch):
+    """End-to-end test for a completely new user:
+    1. New user signs up and connects Instagram (stored with app-scoped ID).
+    2. New user creates automation rule.
+    3. External follower sends a DM matching the rule to a new 17-digit Business ID.
+    4. _find_user_for_ig_account dynamically verifies ownership via Graph API and updates DB.
+    5. Rule executes and reply DM is successfully dispatched."""
+    new_user_id = ObjectId()
+    new_rule_id = ObjectId()
+    new_business_id = "17841400088888888"
+
+    new_user = {
+        "_id": new_user_id,
+        "email": "new_creator@example.com",
+        "plan": "Starter",
+        "instagram_user_id": "scoped_new_777",
+        "instagram_account_ids": ["scoped_new_777"],
+        "instagram_username": "new_creator_official",
+        "instagram_access_token": "token_new_creator_abc",
+        "ig_token_expires_at": datetime.now(timezone.utc) + timedelta(days=60),
+    }
+
+    new_rule = {
+        "_id": new_rule_id,
+        "user_id": str(new_user_id),
+        "name": "Sale Promo",
+        "trigger_type": TriggerType.KEYWORD,
+        "keywords": ["deal", "discount"],
+        "reply_message": "Hello {{name}}! Here is your deal: 50% OFF!",
+        "ask_follow_before_dm": False,
+        "is_active": True,
+        "triggers_count": 0,
+        "sent_count": 0,
+    }
+
+    users_col = _MockCollection([new_user])
+    rules_col = _MockCollection([new_rule])
+    contacts_col = _MockCollection()
+    dm_logs_col = _MockCollection()
+    webhook_events_col = _MockCollection()
+
+    db = SimpleNamespace(
+        users=users_col,
+        automation_rules=rules_col,
+        contacts=contacts_col,
+        dm_logs=dm_logs_col,
+        webhook_events=webhook_events_col,
+    )
+
+    # Mock Graph API verification
+    async def mock_verify(token, ig_account_id):
+        if token == "token_new_creator_abc" and ig_account_id == new_business_id:
+            return {"id": "scoped_new_777", "username": "new_creator_official"}
+        return None
+
+    sent_dms = []
+    async def mock_send_dm(access_token, recipient_ig_id, message, ig_user_id, **kwargs):
+        sent_dms.append({
+            "access_token": access_token,
+            "recipient_ig_id": recipient_ig_id,
+            "message": message,
+            "ig_user_id": ig_user_id,
+        })
+        return {"success": True, "data": {"message_id": "mid_new_sent_1"}}
+
+    monkeypatch.setattr(InstagramService, "verify_account_ownership", mock_verify)
+    monkeypatch.setattr(InstagramService, "send_dm", mock_send_dm)
+    monkeypatch.setattr(InstagramService, "decrypt_access_token", lambda tok: tok)
+    monkeypatch.setattr(
+        InstagramService,
+        "get_messaging_user_profile",
+        AsyncMock(return_value={"name": "Happy Customer", "username": "customer_1"}),
+    )
+
+    incoming_messaging = {
+        "sender": {"id": "customer_ig_456"},
+        "recipient": {"id": new_business_id},
+        "message": {"mid": "mid_incoming_123", "text": "Can I get a discount?"},
+    }
+
+    # Execute incoming message
+    asyncio.run(handle_messaging_event(db, new_business_id, incoming_messaging))
+
+    # Assert 1: User document was updated with the 17-digit Business ID
+    updated_user = asyncio.run(users_col.find_one({"_id": new_user_id}))
+    assert new_business_id in updated_user["instagram_account_ids"]
+    assert updated_user["instagram_user_id"] == new_business_id
+
+    # Assert 2: DM reply was sent to the customer
+    assert len(sent_dms) == 1
+    assert sent_dms[0]["recipient_ig_id"] == "customer_ig_456"
+    assert "Hello Happy Customer! Here is your deal: 50% OFF!" in sent_dms[0]["message"]
+
+    # Assert 3: Subsequent webhook resolves instantly from DB without calling verify_account_ownership
+    verify_call_count = 0
+    async def mock_verify_counted(token, ig_account_id):
+        nonlocal verify_call_count
+        verify_call_count += 1
+        return None
+    monkeypatch.setattr(InstagramService, "verify_account_ownership", mock_verify_counted)
+
+    second_messaging = {
+        "sender": {"id": "customer_ig_789"},
+        "recipient": {"id": new_business_id},
+        "message": {"mid": "mid_incoming_999", "text": "give me the deal"},
+    }
+    asyncio.run(handle_messaging_event(db, new_business_id, second_messaging))
+
+    assert len(sent_dms) == 2
+    assert verify_call_count == 0  # Instant DB match without extra API call!
+
+
+def test_comment_reply_resolves_keyword_variable(monkeypatch):
+    """Verify comment reply properly populates {{keyword}} in the rendered DM template."""
+    user_id = ObjectId()
+    rule_id = ObjectId()
+    user = {
+        "_id": user_id,
+        "instagram_user_id": "biz_123",
+        "instagram_access_token": "token_abc",
+        "plan": "Starter",
+        "instagram_username": "my_brand",
+    }
+    rule = {
+        "_id": rule_id,
+        "user_id": str(user_id),
+        "name": "Comment Rule",
+        "trigger_type": TriggerType.COMMENT,
+        "keywords": ["deal", "promo"],
+        "any_comment_keyword": False,
+        "reply_message": "Hey {{name}}! Here is your link for {{keyword}}: https://pinguru.com/deal",
+        "ask_follow_before_dm": False,
+        "is_active": True,
+    }
+
+    users_col = _MockCollection([user])
+    rules_col = _MockCollection([rule])
+    contacts_col = _MockCollection()
+    dm_logs_col = _MockCollection()
+
+    db = SimpleNamespace(
+        users=users_col,
+        automation_rules=rules_col,
+        contacts=contacts_col,
+        dm_logs=dm_logs_col,
+    )
+
+    sent_dms = []
+    async def fake_send_dm(access_token, recipient_ig_id, message, ig_user_id, **kwargs):
+        sent_dms.append({"recipient": recipient_ig_id, "message": message})
+        return {"success": True}
+
+    monkeypatch.setattr(InstagramService, "send_dm", fake_send_dm)
+    monkeypatch.setattr(InstagramService, "decrypt_access_token", lambda tok: tok)
+
+    from app.routes.webhook import handle_comment_event
+    comment_payload = {
+        "from": {"id": "commenter_999", "username": "superfan", "name": "Super Fan"},
+        "text": "Please send me the deal!",
+        "comment_id": "comm_111",
+        "id": "comm_111",
+    }
+
+    asyncio.run(handle_comment_event(db, "biz_123", comment_payload))
+
+    assert len(sent_dms) == 1
+    assert "Hey Super Fan! Here is your link for deal: https://pinguru.com/deal" in sent_dms[0]["message"]
+    assert "{{keyword}}" not in sent_dms[0]["message"]
+
+
+def test_comment_reply_follow_gate_scoped_per_rule(monkeypatch):
+    """Verify that a contact who completed follow gate on Rule A is NOT bypassed for Rule B."""
+    user_id = ObjectId()
+    rule_a_id = ObjectId()
+    rule_b_id = ObjectId()
+
+    user = {
+        "_id": user_id,
+        "instagram_user_id": "biz_123",
+        "instagram_access_token": "token_abc",
+        "plan": "Starter",
+        "instagram_username": "my_brand",
+    }
+
+    rule_b = {
+        "_id": rule_b_id,
+        "user_id": str(user_id),
+        "name": "Post B Rule",
+        "trigger_type": TriggerType.COMMENT,
+        "keywords": ["access"],
+        "any_comment_keyword": True,
+        "reply_message": "Here is VIP access: https://pinguru.com/access",
+        "ask_follow_before_dm": True,
+        "is_active": True,
+    }
+
+    # Contact previously completed follow gate on Rule A
+    contact = {
+        "_id": ObjectId(),
+        "user_id": str(user_id),
+        "ig_user_id": "tester_777",
+        "display_name": "Tester",
+        "ig_username": "tester_777",
+        "follow_gate_status": "completed",
+        "follow_gate_rule_id": str(rule_a_id),
+        "completed_follow_gate_rule_ids": [str(rule_a_id)],
+    }
+
+    users_col = _MockCollection([user])
+    rules_col = _MockCollection([rule_b])
+    contacts_col = _MockCollection([contact])
+    dm_logs_col = _MockCollection()
+
+    db = SimpleNamespace(
+        users=users_col,
+        automation_rules=rules_col,
+        contacts=contacts_col,
+        dm_logs=dm_logs_col,
+    )
+
+    sent_dms = []
+    async def fake_send_dm(access_token, recipient_ig_id, message, ig_user_id, buttons=None, **kwargs):
+        sent_dms.append({"recipient": recipient_ig_id, "message": message, "buttons": buttons})
+        return {"success": True}
+
+    monkeypatch.setattr(InstagramService, "send_dm", fake_send_dm)
+    monkeypatch.setattr(InstagramService, "decrypt_access_token", lambda tok: tok)
+
+    from app.routes.webhook import handle_comment_event
+    comment_payload = {
+        "from": {"id": "tester_777", "username": "tester_777", "name": "Tester"},
+        "text": "Give me access please",
+        "comment_id": "comm_222",
+        "id": "comm_222",
+    }
+
+    asyncio.run(handle_comment_event(db, "biz_123", comment_payload))
+
+    # Assert: Even though tester completed Rule A in the past, Rule B still prompts Follow Gate!
+    assert len(sent_dms) == 1
+    assert "Oh no! It seems you're not following me" in sent_dms[0]["message"]
+    assert sent_dms[0]["buttons"] is not None
+    assert any(b.get("payload") == "FOLLOWED" for b in sent_dms[0]["buttons"])
+
+
+def test_story_reply_supports_keyword_and_renders_template(monkeypatch):
+    """Verify story reply replaces {{keyword}} and {{name}}."""
+    user_id = ObjectId()
+    rule_id = ObjectId()
+
+    user = {
+        "_id": user_id,
+        "instagram_user_id": "biz_123",
+        "instagram_access_token": "token_abc",
+        "plan": "Starter",
+        "instagram_username": "my_brand",
+    }
+
+    rule = {
+        "_id": rule_id,
+        "user_id": str(user_id),
+        "name": "Story Rule",
+        "trigger_type": TriggerType.STORY_REPLY,
+        "keywords": ["coupon"],
+        "reply_message": "Thanks for replying with {{keyword}}, @{{username}}!",
+        "ask_follow_before_dm": False,
+        "is_active": True,
+    }
+
+    users_col = _MockCollection([user])
+    rules_col = _MockCollection([rule])
+    contacts_col = _MockCollection([{
+        "user_id": str(user_id),
+        "ig_user_id": "fan_story_1",
+        "display_name": "Story Fan",
+        "ig_username": "story_fan",
+    }])
+    dm_logs_col = _MockCollection()
+
+    db = SimpleNamespace(
+        users=users_col,
+        automation_rules=rules_col,
+        contacts=contacts_col,
+        dm_logs=dm_logs_col,
+    )
+
+    sent_dms = []
+    async def fake_send_dm(access_token, recipient_ig_id, message, ig_user_id, **kwargs):
+        sent_dms.append({"recipient": recipient_ig_id, "message": message})
+        return {"success": True}
+
+    monkeypatch.setattr(InstagramService, "send_dm", fake_send_dm)
+    monkeypatch.setattr(InstagramService, "decrypt_access_token", lambda tok: tok)
+
+    from app.routes.webhook import handle_story_reply_event
+    story_msg = {
+        "sender": {"id": "fan_story_1"},
+        "message": {"text": "I want the coupon please!", "is_story_reply": True},
+    }
+
+    asyncio.run(handle_story_reply_event(db, "biz_123", story_msg))
+
+    assert len(sent_dms) == 1
+    assert "Thanks for replying with coupon, @story_fan!" in sent_dms[0]["message"]
+
+
+def test_dm_keyword_takes_precedence_over_new_dm_rule(monkeypatch):
+    """Verify that keyword rules take precedence over NEW_DM, and NEW_DM fires when no keyword matches."""
+    user_id = ObjectId()
+    kw_rule_id = ObjectId()
+    new_dm_rule_id = ObjectId()
+
+    user = {
+        "_id": user_id,
+        "instagram_user_id": "biz_123",
+        "instagram_access_token": "token_abc",
+        "plan": "Starter",
+        "instagram_username": "my_brand",
+    }
+
+    kw_rule = {
+        "_id": kw_rule_id,
+        "user_id": str(user_id),
+        "name": "Keyword Rule",
+        "trigger_type": TriggerType.KEYWORD,
+        "keywords": ["pricing"],
+        "reply_message": "Our pricing is 199/month!",
+        "is_active": True,
+    }
+
+    new_dm_rule = {
+        "_id": new_dm_rule_id,
+        "user_id": str(user_id),
+        "name": "Welcome Rule",
+        "trigger_type": TriggerType.NEW_DM,
+        "keywords": [],
+        "reply_message": "Welcome to PinGuru! How can we assist you today?",
+        "is_active": True,
+    }
+
+    users_col = _MockCollection([user])
+    rules_col = _MockCollection([new_dm_rule, kw_rule])  # Note: new_dm_rule is FIRST in DB!
+    contacts_col = _MockCollection()
+    dm_logs_col = _MockCollection()
+
+    db = SimpleNamespace(
+        users=users_col,
+        automation_rules=rules_col,
+        contacts=contacts_col,
+        dm_logs=dm_logs_col,
+    )
+
+    sent_dms = []
+    async def fake_send_dm(access_token, recipient_ig_id, message, ig_user_id, **kwargs):
+        sent_dms.append({"recipient": recipient_ig_id, "message": message})
+        return {"success": True}
+
+    monkeypatch.setattr(InstagramService, "send_dm", fake_send_dm)
+    monkeypatch.setattr(InstagramService, "decrypt_access_token", lambda tok: tok)
+    monkeypatch.setattr(InstagramService, "get_messaging_user_profile", AsyncMock(return_value={"name": "Alice", "username": "alice"}))
+
+    from app.routes.webhook import handle_dm_event
+
+    # 1. Message containing keyword 'pricing' -> must trigger Keyword Rule, NOT New DM!
+    pricing_msg = {
+        "sender": {"id": "user_p1"},
+        "message": {"text": "what is your pricing?"},
+    }
+    asyncio.run(handle_dm_event(db, "biz_123", pricing_msg))
+    assert len(sent_dms) == 1
+    assert "Our pricing is 199/month!" in sent_dms[0]["message"]
+
+    # 2. General greeting without keywords -> triggers New DM rule
+    hello_msg = {
+        "sender": {"id": "user_p2"},
+        "message": {"text": "hello there"},
+    }
+    asyncio.run(handle_dm_event(db, "biz_123", hello_msg))
+    assert len(sent_dms) == 2
+    assert "Welcome to PinGuru! How can we assist you today?" in sent_dms[1]["message"]
+
+
+
 
 

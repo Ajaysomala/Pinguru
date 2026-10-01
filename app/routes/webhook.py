@@ -295,6 +295,7 @@ async def _mark_event_if_new(db, event_key: str, source: str) -> bool:
 
 
 async def _find_user_for_ig_account(db, ig_account_id: str) -> dict[str, Any] | None:
+    # Step 1: Direct match in database
     user = await db.users.find_one(
         {
             "$or": [
@@ -305,7 +306,8 @@ async def _find_user_for_ig_account(db, ig_account_id: str) -> dict[str, Any] | 
     )
     if user:
         current_primary = str(user.get("instagram_user_id") or "").strip()
-        if current_primary != ig_account_id:
+        account_ids = user.get("instagram_account_ids") or []
+        if current_primary != ig_account_id or ig_account_id not in account_ids:
             await db.users.update_one(
                 {"_id": user["_id"]},
                 {
@@ -314,6 +316,10 @@ async def _find_user_for_ig_account(db, ig_account_id: str) -> dict[str, Any] | 
                 },
             )
             user["instagram_user_id"] = ig_account_id
+            if "instagram_account_ids" not in user:
+                user["instagram_account_ids"] = []
+            if ig_account_id not in user["instagram_account_ids"]:
+                user["instagram_account_ids"].append(ig_account_id)
             logger.info(
                 "Aligned instagram_user_id to webhook ig_account_id=%s for user_id=%s",
                 ig_account_id,
@@ -321,45 +327,100 @@ async def _find_user_for_ig_account(db, ig_account_id: str) -> dict[str, Any] | 
             )
         return user
 
-    # Self-heal fallback: if there is exactly one connected Instagram user,
-    # map that user to the webhook account id so automation can proceed.
-    connected_query = {
-        "instagram_access_token": {"$exists": True, "$nin": [None, ""]},
-        "$or": [
-            {"instagram_user_id": {"$exists": True, "$nin": [None, ""]}},
-            {"instagram_account_ids": {"$exists": True, "$ne": []}},
-        ],
-    }
-    connected_count = await db.users.count_documents(connected_query)
-    if connected_count != 1:
-        logger.warning(
-            "No user found for webhook ig_account_id=%s; connected_account_candidates=%s",
-            ig_account_id,
-            connected_count,
-        )
-        return None
-
-    fallback_user = await db.users.find_one(connected_query)
-    if not fallback_user:
-        logger.warning("No fallback user resolved for webhook ig_account_id=%s", ig_account_id)
-        return None
-
-    old_id = str(fallback_user.get("instagram_user_id") or "")
-    await db.users.update_one(
-        {"_id": fallback_user["_id"]},
+    # Step 2: Fetch candidate users who have an Instagram access token (newest users first)
+    candidates = await db.users.find(
         {
-            "$set": {"instagram_user_id": ig_account_id},
-            "$addToSet": {"instagram_account_ids": ig_account_id},
-        },
-    )
-    fallback_user["instagram_user_id"] = ig_account_id
+            "instagram_access_token": {"$exists": True, "$nin": [None, ""]},
+            "$or": [
+                {"instagram_user_id": {"$exists": True, "$nin": [None, ""]}},
+                {"instagram_account_ids": {"$exists": True, "$ne": []}},
+            ],
+        }
+    ).sort("created_at", -1).to_list(50)
+
+    if not candidates:
+        logger.warning("No candidate users with Instagram tokens found for ig_account_id=%s", ig_account_id)
+        return None
+
+    # Step 3: Try active verification via Instagram Graph API
+    for candidate in candidates:
+        try:
+            token = candidate.get("instagram_access_token")
+            if not token:
+                continue
+            ownership = await InstagramService.verify_account_ownership(token, ig_account_id)
+            if ownership:
+                returned_id = str(ownership.get("id") or "").strip()
+                returned_username = str(ownership.get("username") or "").strip().lower()
+                cand_ig_id = str(candidate.get("instagram_user_id") or "").strip()
+                cand_account_ids = [str(x).strip() for x in (candidate.get("instagram_account_ids") or [])]
+                cand_username = str(candidate.get("instagram_username") or "").strip().lower()
+
+                if (
+                    (returned_id and (returned_id == cand_ig_id or returned_id in cand_account_ids))
+                    or (returned_username and returned_username == cand_username)
+                ):
+                    await db.users.update_one(
+                        {"_id": candidate["_id"]},
+                        {
+                            "$set": {"instagram_user_id": ig_account_id},
+                            "$addToSet": {"instagram_account_ids": ig_account_id},
+                        },
+                    )
+                    candidate["instagram_user_id"] = ig_account_id
+                    candidate.setdefault("instagram_account_ids", []).append(ig_account_id)
+                    logger.info(
+                        "Verified and auto-mapped ig_account_id=%s to user_id=%s (%s) via Graph API",
+                        ig_account_id,
+                        str(candidate["_id"]),
+                        candidate.get("email"),
+                    )
+                    return candidate
+        except Exception:
+            logger.exception("Error checking account ownership for candidate user %s", candidate.get("_id"))
+
+    # Step 4: Fallback to non-expired active candidate if Graph API verification was inconclusive
+    now = datetime.now(timezone.utc)
+    active_candidates = []
+    for c in candidates:
+        exp = c.get("ig_token_expires_at")
+        if exp is not None:
+            if getattr(exp, "tzinfo", None) is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if exp <= now:
+                continue
+        active_candidates.append(c)
+
+    fallback_candidates = active_candidates if len(active_candidates) == 1 else (candidates if len(candidates) == 1 else [])
+    if len(fallback_candidates) == 1:
+        fallback_user = fallback_candidates[0]
+        old_id = str(fallback_user.get("instagram_user_id") or "")
+        await db.users.update_one(
+            {"_id": fallback_user["_id"]},
+            {
+                "$set": {"instagram_user_id": ig_account_id},
+                "$addToSet": {"instagram_account_ids": ig_account_id},
+            },
+        )
+        fallback_user["instagram_user_id"] = ig_account_id
+        fallback_user.setdefault("instagram_account_ids", []).append(ig_account_id)
+        logger.warning(
+            "Auto-mapped instagram_user_id from %s to webhook ig_account_id=%s for user_id=%s (candidates=%s, active=%s)",
+            old_id,
+            ig_account_id,
+            str(fallback_user.get("_id")),
+            len(candidates),
+            len(active_candidates),
+        )
+        return fallback_user
+
     logger.warning(
-        "Auto-mapped instagram_user_id from %s to webhook ig_account_id=%s for user_id=%s",
-        old_id,
+        "No user found for webhook ig_account_id=%s; connected_candidates=%s; active_candidates=%s",
         ig_account_id,
-        str(fallback_user.get("_id")),
+        len(candidates),
+        len(active_candidates),
     )
-    return fallback_user
+    return None
 
 
 def _is_story_reply(messaging: dict[str, Any]) -> bool:
@@ -462,6 +523,7 @@ async def _send_rule_reply(
         TriggerType.REEL_COMMENT,
         TriggerType.KEYWORD,
         TriggerType.NEW_DM,
+        TriggerType.STORY_REPLY,
     }
 
     follow_gate_requested = bool(rule.get("ask_follow_before_dm", False))
@@ -472,11 +534,18 @@ async def _send_rule_reply(
         and trigger_type in allowed_follow_gate_triggers
     ):
         contact = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": recipient_id})
-        is_completed = bool(contact) and str(contact.get("follow_gate_status") or "") == "completed"
+        rule_id_str = str(rule.get("_id"))
+        completed_rules = set(contact.get("completed_follow_gate_rule_ids") or [])
+        if contact and str(contact.get("follow_gate_status") or "") == "completed":
+            saved_rule_id = str(contact.get("follow_gate_rule_id") or "").strip()
+            if saved_rule_id:
+                completed_rules.add(saved_rule_id)
+
+        is_completed = rule_id_str in completed_rules
         is_awaiting_for_rule = (
             bool(contact)
             and str(contact.get("follow_gate_status") or "") == "awaiting"
-            and str(contact.get("follow_gate_rule_id") or "") == str(rule.get("_id"))
+            and str(contact.get("follow_gate_rule_id") or "") == rule_id_str
         )
 
         if not is_awaiting_for_rule and not is_completed:
@@ -928,7 +997,10 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
                 "$set": {
                     "follow_gate_status": "completed",
                     "follow_gate_completed_at": datetime.now(timezone.utc),
-                }
+                },
+                "$addToSet": {
+                    "completed_follow_gate_rule_ids": pending_rule_id,
+                },
             },
         )
         return
@@ -1010,7 +1082,15 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         f"DM rules fetched: count={len(rules)}, sender_id={sender_id}, rule_ids={[str(rule.get('_id')) for rule in rules]}"
     )
 
-    for rule in rules:
+    def _rule_trigger_val(r):
+        tt = r.get("trigger_type")
+        return tt.value if hasattr(tt, "value") else str(tt or "")
+
+    keyword_rules = [r for r in rules if _rule_trigger_val(r) != TriggerType.NEW_DM.value]
+    new_dm_rules = [r for r in rules if _rule_trigger_val(r) == TriggerType.NEW_DM.value]
+
+    matched_keyword_rule = False
+    for rule in keyword_rules:
         keywords = [k.lower() for k in rule.get("keywords", [])]
         match_mode = str(rule.get("match_mode", "exact")).lower()
         use_hinglish = match_mode == "hinglish" and user_plan == PlanType.Pro
@@ -1023,10 +1103,7 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
             use_hinglish,
         )
 
-        rule_trigger_type = str(rule.get("trigger_type") or TriggerType.KEYWORD.value)
-        if rule_trigger_type == TriggerType.NEW_DM.value:
-            is_match = True
-        elif use_hinglish:
+        if use_hinglish:
             is_match = hinglish_keyword_match(message_text, keywords)
         else:
             is_match = any(kw in message_text for kw in keywords)
@@ -1034,10 +1111,18 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         logger.info("DM keyword match result: sender_id=%s, rule_id=%s, is_match=%s", sender_id, rule.get("_id"), is_match)
 
         if is_match:
+            matched_keyword_rule = True
             await db.automation_rules.update_one({"_id": rule["_id"]}, {"$inc": {"triggers_count": 1}})
             matched_kw = next((kw for kw in keywords if kw in message_text), "")
             await _send_rule_reply(db, user, sender_id, rule, TriggerType.KEYWORD, matched_keyword=matched_kw)
             break
+
+    # If no keyword rule matched, check for NEW_DM (welcome/default reply) rules
+    if not matched_keyword_rule and new_dm_rules:
+        new_dm_rule = new_dm_rules[0]
+        await db.automation_rules.update_one({"_id": new_dm_rule["_id"]}, {"$inc": {"triggers_count": 1}})
+        logger.info("Triggering NEW_DM rule %s for sender_id=%s", new_dm_rule.get("_id"), sender_id)
+        await _send_rule_reply(db, user, sender_id, new_dm_rule, TriggerType.NEW_DM)
         
 async def handle_story_mention_event(db, ig_account_id: str, value: dict):
     # Meta sends: {"media_id": "...", "comment_id": "...", "from": {"id": "..."}}
@@ -1062,7 +1147,8 @@ async def handle_story_mention_event(db, ig_account_id: str, value: dict):
     }).to_list(100)
 
     for rule in rules:
-        await _send_rule_reply(db, user, sender_id, rule, TriggerType.STORY_REPLY)
+        matched_kw = (rule.get("keywords") or [""])[0]
+        await _send_rule_reply(db, user, sender_id, rule, TriggerType.STORY_REPLY, matched_keyword=matched_kw)
         break
 
 async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
@@ -1096,7 +1182,13 @@ async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
     for rule in rules:
         keywords = [k.lower() for k in rule.get("keywords", [])]
         if not keywords or any(kw in message_text for kw in keywords):
-            await _send_rule_reply(db, user, sender_id, rule, TriggerType.STORY_REPLY)
+            matched_kw = next((kw for kw in (rule.get("keywords") or []) if kw.lower() in message_text), "")
+            if not matched_kw and rule.get("keywords"):
+                matched_kw = rule["keywords"][0]
+            if not matched_kw and (messaging.get("message") or {}).get("text"):
+                first_word = ((messaging.get("message") or {}).get("text") or "").strip().split()[0]
+                matched_kw = first_word
+            await _send_rule_reply(db, user, sender_id, rule, TriggerType.STORY_REPLY, matched_keyword=matched_kw)
             break
 
 
@@ -1185,5 +1277,20 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
                             message=public_reply,
                         )
 
-            await _send_rule_reply(db, user, commenter_id, rule, trigger_type, comment_id=comment_id)
+            matched_kw = next((kw for kw in (rule.get("keywords") or []) if kw.lower() in comment_text), "")
+            if not matched_kw and rule.get("keywords"):
+                matched_kw = rule["keywords"][0]
+            if not matched_kw:
+                first_word = raw_comment_text.strip().split()[0] if raw_comment_text.strip() else ""
+                matched_kw = first_word
+
+            await _send_rule_reply(
+                db,
+                user,
+                commenter_id,
+                rule,
+                trigger_type,
+                matched_keyword=matched_kw,
+                comment_id=comment_id,
+            )
             break
