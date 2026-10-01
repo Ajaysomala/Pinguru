@@ -280,6 +280,15 @@ def _build_follow_prompt(user: dict[str, Any]) -> str:
     )
 
 
+def _build_follow_not_followed_reminder(user: dict[str, Any]) -> str:
+    username = str(user.get("instagram_username") or "").strip().lstrip("@")
+    handle_str = f"@{username} " if username else "our account "
+    return (
+        f"Oops! We checked and you're not following {handle_str}yet 🥺\n\n"
+        "Please tap 'Visit Profile' below to follow, then tap 'I'm following ✅' again to unlock your message! ✨"
+    )
+
+
 async def _mark_event_if_new(db, event_key: str, source: str) -> bool:
     result = await db.webhook_events.update_one(
         {"_id": event_key},
@@ -467,12 +476,14 @@ async def _render_template(db, user: dict, recipient_id: str, rule: dict, matche
         if not ig_name and ig_username:
             ig_name = ig_username
 
-        if new_info_fetched:
+        if new_info_fetched or isinstance(profile.get("is_user_follow_business"), bool):
             update_fields = {}
             if ig_name:
                 update_fields["display_name"] = ig_name
             if ig_username:
                 update_fields["ig_username"] = ig_username
+            if isinstance(profile.get("is_user_follow_business"), bool):
+                update_fields["is_following"] = profile["is_user_follow_business"]
             if update_fields:
                 now = datetime.now(timezone.utc)
                 await db.contacts.update_one(
@@ -549,51 +560,91 @@ async def _send_rule_reply(
         )
 
         if not is_awaiting_for_rule and not is_completed:
-            prompt_message = _build_follow_prompt(user)
-            follow_buttons = _build_follow_buttons(user)
-            prompt_result = await InstagramService.send_dm(
-                access_token=user["instagram_access_token"],
-                recipient_ig_id=recipient_id,
-                message=prompt_message,
-                ig_user_id=user["instagram_user_id"],
-                comment_id=comment_id,
-                buttons=follow_buttons,
-            )
+            # Check if recipient already follows the business account
+            is_already_following = False
+            if contact and contact.get("is_following") is True:
+                is_already_following = True
+            else:
+                profile = await InstagramService.get_messaging_user_profile(
+                    user["instagram_access_token"], recipient_id
+                )
+                if profile and profile.get("is_user_follow_business") is True:
+                    is_already_following = True
 
-            await db.dm_logs.insert_one(
-                {
-                    "user_id": str(user["_id"]),
-                    "rule_id": str(rule["_id"]),
-                    "recipient_ig_id": recipient_id,
-                    "message_sent": prompt_message,
-                    "trigger_type": trigger_type,
-                    "status": "sent" if prompt_result["success"] else "failed",
-                    "sent_at": datetime.now(timezone.utc),
-                }
-            )
-
-            if prompt_result["success"]:
+            if is_already_following:
+                logger.info(
+                    "Recipient %s is already following %s. Completing follow gate without prompt.",
+                    recipient_id,
+                    user.get("instagram_username"),
+                )
                 now = datetime.now(timezone.utc)
                 await _ensure_contact_create_allowed(db, user, recipient_id)
                 await db.contacts.update_one(
                     {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
                     {
                         "$set": {
+                            "is_following": True,
+                            "follow_gate_status": "completed",
+                            "follow_gate_completed_at": now,
                             "last_seen_at": now,
-                            "last_triggered_rule_id": str(rule["_id"]),
-                            "trigger_type": trigger_type,
-                            "follow_gate_status": "awaiting",
-                            "follow_gate_rule_id": str(rule["_id"]),
-                            "follow_gate_trigger_type": trigger_type.value,
-                            "follow_gate_prompted_at": now,
                         },
-                        "$inc": {"dm_count": 1},
-                        "$setOnInsert": {"user_id": str(user["_id"]), "ig_user_id": recipient_id, "first_seen_at": now},
+                        "$addToSet": {"completed_follow_gate_rule_ids": rule_id_str},
+                        "$setOnInsert": {
+                            "user_id": str(user["_id"]),
+                            "ig_user_id": recipient_id,
+                            "first_seen_at": now,
+                        },
                     },
                     upsert=True,
                 )
-                await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
-            return
+                is_completed = True
+            else:
+                prompt_message = _build_follow_prompt(user)
+                follow_buttons = _build_follow_buttons(user)
+                prompt_result = await InstagramService.send_dm(
+                    access_token=user["instagram_access_token"],
+                    recipient_ig_id=recipient_id,
+                    message=prompt_message,
+                    ig_user_id=user["instagram_user_id"],
+                    comment_id=comment_id,
+                    buttons=follow_buttons,
+                )
+
+                await db.dm_logs.insert_one(
+                    {
+                        "user_id": str(user["_id"]),
+                        "rule_id": str(rule["_id"]),
+                        "recipient_ig_id": recipient_id,
+                        "message_sent": prompt_message,
+                        "trigger_type": trigger_type,
+                        "status": "sent" if prompt_result["success"] else "failed",
+                        "sent_at": datetime.now(timezone.utc),
+                    }
+                )
+
+                if prompt_result["success"]:
+                    now = datetime.now(timezone.utc)
+                    await _ensure_contact_create_allowed(db, user, recipient_id)
+                    await db.contacts.update_one(
+                        {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
+                        {
+                            "$set": {
+                                "last_seen_at": now,
+                                "last_triggered_rule_id": str(rule["_id"]),
+                                "trigger_type": trigger_type,
+                                "follow_gate_status": "awaiting",
+                                "follow_gate_rule_id": str(rule["_id"]),
+                                "follow_gate_trigger_type": trigger_type.value,
+                                "follow_gate_prompted_at": now,
+                                "is_following": False,
+                            },
+                            "$inc": {"dm_count": 1},
+                            "$setOnInsert": {"user_id": str(user["_id"]), "ig_user_id": recipient_id, "first_seen_at": now},
+                        },
+                        upsert=True,
+                    )
+                    await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
+                return
 
     # Check In-DM Email Capture (if enabled and not skipped)
     email_capture_requested = bool(rule.get("capture_email_enabled", False))
@@ -969,6 +1020,62 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         pending_trigger_raw = str(contact.get("follow_gate_trigger_type") or TriggerType.COMMENT.value)
         pending_trigger = TriggerType(pending_trigger_raw) if pending_trigger_raw in {t.value for t in TriggerType} else TriggerType.COMMENT
 
+        # Fetch profile and verify real follower status from Instagram Graph API
+        profile = await InstagramService.get_messaging_user_profile(
+            user["instagram_access_token"], sender_id
+        )
+        is_following = profile.get("is_user_follow_business") if profile else None
+
+        update_fields: dict[str, Any] = {"last_seen_at": datetime.now(timezone.utc)}
+        if profile.get("username"):
+            update_fields["ig_username"] = profile["username"]
+        if profile.get("name"):
+            update_fields["display_name"] = profile["name"]
+        if isinstance(is_following, bool):
+            update_fields["is_following"] = is_following
+
+        # If Meta explicitly indicates the user is NOT following
+        if is_following is False:
+            logger.info(
+                "Follow gate check rejected for sender_id=%s: user is NOT following %s",
+                sender_id,
+                user.get("instagram_username") or ig_account_id,
+            )
+            await db.contacts.update_one(
+                {"_id": contact["_id"]},
+                {"$set": update_fields},
+            )
+            reminder_msg = _build_follow_not_followed_reminder(user)
+            reminder_msg = _apply_plan_footer(reminder_msg, user_plan)
+            follow_buttons = _build_follow_buttons(user)
+            prompt_res = await InstagramService.send_dm(
+                access_token=user["instagram_access_token"],
+                recipient_ig_id=sender_id,
+                message=reminder_msg,
+                ig_user_id=user["instagram_user_id"],
+                buttons=follow_buttons,
+            )
+            await db.dm_logs.insert_one(
+                {
+                    "user_id": str(user["_id"]),
+                    "rule_id": pending_rule_id,
+                    "recipient_ig_id": sender_id,
+                    "message_sent": reminder_msg,
+                    "trigger_type": "follow_gate_reminder",
+                    "status": "sent" if prompt_res.get("success") else "failed",
+                    "sent_at": datetime.now(timezone.utc),
+                }
+            )
+            if prompt_res.get("success"):
+                await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
+            return
+
+        logger.info(
+            "Follow gate check passed (is_following=%s) for sender_id=%s. Delivering rule reply.",
+            is_following,
+            sender_id,
+        )
+
         if ObjectId.is_valid(pending_rule_id):
             pending_rule = await db.automation_rules.find_one(
                 {
@@ -991,12 +1098,14 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
                     skip_follow_gate=True,
                 )
 
+        now = datetime.now(timezone.utc)
         await db.contacts.update_one(
             {"_id": contact["_id"]},
             {
                 "$set": {
                     "follow_gate_status": "completed",
-                    "follow_gate_completed_at": datetime.now(timezone.utc),
+                    "follow_gate_completed_at": now,
+                    **update_fields,
                 },
                 "$addToSet": {
                     "completed_follow_gate_rule_ids": pending_rule_id,

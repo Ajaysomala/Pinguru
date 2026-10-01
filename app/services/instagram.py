@@ -222,7 +222,7 @@ class InstagramService:
 
     @staticmethod
     async def get_messaging_user_profile(access_token: str, instagram_scoped_user_id: str) -> dict:
-        """Get the display name and username for a user who sent a message."""
+        """Get the display name, username, and follow status for a user who sent a message."""
         try:
             decrypted = InstagramService.decrypt_access_token(access_token)
         except (InvalidToken, ValueError) as exc:
@@ -230,12 +230,18 @@ class InstagramService:
             return {}
         url = f"{BASE_GRAPH_IG}/{instagram_scoped_user_id}"
         params = {
-            "fields": "name,username",
+            "fields": "name,username,is_user_follow_business",
             "access_token": decrypted,
         }
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 resp = await client.get(url, params=params)
+                if resp.status_code == 400:
+                    # Fallback to name,username if is_user_follow_business is not supported on this node
+                    retry_resp = await client.get(url, params={"fields": "name,username", "access_token": decrypted})
+                    if retry_resp.status_code == 200:
+                        return retry_resp.json() or {}
+
             if resp.status_code != 200:
                 logger.warning(
                     "Instagram messaging user profile lookup returned %s: %s",

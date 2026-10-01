@@ -548,3 +548,161 @@ def test_delayed_reply_executes_asyncio_sleep(monkeypatch):
     assert sleep_called == [3]
 
 
+def test_follow_gate_strictly_verifies_real_follower_status(monkeypatch):
+    """If user clicks I'm following without actually following, Pinguru sends reminder and blocks delivery."""
+    user_id = ObjectId()
+    rule_id = ObjectId()
+    user = {
+        "_id": user_id,
+        "instagram_user_id": "biz_123",
+        "instagram_access_token": "token_abc",
+        "plan": "Starter",
+        "instagram_username": "my_brand",
+    }
+    rule = {
+        "_id": rule_id,
+        "user_id": str(user_id),
+        "name": "Follow Gate Rule",
+        "trigger_type": TriggerType.KEYWORD,
+        "keywords": ["secret"],
+        "reply_message": "Here is the secret link: https://secret.link",
+        "ask_follow_before_dm": True,
+        "is_active": True,
+    }
+
+    contacts_col = _MockCollection()
+    dm_logs_col = _MockCollection()
+    rules_col = _MockCollection([rule])
+    users_col = _MockCollection([user])
+
+    db = SimpleNamespace(
+        contacts=contacts_col,
+        dm_logs=dm_logs_col,
+        automation_rules=rules_col,
+        users=users_col,
+    )
+
+    sent_messages = []
+
+    async def fake_send_dm(access_token, recipient_ig_id, message, ig_user_id, attachment_url=None, attachment_type="image", comment_id=None, buttons=None):
+        sent_messages.append({
+            "recipient_ig_id": recipient_ig_id,
+            "message": message,
+            "buttons": buttons,
+        })
+        return {"success": True}
+
+    monkeypatch.setattr(InstagramService, "send_dm", fake_send_dm)
+    monkeypatch.setattr(InstagramService, "decrypt_access_token", lambda tok: tok)
+
+    # 1. Initially user is NOT following (is_user_follow_business=False)
+    profile_state = {"name": "Fan", "username": "fan_001", "is_user_follow_business": False}
+    monkeypatch.setattr(InstagramService, "get_messaging_user_profile", AsyncMock(side_effect=lambda token, uid: profile_state))
+
+    async def _run():
+        # Step 1: User sends keyword "secret"
+        await _send_rule_reply(db, user, "fan_001", rule, TriggerType.KEYWORD, matched_keyword="secret")
+
+        assert len(sent_messages) == 1
+        assert "Oh no! It seems you're not following me" in sent_messages[0]["message"]
+        contact = await contacts_col.find_one({"user_id": str(user_id), "ig_user_id": "fan_001"})
+        assert contact["follow_gate_status"] == "awaiting"
+
+        # Step 2: User clicks "I'm following ✅" WITHOUT following
+        postback_event = {
+            "sender": {"id": "fan_001"},
+            "recipient": {"id": "biz_123"},
+            "postback": {"title": "I'm following ✅", "payload": "FOLLOWED"},
+        }
+        await handle_messaging_event(db, "biz_123", postback_event)
+
+        # Final link must NOT be delivered! A reminder must be sent instead!
+        assert len(sent_messages) == 2
+        assert "https://secret.link" not in sent_messages[1]["message"]
+        assert "you're not following @my_brand yet" in sent_messages[1]["message"]
+        assert sent_messages[1]["buttons"] is not None
+
+        contact_mid = await contacts_col.find_one({"user_id": str(user_id), "ig_user_id": "fan_001"})
+        assert contact_mid["follow_gate_status"] == "awaiting"
+
+        # Step 3: User now actually follows on Instagram! (is_user_follow_business=True)
+        profile_state["is_user_follow_business"] = True
+
+        # User clicks "I'm following ✅" again
+        await handle_messaging_event(db, "biz_123", postback_event)
+
+        # Final link MUST now be delivered!
+        assert len(sent_messages) == 3
+        assert "Here is the secret link: https://secret.link" in sent_messages[2]["message"]
+
+        contact_final = await contacts_col.find_one({"user_id": str(user_id), "ig_user_id": "fan_001"})
+        assert contact_final["follow_gate_status"] == "completed"
+        assert contact_final["is_following"] is True
+
+    asyncio.run(_run())
+
+
+def test_follow_gate_skips_prompt_if_user_already_follows(monkeypatch):
+    """If user is already following when trigger fires, deliver directly without follow prompt."""
+    user_id = ObjectId()
+    rule_id = ObjectId()
+    user = {
+        "_id": user_id,
+        "instagram_user_id": "biz_123",
+        "instagram_access_token": "token_abc",
+        "plan": "Starter",
+        "instagram_username": "my_brand",
+    }
+    rule = {
+        "_id": rule_id,
+        "user_id": str(user_id),
+        "name": "Follow Gate Rule",
+        "trigger_type": TriggerType.KEYWORD,
+        "keywords": ["secret"],
+        "reply_message": "Direct link for follower: https://follower.link",
+        "ask_follow_before_dm": True,
+        "is_active": True,
+    }
+
+    contacts_col = _MockCollection()
+    dm_logs_col = _MockCollection()
+    rules_col = _MockCollection([rule])
+    users_col = _MockCollection([user])
+
+    db = SimpleNamespace(
+        contacts=contacts_col,
+        dm_logs=dm_logs_col,
+        automation_rules=rules_col,
+        users=users_col,
+    )
+
+    sent_messages = []
+
+    async def fake_send_dm(access_token, recipient_ig_id, message, ig_user_id, attachment_url=None, attachment_type="image", comment_id=None, buttons=None):
+        sent_messages.append({
+            "recipient_ig_id": recipient_ig_id,
+            "message": message,
+            "buttons": buttons,
+        })
+        return {"success": True}
+
+    monkeypatch.setattr(InstagramService, "send_dm", fake_send_dm)
+    monkeypatch.setattr(InstagramService, "decrypt_access_token", lambda tok: tok)
+    # User is ALREADY following!
+    monkeypatch.setattr(InstagramService, "get_messaging_user_profile", AsyncMock(return_value={"name": "LoyalFan", "username": "fan_loyal", "is_user_follow_business": True}))
+
+    async def _run():
+        await _send_rule_reply(db, user, "fan_loyal", rule, TriggerType.KEYWORD, matched_keyword="secret")
+
+        # Must NOT send the follow prompt; must deliver the actual reply directly
+        assert len(sent_messages) == 1
+        assert "Direct link for follower: https://follower.link" in sent_messages[0]["message"]
+
+        contact = await contacts_col.find_one({"user_id": str(user_id), "ig_user_id": "fan_loyal"})
+        assert contact["follow_gate_status"] == "completed"
+        assert contact["is_following"] is True
+
+    asyncio.run(_run())
+
+
+

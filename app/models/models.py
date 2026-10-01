@@ -230,6 +230,7 @@ PLAN_LIMITS = {
         "support_tier": "email",
         "branding": "footer_copyright",
         "ask_follow_before_dm": False,
+        "interactive_dm_buttons": False,
     },
     PlanType.Starter: {
         "dm_limit": None,
@@ -240,6 +241,7 @@ PLAN_LIMITS = {
         "support_tier": "priority_email",
         "branding": "none",
         "ask_follow_before_dm": True,
+        "interactive_dm_buttons": True,
     },
     PlanType.Pro: {
         "dm_limit": None,
@@ -250,6 +252,7 @@ PLAN_LIMITS = {
         "support_tier": "24x7_priority",
         "branding": "none",
         "ask_follow_before_dm": True,
+        "interactive_dm_buttons": True,
     },
 }
 

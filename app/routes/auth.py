@@ -633,17 +633,35 @@ async def me(request: Request, user=Depends(get_current_user), db: Any = Depends
     full_name = " ".join(part for part in [first_name, last_name] if part)
     instagram_username = str(user.get("instagram_username") or "").strip()
 
-    if not instagram_username and user.get("instagram_access_token") and user.get("instagram_user_id"):
-        try:
-            profile = await InstagramService.get_user_profile(str(user.get("instagram_access_token") or ""))
-            instagram_username = str(profile.get("username") or "").strip()
-            if instagram_username:
-                await db.users.update_one(
-                    {"_id": user["_id"]},
-                    {"$set": {"instagram_username": instagram_username}},
-                )
-        except Exception:
-            instagram_username = str(user.get("instagram_username") or "").strip()
+    if user.get("instagram_access_token") and user.get("instagram_user_id"):
+        account_ids = user.get("instagram_account_ids") or []
+        user_ig_id = str(user.get("instagram_user_id") or "")
+        needs_profile_sync = not instagram_username or len(user_ig_id) > 20 or len(account_ids) <= 1
+        if needs_profile_sync:
+            try:
+                profile = await InstagramService.get_user_profile(str(user.get("instagram_access_token") or ""))
+                ig_username = str(profile.get("username") or "").strip()
+                meta_biz_id = str(profile.get("user_id") or "").strip()
+                update_fields = {}
+                if ig_username and not instagram_username:
+                    instagram_username = ig_username
+                    update_fields["instagram_username"] = ig_username
+                if meta_biz_id and meta_biz_id not in account_ids:
+                    update_fields["instagram_user_id"] = meta_biz_id
+                    await db.users.update_one(
+                        {"_id": user["_id"]},
+                        {
+                            "$set": update_fields,
+                            "$addToSet": {"instagram_account_ids": meta_biz_id},
+                        },
+                    )
+                elif update_fields:
+                    await db.users.update_one(
+                        {"_id": user["_id"]},
+                        {"$set": update_fields},
+                    )
+            except Exception:
+                instagram_username = str(user.get("instagram_username") or "").strip()
 
     return {
         "id": str(user["_id"]),

@@ -24,6 +24,7 @@ PLAN_FEATURES = {
         "No footer branding",
         "Premium analytics",
         "Ask-to-follow before DM delivery",
+        "Interactive DM buttons (up to 3)",
         "Priority email support",
     ],
     PlanType.Pro: [
@@ -34,6 +35,7 @@ PLAN_FEATURES = {
         "24/7 faster support",
         "No footer branding",
         "Ask-to-follow before DM delivery",
+        "Interactive DM buttons (up to 3)",
     ],
 }
 
@@ -60,6 +62,7 @@ async def get_plans():
                 "support_tier": limits.get("support_tier", "email"),
                 "branding": limits.get("branding", "footer_copyright"),
                 "ask_follow_before_dm": bool(limits.get("ask_follow_before_dm", False)),
+                "interactive_dm_buttons": bool(limits.get("interactive_dm_buttons", False)),
                 "features": PLAN_FEATURES.get(plan, []),
                 "pricing": {
                     cycle: (limits["price_inr"] * multiplier)
