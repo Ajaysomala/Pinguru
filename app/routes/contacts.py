@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Query
 from app.database import get_db
@@ -5,6 +6,19 @@ from app.routes.auth import get_current_user
 from app.models.models import get_plan_limits
 
 router = APIRouter()
+
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+# Plain numbers such as "+919876543210" are evaluated as numbers, not formulas.
+_CSV_PLAIN_NUMBER = re.compile(r"^[+-]?\d[\d ]*$")
+
+
+def _csv_safe(value):
+    """Neutralise spreadsheet formula injection (=, +, -, @, tab, CR) in exported cells."""
+    if not isinstance(value, str) or not value:
+        return value
+    if value.startswith(_CSV_FORMULA_PREFIXES) and not _CSV_PLAIN_NUMBER.match(value):
+        return "'" + value
+    return value
 
 
 @router.get("")
@@ -95,7 +109,7 @@ async def export_contacts_csv(
         window_active = "Yes" if bool(last_seen and (now - last_seen).total_seconds() <= 86400) else "No"
         tags_str = ", ".join(c.get("tags") or [])
 
-        writer.writerow([
+        writer.writerow([_csv_safe(cell) for cell in [
             c.get("ig_username") or "",
             c.get("display_name") or "",
             c.get("captured_email") or "",
@@ -109,7 +123,7 @@ async def export_contacts_csv(
             c.get("follow_gate_status") or "none",
             first_seen_str,
             last_seen_str,
-        ])
+        ]])
 
     csv_data = output.getvalue()
     filename = f"pinguru_contacts_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv"

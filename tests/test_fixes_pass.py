@@ -29,6 +29,11 @@ from app.services.instagram import (
 )
 
 
+# These tests call DM handlers directly, bypassing the inbound webhook that opens
+# Meta's 24h messaging window (see conftest.open_messaging_window).
+pytestmark = pytest.mark.usefixtures("open_messaging_window")
+
+
 class _MockCollection:
     def __init__(self, data=None):
         self.data = list(data or [])
@@ -222,7 +227,7 @@ def test_fix_2_and_4_dm_trigger_renders_and_enriches_contact(monkeypatch):
                         "sender": {"id": "fan_dm_999"},
                         "recipient": {"id": "biz_123"},
                         "message": {"mid": "mid_001", "text": "promo please"},
-                        "timestamp": 1710000000,
+                        "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
                     }
                 ],
             }

@@ -8,12 +8,19 @@ from app.config import settings, validate_startup_config
 from app.database import connect_db, disconnect_db
 from app.routes import webhook, auth, automation, dashboard, plans, admin, contacts, billing
 from app.services.token_refresh import token_refresh_background_loop
-from app.security import limiter
+from app.services.dm_delivery import dm_retry_background_loop
+from app.security import get_cookie, limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 import logging
+from app.log_redaction import install_log_redaction
 
 logging.basicConfig(level=logging.INFO)
+install_log_redaction()
+# httpx logs every request URL at INFO. Token exchange/refresh calls still carry
+# tokens in the query string, so keep these loggers at WARNING (redaction is a backstop).
+for _noisy_logger in ("httpx", "httpcore"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 CSRF_EXEMPT_PATHS = {
@@ -31,14 +38,16 @@ async def lifespan(app: FastAPI):
     await connect_db()
     logger.info("✅ PinGuru backend started — MongoDB connected")
     refresh_task = asyncio.create_task(token_refresh_background_loop())
+    dm_retry_task = asyncio.create_task(dm_retry_background_loop())
     try:
         yield
     finally:
-        refresh_task.cancel()
-        try:
-            await refresh_task
-        except asyncio.CancelledError:
-            pass
+        for task in (refresh_task, dm_retry_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await disconnect_db()
         logger.info("🛑 PinGuru backend shutting down")
 
@@ -62,8 +71,8 @@ async def rate_limit_handler(request, exc):
 
 @app.middleware("http")
 async def add_security_headers(request, call_next):
-    has_user_cookie = bool(request.cookies.get("pg_token"))
-    has_admin_cookie = bool(request.cookies.get("pg_admin_token"))
+    has_user_cookie = bool(get_cookie(request, "pg_token"))
+    has_admin_cookie = bool(get_cookie(request, "pg_admin_token"))
     path = request.url.path
 
     if request.method.upper() not in SAFE_HTTP_METHODS and (has_user_cookie or has_admin_cookie) and path not in CSRF_EXEMPT_PATHS:
@@ -78,7 +87,7 @@ async def add_security_headers(request, call_next):
 
         csrf_header = request.headers.get("X-CSRF-Token") or ""
         csrf_cookie_name = "pg_admin_csrf" if has_admin_cookie else "pg_csrf"
-        csrf_cookie = request.cookies.get(csrf_cookie_name) or ""
+        csrf_cookie = get_cookie(request, csrf_cookie_name) or ""
         if not csrf_header or not csrf_cookie or not hmac.compare_digest(csrf_header, csrf_cookie):
             return JSONResponse(status_code=403, content={"detail": "Invalid CSRF token"})
 

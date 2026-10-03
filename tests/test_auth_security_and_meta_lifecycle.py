@@ -1,3 +1,4 @@
+import logging
 import asyncio
 import base64
 import hashlib
@@ -9,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
 
+import jwt
 import pytest
 from bson import ObjectId
 from fastapi import HTTPException
@@ -857,6 +859,31 @@ def test_reregister_per_email_limit_3_per_hour(test_setup, monkeypatch):
     assert "too many registration attempts" in r4.json().get("detail", "").lower()
 
 
+def test_meta_callbacks_warn_but_confirm_when_no_user_matches(test_setup, caplog):
+    """Unknown signed_request user_id: log a warning, still return Meta's confirmation."""
+    client, _mock_db = test_setup
+    payload = {
+        "algorithm": "HMAC-SHA256",
+        "user_id": f"unknown_{secrets.token_hex(4)}",
+        "issued_at": int(datetime.now(timezone.utc).timestamp()),
+    }
+    signed_req = _generate_meta_signed_request(payload)
+
+    with caplog.at_level(logging.WARNING, logger="app.routes.auth"):
+        deletion = client.post("/auth/data-deletion-callback", data={"signed_request": signed_req})
+        deauth = client.post("/auth/deauthorize", data={"signed_request": signed_req})
+
+    assert deletion.status_code == 200, deletion.text
+    assert deletion.json()["confirmation_code"]
+    assert deletion.json()["url"]
+    assert deauth.status_code == 200
+    assert deauth.json() == {"success": True}
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("data-deletion callback: no user matched" in m and payload["user_id"] in m for m in warnings)
+    assert any("deauthorize callback: no user matched" in m and payload["user_id"] in m for m in warnings)
+
+
 def test_data_deletion_callback_looks_up_by_app_scoped_id(test_setup):
     """In /auth/data-deletion-callback, user is looked up by Meta's app-scoped ID stored in meta_app_scoped_id or instagram_account_ids."""
     client, mock_db = test_setup
@@ -987,6 +1014,141 @@ def test_jwt_claims_and_type_enforcement(test_setup):
     wrong_type_resp = client.get("/auth/me", headers={"Authorization": f"Bearer {wrong_type_token}"})
     assert wrong_type_resp.status_code == 401
     assert "Invalid token type" in wrong_type_resp.json()["detail"]
+
+
+def test_unauthenticated_admin_logout_does_not_touch_session_version(test_setup, monkeypatch):
+    """Without a valid admin session, admin logout must only clear cookies."""
+    client, mock_db = test_setup
+    import app.routes.admin as admin_module
+
+    admin_email = "admin_unauth_logout@example.com"
+    monkeypatch.setattr(admin_module.settings, "ADMIN_EMAIL", admin_email)
+    asyncio.run(mock_db.admin_config.update_one(
+        {"_id": "admin_session"}, {"$set": {"admin_session_version": 3}}, upsert=True,
+    ))
+
+    def _version():
+        doc = asyncio.run(mock_db.admin_config.find_one({"_id": "admin_session"}))
+        return doc.get("admin_session_version")
+
+    stale_token = admin_module._create_admin_token(admin_email, session_version=2)
+    forged_token = jwt.encode({"sub": admin_email, "type": "admin", "sv": 3}, "not-the-secret", algorithm="HS256")
+    attempts = [None, forged_token, stale_token]
+
+    for path in ("/admin/logout", "/admin/auth/logout"):
+        for token in attempts:
+            client.cookies.clear()
+            headers = {}
+            if token:
+                # /admin/logout is not CSRF-exempt; send a valid pair so the handler is reached.
+                client.cookies.set("pg_admin_token", token)
+                client.cookies.set("pg_admin_csrf", "csrf-ok")
+                headers["X-CSRF-Token"] = "csrf-ok"
+            resp = client.post(path, headers=headers)
+            assert resp.status_code == 200, (path, resp.text)
+            assert resp.json() == {"ok": True}
+            assert "pg_admin_token" in resp.headers.get("set-cookie", "")  # cookie cleared
+            assert _version() == 3, f"{path} with token={bool(token)} changed admin_session_version"
+
+    # A valid session still revokes.
+    client.cookies.clear()
+    client.cookies.set("pg_admin_token", admin_module._create_admin_token(admin_email, session_version=3))
+    client.cookies.set("pg_admin_csrf", "csrf-ok")
+    assert client.post("/admin/logout", headers={"X-CSRF-Token": "csrf-ok"}).status_code == 200
+    assert _version() == 4
+
+
+def test_logout_with_non_session_token_does_not_revoke(test_setup):
+    """OAuth state / reset tokens are signed with the same secret but must not revoke sessions."""
+    from app.routes.auth import _create_password_reset_token, create_oauth_state
+
+    client, mock_db = test_setup
+    user_id = ObjectId()
+    email = f"state_logout_{secrets.token_hex(4)}@example.com"
+    asyncio.run(mock_db.users.insert_one({
+        "_id": user_id,
+        "email": email,
+        "email_verified": True,
+        "is_active": True,
+        "plan": PlanType.Free.value,
+        "session_version": 5,
+        "created_at": datetime.now(timezone.utc),
+    }))
+    oauth_state = create_oauth_state(str(user_id), "nonce")
+    reset_token = _create_password_reset_token(email)
+    untyped = jwt.encode({"sub": str(user_id)}, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+    for token in (oauth_state, reset_token, untyped):
+        for send in ("bearer", "cookie"):
+            client.cookies.clear()
+            headers = {}
+            if send == "bearer":
+                headers["Authorization"] = f"Bearer {token}"
+            else:
+                client.cookies.set("pg_token", token)
+            resp = client.post("/auth/logout", headers=headers)
+            assert resp.status_code == 200
+            assert "pg_token=" in resp.headers.get("set-cookie", "")
+            user = asyncio.run(mock_db.users.find_one({"_id": user_id}))
+            assert user["session_version"] == 5, f"{send} logout with non-session token revoked the session"
+
+    # A real session token still revokes.
+    client.cookies.clear()
+    resp = client.post("/auth/logout", headers={"Authorization": f"Bearer {create_jwt(str(user_id), session_version=5)}"})
+    assert resp.status_code == 200
+    assert asyncio.run(mock_db.users.find_one({"_id": user_id}))["session_version"] == 6
+
+
+def _parse_set_cookies(response):
+    cookies = []
+    for raw_name, raw_value in response.headers.raw:
+        if raw_name.decode().lower() != "set-cookie":
+            continue
+        parts = [p.strip() for p in raw_value.decode().split(";")]
+        name, _, value = parts[0].partition("=")
+        attrs = {}
+        for part in parts[1:]:
+            key, _, val = part.partition("=")
+            attrs[key.lower()] = val
+        cookies.append({"name": name, "value": value, "attrs": attrs})
+    return cookies
+
+
+def _is_deletion(cookie):
+    return cookie["attrs"].get("max-age") == "0" or "1970" in cookie["attrs"].get("expires", "")
+
+
+@pytest.mark.parametrize("environment", ["production", "development"])
+def test_logout_clears_each_auth_cookie_with_matching_path_and_secure(test_setup, monkeypatch, environment):
+    """Browsers only delete a cookie when name, Path, Domain (and Secure for __Host-) match how it was set."""
+    from fastapi import Response as FastAPIResponse
+    from app.routes.admin import _set_admin_cookie
+    from app.routes.auth import _auth_response
+
+    client, _mock_db = test_setup
+    monkeypatch.setattr(settings, "ENVIRONMENT", environment)
+    monkeypatch.setattr(settings, "LEGACY_SHARED_COOKIES", False)
+
+    admin_set = FastAPIResponse()
+    _set_admin_cookie(admin_set, "admin-jwt")
+    set_cookies = {c["name"]: c for c in _parse_set_cookies(_auth_response({}, "user-jwt")) + _parse_set_cookies(admin_set)}
+
+    prefix = "__Host-" if environment == "production" else ""
+    expected = {f"{prefix}{base}" for base in ("pg_token", "pg_csrf", "pg_admin_token", "pg_admin_csrf")}
+    assert set(set_cookies) == expected
+
+    cleared = _parse_set_cookies(client.post("/auth/logout")) + _parse_set_cookies(client.post("/admin/auth/logout"))
+    for name, set_cookie in set_cookies.items():
+        matches = [
+            c for c in cleared
+            if c["name"] == name and _is_deletion(c) and "domain" not in c["attrs"]
+        ]
+        assert matches, f"logout did not clear {name} (host-only)"
+        for deletion in matches:
+            assert deletion["attrs"].get("path") == set_cookie["attrs"].get("path") == "/"
+            assert ("secure" in deletion["attrs"]) == ("secure" in set_cookie["attrs"]), name
+        if name.startswith("__Host-"):
+            assert "secure" in set_cookie["attrs"] and "domain" not in set_cookie["attrs"]
 
 
 def test_user_and_admin_logout_revokes_session(test_setup, monkeypatch):
@@ -1145,9 +1307,11 @@ def test_generic_404_and_dummy_bcrypt_verify(test_setup):
         assert mock_verify.called, "Dummy bcrypt verify was not invoked for unknown email on /auth/login!"
 
 
-def test_lockout_keyed_on_email_and_ip(test_setup):
+def test_lockout_keyed_on_email_and_ip(test_setup, monkeypatch):
     """Lockout must be keyed on (email + IP) so an attacker cannot DoS a user on another IP."""
     client, mock_db = test_setup
+    # Simulates deployment behind a trusted proxy that sets X-Forwarded-For.
+    monkeypatch.setattr(settings, "CLIENT_IP_HEADER", "x-forwarded-for")
     email = f"lockout_{secrets.token_hex(4)}@example.com"
     correct_pass = "GoodPassword123!"
     attacker_ip = "198.51.100.22"

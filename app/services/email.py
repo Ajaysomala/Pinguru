@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -163,3 +164,24 @@ async def send_subscription_expired_email(to_email: str, plan: str) -> bool:
     if resend_ok:
         return True
     return await asyncio.to_thread(_send_via_smtp_html_sync, to_email, subject, html)
+
+def _admin_alert_html(alert: dict) -> str:
+    rows = "".join(
+        f"<tr><td style='padding:4px 12px 4px 0;color:#666'>{html.escape(str(key))}</td>"
+        f"<td style='padding:4px 0'>{html.escape(str(value))}</td></tr>"
+        for key, value in alert.items()
+        if key not in {"_id", "resolved"}
+    )
+    return f"""
+    <div style="font-family:sans-serif;max-width:560px">
+      <h2 style="margin:0 0 12px">PinGuru admin alert: {html.escape(str(alert.get("type", "alert")))}</h2>
+      <p>This needs a manual check. Resolve it in the admin panel once handled.</p>
+      <table style="font-size:14px">{rows}</table>
+    </div>
+    """
+
+
+async def send_admin_alert_email(to_email: str, alert: dict) -> bool:
+    """Notify the admin about an alert through Resend (no SMTP fallback needed for ops mail)."""
+    subject = f"[PinGuru alert] {alert.get('type', 'alert')}"
+    return await _send_via_resend_html(to_email, subject, _admin_alert_html(alert))

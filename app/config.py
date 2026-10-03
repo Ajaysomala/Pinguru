@@ -1,3 +1,5 @@
+import logging
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
@@ -17,6 +19,9 @@ class Settings(BaseSettings):
     IG_APP_SECRET: str = ""
     META_WEBHOOK_VERIFY_TOKEN: str
     INSTAGRAM_GRAPH_API_VERSION: str = "v22.0"
+    # Send Instagram tokens as "Authorization: Bearer" (default). Set false to fall
+    # back to the access_token query/body parameter if Graph rejects the header.
+    IG_TOKEN_IN_HEADER: bool = True
 
     # Razorpay
     RAZORPAY_KEY_ID: str = ""
@@ -42,6 +47,8 @@ class Settings(BaseSettings):
     ENCRYPTION_KEY: str
     admin_api_key: str = ""
     ADMIN_EMAIL: str = ""
+    # Where admin alert emails go (defaults to ADMIN_EMAIL).
+    ADMIN_ALERT_EMAIL: str = ""
     ADMIN_PASSWORD_HASH: str = ""
     GOOGLE_CLIENT_ID: str = ""
     DEFAULT_OAUTH_PASSWORD: str = ""
@@ -51,6 +58,20 @@ class Settings(BaseSettings):
     OTP_FROM_EMAIL: str = ""
     ENVIRONMENT: str = "production"
     DISABLE_WEBHOOK_SIGNATURE: bool = False
+
+    # Real client IP behind a proxy. Leave CLIENT_IP_HEADER empty to use the
+    # direct peer. Set to "cf-connecting-ip", "x-real-ip" or "x-forwarded-for"
+    # only when that header is set by a proxy you control.
+    CLIENT_IP_HEADER: str = ""
+    # Comma-separated CIDRs of proxies allowed to set CLIENT_IP_HEADER (empty = any peer).
+    TRUSTED_PROXY_IPS: str = ""
+    # For x-forwarded-for: number of trusted proxies that append to the header.
+    TRUSTED_PROXY_COUNT: int = 1
+    # Rate-limit store. "memory://" is per-process; use a mongodb:// or redis://
+    # URI when running more than one worker/instance.
+    RATE_LIMIT_STORAGE_URI: str = "memory://"
+    # Rollback switch: True restores the old .parent-domain cookies without __Host- prefix.
+    LEGACY_SHARED_COOKIES: bool = False
 
 
 settings = Settings()  # pyright: ignore[reportCallIssue]
@@ -86,6 +107,12 @@ def validate_startup_config(target_settings: Settings | None = None) -> None:
         meta_sec = str(getattr(cfg, "META_APP_SECRET", "") or "").strip()
         if not meta_sec:
             raise RuntimeError("Startup validation failed: META_APP_SECRET must not be empty in production")
+
+        verify_token = str(getattr(cfg, "META_WEBHOOK_VERIFY_TOKEN", "") or "").strip()
+        if verify_token in {"", "pinguru_webhook_secret_2024", "CHANGE_ME_random_token"}:
+            logging.getLogger(__name__).warning(
+                "META_WEBHOOK_VERIFY_TOKEN is empty or a published example value; set a random token"
+            )
 
         rp_webhook_sec = str(getattr(cfg, "RAZORPAY_WEBHOOK_SECRET", "") or "").strip()
         if not rp_webhook_sec:

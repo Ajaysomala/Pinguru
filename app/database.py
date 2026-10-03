@@ -27,6 +27,7 @@ async def _create_indexes(db) -> None:
     await _safe_create_index(db.users, "instagram_user_id", sparse=True)
     await _safe_create_index(db.users, "instagram_account_ids", sparse=True)
     await _safe_create_index(db.users, "razorpay_subscription_id", sparse=True)
+    await _safe_create_index(db.users, "pending_razorpay_subscription_id", sparse=True)
     await _safe_create_index(db.users, [("created_at", DESCENDING)])
     # TTL: auto-delete unverified user records when unverified_expires_at is reached
     await _safe_create_index(db.users, "unverified_expires_at", expireAfterSeconds=0)
@@ -74,6 +75,26 @@ async def _create_indexes(db) -> None:
         "received_at",
         expireAfterSeconds=172800,  # 48 hours
     )
+
+    # ── comment_dm_history (one private reply per comment) ──────────────────────
+    await _safe_create_index(
+        db.comment_dm_history,
+        [("user_id", ASCENDING), ("comment_id", ASCENDING)],
+        unique=True,
+        name="user_comment_unique",
+    )
+    await _safe_create_index(db.comment_dm_history, [("user_id", ASCENDING), ("sent_at", DESCENDING)])
+    # Keep claims well past Meta's 7-day private reply window, then expire them.
+    await _safe_create_index(db.comment_dm_history, "claimed_at", expireAfterSeconds=30 * 86400)
+
+    # ── dm_retry_queue (429 / error 613 retries) ───────────────────────────────
+    await _safe_create_index(db.dm_retry_queue, [("status", ASCENDING), ("next_run_at", ASCENDING)])
+    await _safe_create_index(db.dm_retry_queue, "created_at", expireAfterSeconds=14 * 86400)
+    await _safe_create_index(db.dm_logs, "retry_job_id", sparse=True)
+
+    # ── admin_alerts ───────────────────────────────────────────────────────────
+    await _safe_create_index(db.admin_alerts, [("type", ASCENDING), ("resolved", ASCENDING), ("created_at", DESCENDING)])
+    await _safe_create_index(db.admin_alerts, [("created_at", DESCENDING)])
 
     # ── data_deletion_requests ─────────────────────────────────────────────────
     await _safe_create_index(db.data_deletion_requests, "confirmation_code", unique=True)

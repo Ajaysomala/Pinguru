@@ -26,6 +26,11 @@ from app.routes.webhook import (
 from app.services.instagram import InstagramService
 
 
+# These tests call DM handlers directly, bypassing the inbound webhook that opens
+# Meta's 24h messaging window (see conftest.open_messaging_window).
+pytestmark = pytest.mark.usefixtures("open_messaging_window")
+
+
 class MockRulesCollection:
     def __init__(self, initial_rules=None):
         self.rules = list(initial_rules or [])
@@ -379,6 +384,33 @@ async def test_validate_attachment_url_accepts_valid_image(monkeypatch):
     is_valid, err = await InstagramService.validate_attachment_url("https://example.com/good.png")
     assert is_valid is True
     assert err == ""
+
+
+@pytest.mark.anyio
+async def test_validate_attachment_url_rejects_non_443_port(monkeypatch):
+    head_calls = []
+
+    class MockResp:
+        status_code = 200
+        headers = {"content-type": "image/png", "content-length": "1024"}
+
+    class MockClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def head(self, url):
+            head_calls.append(url)
+            return MockResp()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: MockClient())
+
+    is_valid, err = await InstagramService.validate_attachment_url("https://example.com:8443/image.png")
+    assert is_valid is False
+    assert "443" in err
+    assert head_calls == []
+
+    # Explicit :443 is still allowed.
+    is_valid, err = await InstagramService.validate_attachment_url("https://example.com:443/port-ok.png")
+    assert is_valid is True, err
 
 
 @pytest.mark.anyio
