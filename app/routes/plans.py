@@ -106,5 +106,5 @@ async def plans_razorpay_webhook(request: Request, db=Depends(get_db)):
 
 @router.get("/status")
 @limiter.limit("20/minute")
-async def plans_billing_status(request: Request, user=Depends(get_current_user)):
-    return await get_billing_status(user=user)
+async def plans_billing_status(request: Request, user=Depends(get_current_user), db=Depends(get_db)):
+    return await get_billing_status(user=user, db=db)

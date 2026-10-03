@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -138,6 +139,108 @@ def _cleared_pending_fields(user: dict[str, Any], pending_sub_id: str | None) ->
     return fields
 
 
+PENDING_CHECKOUT_TTL_MINUTES = 30
+_TERMINAL_SUBSCRIPTION_STATES = {"cancelled", "completed", "expired"}
+_CANCEL_ATTEMPTS = 3
+_CANCEL_BACKOFF_SECONDS = 0.5
+_backoff_sleep = asyncio.sleep  # patched in tests
+
+
+async def _razorpay_subscription_status(client: httpx.AsyncClient, auth, sub_id: str) -> str | None:
+    try:
+        resp = await client.get(f"https://api.razorpay.com/v1/subscriptions/{sub_id}", auth=auth)
+    except httpx.RequestError:
+        return None
+    if resp.status_code != 200:
+        return None
+    return str((resp.json() or {}).get("status") or "") or None
+
+
+async def _cancel_razorpay_subscription(sub_id: str, attempts: int = _CANCEL_ATTEMPTS) -> tuple[bool, str]:
+    """Cancel a Razorpay subscription immediately. Returns (done, detail).
+
+    Already-terminal subscriptions count as done. Network errors, 429 and 5xx are
+    retried with exponential backoff; other 4xx responses are not retried.
+    """
+    if not _is_razorpay_configured():
+        return False, "razorpay_not_configured"
+    auth = (settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
+    cancel_url = f"https://api.razorpay.com/v1/subscriptions/{sub_id}/cancel"
+    detail = "unknown_error"
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+        for attempt in range(1, attempts + 1):
+            retryable = True
+            try:
+                resp = await client.post(cancel_url, json={"cancel_at_cycle_end": 0}, auth=auth)
+                if resp.status_code == 200:
+                    return True, "cancelled"
+                detail = f"status={resp.status_code} {summarize_api_error(resp)}"
+                if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                    status = await _razorpay_subscription_status(client, auth, sub_id)
+                    if status in _TERMINAL_SUBSCRIPTION_STATES:
+                        return True, f"already_{status}"
+                    retryable = False
+            except httpx.RequestError as exc:
+                detail = f"request_error={type(exc).__name__}"
+            if not retryable or attempt == attempts:
+                break
+            await _backoff_sleep(_CANCEL_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+    return False, detail
+
+
+async def _write_admin_alert(db, alert_type: str, **fields: Any) -> None:
+    doc = {"type": alert_type, "resolved": False, "created_at": datetime.now(timezone.utc), **fields}
+    collection = getattr(db, "admin_alerts", None)
+    if collection is None:
+        logger.error("admin_alerts collection unavailable; alert not stored: %s", doc)
+        return
+    await collection.insert_one(doc)
+
+
+async def _cancel_previous_subscription(db, user_id: Any, previous_sub_id: str, new_sub_id: str) -> None:
+    """After an upgrade activates, cancel the subscription it replaced (idempotent)."""
+    user_doc = await db.users.find_one({"_id": user_id}) or {}
+    if (
+        str(user_doc.get("previous_razorpay_subscription_id") or "") == previous_sub_id
+        and user_doc.get("previous_subscription_cancelled_at")
+    ):
+        return
+
+    done, detail = await _cancel_razorpay_subscription(previous_sub_id)
+    now = datetime.now(timezone.utc)
+    if done:
+        await db.users.update_one(
+            {"_id": user_id},
+            {"$set": {
+                "previous_razorpay_subscription_id": previous_sub_id,
+                "previous_subscription_cancelled_at": now,
+                "previous_subscription_cancel_status": detail,
+            }},
+        )
+        logger.info("Cancelled replaced Razorpay subscription %s for user %s (%s)", previous_sub_id, user_id, detail)
+        return
+
+    logger.error(
+        "Failed to cancel replaced Razorpay subscription %s for user %s after upgrade to %s: %s",
+        previous_sub_id,
+        user_id,
+        new_sub_id,
+        detail,
+    )
+    await db.users.update_one(
+        {"_id": user_id},
+        {"$set": {"previous_subscription_cancel_status": "failed"}},
+    )
+    await _write_admin_alert(
+        db,
+        "razorpay_cancel_failed",
+        user_id=str(user_id),
+        subscription_id=previous_sub_id,
+        new_subscription_id=new_sub_id,
+        error=detail,
+    )
+
+
 async def _clear_stale_pending_checkout(db, user: dict[str, Any]) -> bool:
     pending_plan = user.get("pending_plan")
     if pending_plan not in {PlanType.Starter.value, PlanType.Pro.value}:
@@ -151,16 +254,39 @@ async def _clear_stale_pending_checkout(db, user: dict[str, Any]) -> bool:
         initiated_at = initiated_at.replace(tzinfo=timezone.utc)
 
     age_minutes = (datetime.now(timezone.utc) - initiated_at).total_seconds() / 60
-    if age_minutes <= 30:
+    if age_minutes <= PENDING_CHECKOUT_TTL_MINUTES:
         return False
 
     pending_sub_id = _pending_subscription_id(user)
-    await db.users.update_one(
+    result = await db.users.update_one(
         {"_id": user["_id"], "pending_plan": pending_plan},
         {"$set": _cleared_pending_fields(user, pending_sub_id)},
     )
+    if getattr(result, "matched_count", 1) == 0:
+        return False
     logger.info("Auto-cleared stale pending checkout for user=%s", str(user.get("_id")))
+    if pending_sub_id:
+        # Stop the abandoned checkout link from being paid later (best effort, single try).
+        done, detail = await _cancel_razorpay_subscription(pending_sub_id, attempts=1)
+        if not done:
+            logger.warning("Could not cancel expired pending subscription %s: %s", pending_sub_id, detail)
     return True
+
+
+async def expire_stale_pending_checkouts(db) -> int:
+    """Background sweep: clear pending upgrades older than PENDING_CHECKOUT_TTL_MINUTES."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=PENDING_CHECKOUT_TTL_MINUTES)
+    users = await db.users.find({
+        "pending_plan": {"$in": [PlanType.Starter.value, PlanType.Pro.value]},
+        "checkout_initiated_at": {"$lte": cutoff},
+    }).to_list(500)
+    cleared = 0
+    for user in users:
+        if await _clear_stale_pending_checkout(db, user):
+            cleared += 1
+    if cleared:
+        logger.info("Expired %d stale pending checkout(s)", cleared)
+    return cleared
 
 
 @router.post("/create-checkout")
@@ -413,12 +539,21 @@ async def _handle_subscription_activated(db, sub_entity: dict[str, Any]) -> dict
     stored_sub_id = str(user_doc.get("razorpay_subscription_id") or "")
     pending_sub_id = str(user_doc.get("pending_razorpay_subscription_id") or "")
     if incoming_sub_id not in {stored_sub_id, pending_sub_id} and (stored_sub_id or pending_sub_id):
-        logger.warning(
+        logger.error(
             "Subscription id mismatch user=%s stored=%s pending=%s incoming=%s",
             user_id,
             stored_sub_id,
             pending_sub_id,
             incoming_sub_id,
+        )
+        # A customer may have paid an expired or replaced checkout link: needs a human.
+        await _write_admin_alert(
+            db,
+            "unmatched_subscription_activation",
+            user_id=str(user_id),
+            subscription_id=incoming_sub_id,
+            stored_subscription_id=stored_sub_id or None,
+            pending_subscription_id=pending_sub_id or None,
         )
         return {"status": "ignored"}
 
@@ -439,16 +574,16 @@ async def _activate_subscription(
     fields["pending_razorpay_subscription_id"] = None
     fields.update(extra or {})
     previous_sub_id = str(user_doc.get("razorpay_subscription_id") or "")
-    if previous_sub_id and previous_sub_id != sub_id:
-        # Upgrade completed. The old subscription is not cancelled automatically.
+    replaced = bool(previous_sub_id and previous_sub_id != sub_id)
+    if replaced:
         fields["previous_razorpay_subscription_id"] = previous_sub_id
-        logger.warning(
-            "User %s switched subscription %s -> %s; previous subscription may still be active on Razorpay",
-            user_doc["_id"],
-            previous_sub_id,
-            sub_id,
-        )
+        fields["previous_subscription_cancelled_at"] = None
+        fields["previous_subscription_cancel_status"] = "pending"
+    # Promote first: once the old subscription is no longer current, its
+    # subscription.cancelled webhook cannot downgrade the user.
     await db.users.update_one({"_id": user_doc["_id"]}, {"$set": fields})
+    if replaced:
+        await _cancel_previous_subscription(db, user_doc["_id"], previous_sub_id, sub_id)
 
 
 async def _handle_subscription_renewed(db, sub_entity: dict[str, Any], event_type: str) -> dict[str, str]:
@@ -536,7 +671,9 @@ async def _downgrade_subscription(db, sub_id: Any, status: str, keep_subscriptio
 
 
 @router.get("/status")
-async def get_billing_status(user=Depends(get_current_user)):
+async def get_billing_status(user=Depends(get_current_user), db=Depends(get_db)):
+    if await _clear_stale_pending_checkout(db, user):
+        user = await db.users.find_one({"_id": user["_id"]}) or user
     current_plan = _normalize_user_plan(user)
     pending_value = user.get("pending_plan")
     pending_plan = pending_value if pending_value in {PlanType.Starter.value, PlanType.Pro.value} else None

@@ -175,6 +175,17 @@ async def cleanup_unverified_accounts(db: Any) -> int:
         return 0
 
 
+async def _expire_stale_pending_checkouts(db: Any) -> int:
+    # Imported lazily: app.routes.billing imports route modules that import this service.
+    from app.routes.billing import expire_stale_pending_checkouts
+
+    try:
+        return await expire_stale_pending_checkouts(db)
+    except Exception:
+        logger.exception("Failed to expire stale pending checkouts")
+        return 0
+
+
 async def token_refresh_background_loop(interval_seconds: int = 43200, days_ahead: int = 10) -> None:
     """Startup background loop that periodically refreshes Instagram tokens expiring within 10 days,
     resets monthly DM counts on month rollover, and cleans up unverified accounts.
@@ -191,6 +202,7 @@ async def token_refresh_background_loop(interval_seconds: int = 43200, days_ahea
                 await refresh_expiring_tokens(db, days_ahead=days_ahead)
                 await reset_monthly_dm_counts(db)
                 await cleanup_unverified_accounts(db)
+                await _expire_stale_pending_checkouts(db)
             else:
                 logger.warning("Database not initialized yet; skipping token refresh cycle")
         except asyncio.CancelledError:

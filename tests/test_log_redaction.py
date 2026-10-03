@@ -125,3 +125,36 @@ def test_send_dm_body_has_no_token(captured_requests):
     body = json.loads(captured_requests[0].content)
     assert "access_token" not in body
     assert body["recipient"] == {"id": "user_1"}
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: InstagramService.send_dm(TOKEN, "user_1", "hi", "biz_1"),
+        lambda: InstagramService.get_messaging_user_profile(TOKEN, "user_1"),
+        lambda: InstagramService.get_user_profile(TOKEN),
+        lambda: InstagramService.get_user_media(TOKEN),
+        lambda: InstagramService.verify_account_ownership(TOKEN, "biz_1"),
+        lambda: InstagramService.reply_to_comment(TOKEN, "comment_1", "thanks"),
+        lambda: InstagramService.subscribe_app_to_webhooks(TOKEN, "biz_1"),
+        lambda: InstagramService.get_granted_permissions(TOKEN),
+    ],
+)
+def test_ig_token_in_header_false_uses_access_token_parameter(captured_requests, monkeypatch, call):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "IG_TOKEN_IN_HEADER", False)
+    asyncio.run(call())
+    assert captured_requests
+    for request in captured_requests:
+        assert "authorization" not in request.headers
+        body = request.content.decode("utf-8", "ignore")
+        in_query = request.url.params.get("access_token") == TOKEN
+        in_body = f'"access_token": "{TOKEN}"' in body or f'"access_token":"{TOKEN}"' in body or f"access_token={TOKEN}" in body
+        assert in_query or in_body, f"no access_token parameter on {request.method} {request.url.path}"
+
+
+def test_ig_token_in_header_defaults_to_true():
+    from app.config import Settings
+
+    assert Settings.model_fields["IG_TOKEN_IN_HEADER"].default is True

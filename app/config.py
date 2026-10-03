@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     IG_APP_SECRET: str = ""
     META_WEBHOOK_VERIFY_TOKEN: str
     INSTAGRAM_GRAPH_API_VERSION: str = "v22.0"
+    # Send Instagram tokens as "Authorization: Bearer" (default). Set false to fall
+    # back to the access_token query/body parameter if Graph rejects the header.
+    IG_TOKEN_IN_HEADER: bool = True
 
     # Razorpay
     RAZORPAY_KEY_ID: str = ""
