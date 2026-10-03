@@ -22,6 +22,11 @@ from app.services.instagram import InstagramService
 
 # ── Test 1: Plan Resolution & UserInDB Model ──────────────────────────────────
 
+# These tests call DM handlers directly, bypassing the inbound webhook that opens
+# Meta's 24h messaging window (see conftest.open_messaging_window).
+pytestmark = pytest.mark.usefixtures("open_messaging_window")
+
+
 def test_get_plan_type_case_insensitivity():
     assert get_plan_type("Starter") == PlanType.Starter
     assert get_plan_type("starter") == PlanType.Starter

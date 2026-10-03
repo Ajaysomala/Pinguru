@@ -26,6 +26,11 @@ from app.routes.webhook import (
 from app.services.instagram import InstagramService
 
 
+# These tests call DM handlers directly, bypassing the inbound webhook that opens
+# Meta's 24h messaging window (see conftest.open_messaging_window).
+pytestmark = pytest.mark.usefixtures("open_messaging_window")
+
+
 class MockRulesCollection:
     def __init__(self, initial_rules=None):
         self.rules = list(initial_rules or [])

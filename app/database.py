@@ -76,6 +76,22 @@ async def _create_indexes(db) -> None:
         expireAfterSeconds=172800,  # 48 hours
     )
 
+    # ── comment_dm_history (one private reply per comment) ──────────────────────
+    await _safe_create_index(
+        db.comment_dm_history,
+        [("user_id", ASCENDING), ("comment_id", ASCENDING)],
+        unique=True,
+        name="user_comment_unique",
+    )
+    await _safe_create_index(db.comment_dm_history, [("user_id", ASCENDING), ("sent_at", DESCENDING)])
+    # Keep claims well past Meta's 7-day private reply window, then expire them.
+    await _safe_create_index(db.comment_dm_history, "claimed_at", expireAfterSeconds=30 * 86400)
+
+    # ── dm_retry_queue (429 / error 613 retries) ───────────────────────────────
+    await _safe_create_index(db.dm_retry_queue, [("status", ASCENDING), ("next_run_at", ASCENDING)])
+    await _safe_create_index(db.dm_retry_queue, "created_at", expireAfterSeconds=14 * 86400)
+    await _safe_create_index(db.dm_logs, "retry_job_id", sparse=True)
+
     # ── admin_alerts ───────────────────────────────────────────────────────────
     await _safe_create_index(db.admin_alerts, [("type", ASCENDING), ("resolved", ASCENDING), ("created_at", DESCENDING)])
     await _safe_create_index(db.admin_alerts, [("created_at", DESCENDING)])

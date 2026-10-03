@@ -8,6 +8,7 @@ from app.config import settings, validate_startup_config
 from app.database import connect_db, disconnect_db
 from app.routes import webhook, auth, automation, dashboard, plans, admin, contacts, billing
 from app.services.token_refresh import token_refresh_background_loop
+from app.services.dm_delivery import dm_retry_background_loop
 from app.security import get_cookie, limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -37,14 +38,16 @@ async def lifespan(app: FastAPI):
     await connect_db()
     logger.info("✅ PinGuru backend started — MongoDB connected")
     refresh_task = asyncio.create_task(token_refresh_background_loop())
+    dm_retry_task = asyncio.create_task(dm_retry_background_loop())
     try:
         yield
     finally:
-        refresh_task.cancel()
-        try:
-            await refresh_task
-        except asyncio.CancelledError:
-            pass
+        for task in (refresh_task, dm_retry_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await disconnect_db()
         logger.info("🛑 PinGuru backend shutting down")
 

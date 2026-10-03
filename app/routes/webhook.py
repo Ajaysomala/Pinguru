@@ -15,6 +15,15 @@ from app.config import settings
 from app.database import get_db
 from app.models.models import PlanType, TriggerType, get_plan_limits, get_plan_type
 from app.services.instagram import InstagramService
+from app.services.dm_delivery import (
+    dm_log_fields,
+    event_context,
+    is_opt_out_message,
+    mark_opted_out,
+    parse_event_time,
+    record_inbound,
+    send_dm_with_policy,
+)
 from bson import ObjectId
 
 router = APIRouter()
@@ -717,11 +726,11 @@ async def _send_rule_reply(
             else:
                 prompt_message = _build_follow_prompt(user)
                 follow_buttons = _build_follow_buttons(user)
-                prompt_result = await InstagramService.send_dm(
-                    access_token=user["instagram_access_token"],
+                prompt_result = await send_dm_with_policy(
+                    db,
+                    user,
                     recipient_ig_id=recipient_id,
                     message=prompt_message,
-                    ig_user_id=user["instagram_user_id"],
                     comment_id=comment_id,
                     buttons=follow_buttons,
                 )
@@ -733,7 +742,7 @@ async def _send_rule_reply(
                         "recipient_ig_id": recipient_id,
                         "message_sent": prompt_message,
                         "trigger_type": trigger_type,
-                        "status": "sent" if prompt_result["success"] else "failed",
+                        **dm_log_fields(prompt_result),
                         "sent_at": datetime.now(timezone.utc),
                     }
                 )
@@ -779,11 +788,11 @@ async def _send_rule_reply(
         if not has_email and not is_awaiting_email:
             prompt_message = str(rule.get("email_capture_prompt") or "What's the best email address to send your link to? 📩").strip()
             prompt_message = _apply_plan_footer(prompt_message, user_plan)
-            prompt_result = await InstagramService.send_dm(
-                access_token=user["instagram_access_token"],
+            prompt_result = await send_dm_with_policy(
+                db,
+                user,
                 recipient_ig_id=recipient_id,
                 message=prompt_message,
-                ig_user_id=user["instagram_user_id"],
                 comment_id=comment_id,
             )
 
@@ -794,7 +803,7 @@ async def _send_rule_reply(
                     "recipient_ig_id": recipient_id,
                     "message_sent": prompt_message,
                     "trigger_type": trigger_type,
-                    "status": "sent" if prompt_result["success"] else "failed",
+                    **dm_log_fields(prompt_result),
                     "sent_at": datetime.now(timezone.utc),
                 }
             )
@@ -839,11 +848,11 @@ async def _send_rule_reply(
         if not has_phone and not is_awaiting_phone:
             prompt_message = str(rule.get("capture_phone_prompt") or "What's your WhatsApp or phone number so we can text you the details? 📱").strip()
             prompt_message = _apply_plan_footer(prompt_message, user_plan)
-            prompt_result = await InstagramService.send_dm(
-                access_token=user["instagram_access_token"],
+            prompt_result = await send_dm_with_policy(
+                db,
+                user,
                 recipient_ig_id=recipient_id,
                 message=prompt_message,
-                ig_user_id=user["instagram_user_id"],
                 comment_id=comment_id,
             )
 
@@ -854,7 +863,7 @@ async def _send_rule_reply(
                     "recipient_ig_id": recipient_id,
                     "message_sent": prompt_message,
                     "trigger_type": trigger_type,
-                    "status": "sent" if prompt_result["success"] else "failed",
+                    **dm_log_fields(prompt_result),
                     "sent_at": datetime.now(timezone.utc),
                 }
             )
@@ -941,11 +950,11 @@ async def _send_rule_reply(
 
     if attachment_url:
         # Send image first, then text sequentially
-        img_result = await InstagramService.send_dm(
-            access_token=user["instagram_access_token"],
+        img_result = await send_dm_with_policy(
+            db,
+            user,
             recipient_ig_id=recipient_id,
             message="",
-            ig_user_id=user["instagram_user_id"],
             attachment_url=attachment_url,
             attachment_type=attachment_type,
             comment_id=comment_id,
@@ -975,22 +984,36 @@ async def _send_rule_reply(
         # If image succeeded with comment_id, subsequent text message goes to recipient_id directly
         text_comment_id = None if img_result.get("success") else comment_id
 
-        text_result = await InstagramService.send_dm(
-            access_token=user["instagram_access_token"],
+        text_result = await send_dm_with_policy(
+            db,
+            user,
             recipient_ig_id=recipient_id,
             message=reply,
-            ig_user_id=user["instagram_user_id"],
             comment_id=text_comment_id,
             buttons=dm_buttons,
         )
 
+        if text_result.get("skipped") and img_result.get("success"):
+            # The image was the private reply; Meta allows nothing more until the person replies.
+            await db.dm_logs.insert_one(
+                {
+                    "user_id": str(user["_id"]),
+                    "rule_id": str(rule["_id"]),
+                    "recipient_ig_id": recipient_id,
+                    "message_sent": reply,
+                    "trigger_type": trigger_type,
+                    **dm_log_fields(text_result),
+                    "sent_at": datetime.now(timezone.utc),
+                }
+            )
+
         result = text_result if text_result.get("success") else (img_result if img_result.get("success") else text_result)
     else:
-        result = await InstagramService.send_dm(
-            access_token=user["instagram_access_token"],
+        result = await send_dm_with_policy(
+            db,
+            user,
             recipient_ig_id=recipient_id,
             message=reply,
-            ig_user_id=user["instagram_user_id"],
             comment_id=comment_id,
             buttons=dm_buttons,
         )
@@ -1002,7 +1025,7 @@ async def _send_rule_reply(
             "recipient_ig_id": recipient_id,
             "message_sent": reply,
             "trigger_type": trigger_type,
-            "status": "sent" if result["success"] else "failed",
+            **dm_log_fields(result),
             "sent_at": datetime.now(timezone.utc),
         }
     )
@@ -1102,7 +1125,7 @@ async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) ->
                     deduped_events += 1
                     continue
                 try:
-                    await handle_change_event(db, ig_id, change)
+                    await handle_change_event(db, ig_id, {**change, "_entry_time": entry.get("time")})
                     processed_events += 1
                 except Exception:
                     logger.exception("Failed to process change event in webhook: ig_id=%s", ig_id)
@@ -1175,6 +1198,8 @@ async def simulate_webhook(data: WebhookSimulateRequest, db=Depends(get_db)):
 
 @router.get("/dev/sample-payload")
 async def sample_payloads():
+    # Current timestamps so simulated DMs fall inside Meta's 24h messaging window.
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     return {
         "dm_keyword": {
             "entry": [
@@ -1184,7 +1209,7 @@ async def sample_payloads():
                         {
                             "sender": {"id": "<customer_ig_id>"},
                             "message": {"mid": "m_1", "text": "link bhejo"},
-                            "timestamp": 1710000000,
+                            "timestamp": now_ms,
                         }
                     ],
                 }
@@ -1215,7 +1240,7 @@ async def sample_payloads():
                         {
                             "sender": {"id": "<customer_ig_id>"},
                             "message": {"mid": "m_2", "text": "interested", "is_story_reply": True},
-                            "timestamp": 1710000001,
+                            "timestamp": now_ms + 1,
                         }
                     ],
                 }
@@ -1234,21 +1259,56 @@ async def handle_messaging_event(db, ig_account_id: str, messaging: dict):
         or (message_obj.get("quick_reply") or {}).get("payload")
     )
 
-    if has_content:
-        await handle_dm_event(db, ig_account_id, messaging)
+    sender_id = str((messaging.get("sender") or {}).get("id") or "")
+    if message_obj.get("is_echo") or not sender_id or sender_id == str(ig_account_id):
+        return
 
-    if _is_story_reply(messaging):
-        await handle_story_reply_event(db, ig_account_id, messaging)
+    user = await _find_user_for_ig_account(db, ig_account_id)
+    if not user:
+        return
+    user_id = str(user["_id"])
+    now = datetime.now(timezone.utc)
+    # An inbound message opens Meta's 24h messaging window for this person.
+    inbound_at = min(parse_event_time(messaging.get("timestamp")) or now, now)
+    await record_inbound(db, user_id, sender_id, inbound_at)
+
+    inbound_text = (
+        postback_obj.get("payload")
+        or (message_obj.get("quick_reply") or {}).get("payload")
+        or message_obj.get("text")
+        or postback_obj.get("title")
+        or ""
+    )
+    if is_opt_out_message(inbound_text):
+        await mark_opted_out(db, user_id, sender_id, inbound_at)
+        logger.info("Contact %s opted out of automation for user %s", sender_id, user_id)
+        return
+
+    contact = await db.contacts.find_one({"user_id": user_id, "ig_user_id": sender_id})
+    if contact and contact.get("opted_out"):
+        logger.info("Skipping automation for opted-out contact %s", sender_id)
+        return
+
+    with event_context(user_id=user_id, sender_id=sender_id, inbound_at=inbound_at):
+        if has_content:
+            await handle_dm_event(db, ig_account_id, messaging)
+
+        if _is_story_reply(messaging):
+            await handle_story_reply_event(db, ig_account_id, messaging)
 
 
 async def handle_change_event(db, ig_account_id: str, change: dict):
     field = str(change.get("field") or "")
     value = change.get("value") or {}
+    # Comment time for the 7-day private reply rule: the comment's own time, else the webhook entry time.
+    created_at = parse_event_time(value.get("created_time")) or parse_event_time(change.get("_entry_time"))
+    comment_id = str(value.get("comment_id") or value.get("id") or "").strip() or None
 
-    if field == "comments":
-        await handle_comment_event(db, ig_account_id, value)
-    elif field == "mentions":
-        await handle_story_mention_event(db, ig_account_id, value)
+    with event_context(comment_id=comment_id, comment_created_at=created_at):
+        if field == "comments":
+            await handle_comment_event(db, ig_account_id, value)
+        elif field == "mentions":
+            await handle_story_mention_event(db, ig_account_id, value)
 
 
 async def handle_dm_event(db, ig_account_id: str, messaging: dict):
@@ -1363,11 +1423,11 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
                 reminder_msg = _build_follow_not_followed_reminder(user)
                 reminder_msg = _apply_plan_footer(reminder_msg, user_plan)
                 follow_buttons = _build_follow_buttons(user)
-                prompt_res = await InstagramService.send_dm(
-                    access_token=user["instagram_access_token"],
+                prompt_res = await send_dm_with_policy(
+                    db,
+                    user,
                     recipient_ig_id=sender_id,
                     message=reminder_msg,
-                    ig_user_id=user["instagram_user_id"],
                     buttons=follow_buttons,
                 )
                 await db.dm_logs.insert_one(
@@ -1377,7 +1437,7 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
                         "recipient_ig_id": sender_id,
                         "message_sent": reminder_msg,
                         "trigger_type": "follow_gate_reminder",
-                        "status": "sent" if prompt_res.get("success") else "failed",
+                        **dm_log_fields(prompt_res),
                         "sent_at": now,
                     }
                 )
@@ -1478,11 +1538,11 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
                     if success_msg:
                         formatted_success = success_msg.replace("{{email}}", captured_email).replace("{email}", captured_email)
                         formatted_success = _apply_plan_footer(formatted_success, user_plan)
-                        await InstagramService.send_dm(
-                            access_token=user["instagram_access_token"],
+                        await send_dm_with_policy(
+                            db,
+                            user,
                             recipient_ig_id=sender_id,
                             message=formatted_success,
-                            ig_user_id=user["instagram_user_id"],
                         )
                     pending_trigger_raw = str(contact.get("email_capture_trigger_type") or TriggerType.COMMENT.value)
                     pending_trigger = TriggerType(pending_trigger_raw) if pending_trigger_raw in {t.value for t in TriggerType} else TriggerType.COMMENT
@@ -1499,11 +1559,11 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         else:
             retry_msg = "Please reply with a valid email address (e.g. name@example.com) to receive your link! 📩"
             retry_msg = _apply_plan_footer(retry_msg, user_plan)
-            await InstagramService.send_dm(
-                access_token=user["instagram_access_token"],
+            await send_dm_with_policy(
+                db,
+                user,
                 recipient_ig_id=sender_id,
                 message=retry_msg,
-                ig_user_id=user["instagram_user_id"],
             )
             return
 
@@ -1541,11 +1601,11 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
                     if success_msg:
                         formatted_success = success_msg.replace("{{phone}}", captured_phone).replace("{phone}", captured_phone)
                         formatted_success = _apply_plan_footer(formatted_success, user_plan)
-                        await InstagramService.send_dm(
-                            access_token=user["instagram_access_token"],
+                        await send_dm_with_policy(
+                            db,
+                            user,
                             recipient_ig_id=sender_id,
                             message=formatted_success,
-                            ig_user_id=user["instagram_user_id"],
                         )
                     pending_trigger_raw = str(contact.get("phone_capture_trigger_type") or TriggerType.COMMENT.value)
                     pending_trigger = TriggerType(pending_trigger_raw) if pending_trigger_raw in {t.value for t in TriggerType} else TriggerType.COMMENT
@@ -1563,11 +1623,11 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         else:
             retry_msg = "Please reply with a valid phone or WhatsApp number to receive your details! 📱"
             retry_msg = _apply_plan_footer(retry_msg, user_plan)
-            await InstagramService.send_dm(
-                access_token=user["instagram_access_token"],
+            await send_dm_with_policy(
+                db,
+                user,
                 recipient_ig_id=sender_id,
                 message=retry_msg,
-                ig_user_id=user["instagram_user_id"],
             )
             return
 
@@ -1681,7 +1741,11 @@ async def handle_story_mention_event(db, ig_account_id: str, value: dict):
     target_rule = rules[0]
     matched_kw = (target_rule.get("keywords") or ["story_mention"])[0]
     await db.automation_rules.update_one({"_id": target_rule["_id"]}, {"$inc": {"triggers_count": 1}})
-    await _send_rule_reply(db, user, sender_id, target_rule, TriggerType.STORY_MENTION, matched_keyword=matched_kw)
+    mention_comment_id = str(value.get("comment_id") or "").strip() or None
+    await _send_rule_reply(
+        db, user, sender_id, target_rule, TriggerType.STORY_MENTION,
+        matched_keyword=matched_kw, comment_id=mention_comment_id,
+    )
 
 async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
     sender_id = (messaging.get("sender") or {}).get("id")
@@ -1757,6 +1821,12 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
 
     user = await _find_user_for_ig_account(db, ig_account_id)
     if not user:
+        return
+
+    commenter_contact = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": commenter_id})
+    if commenter_contact and commenter_contact.get("opted_out"):
+        # Opted out: no private reply and no public comment reply.
+        logger.info("Skipping comment automation for opted-out contact %s", commenter_id)
         return
 
     our_account_ids = {str(ig_account_id)}
