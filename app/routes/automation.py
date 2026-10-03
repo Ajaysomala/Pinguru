@@ -1,3 +1,4 @@
+import hashlib
 import re
 from datetime import datetime, timezone
 
@@ -13,6 +14,7 @@ from app.models.models import (
     get_plan_type,
 )
 from app.routes.auth import get_current_user
+from app.services.instagram import InstagramService
 from bson import ObjectId
 
 router = APIRouter()
@@ -92,6 +94,25 @@ def _sanitize_attachment_url(value: str | None) -> str | None:
     return text
 
 
+ATTACHMENT_ALLOWED_TRIGGERS = {
+    TriggerType.KEYWORD.value,
+    TriggerType.NEW_DM.value,
+    TriggerType.STORY_REPLY.value,
+    TriggerType.STORY_MENTION.value,
+    TriggerType.COMMENT.value,
+    TriggerType.POST_COMMENT.value,
+    TriggerType.REEL_COMMENT.value,
+}
+
+
+async def _validate_rule_attachment_url(url: str | None) -> None:
+    if not url:
+        return
+    is_valid, err_msg = await InstagramService.validate_attachment_url(url)
+    if not is_valid:
+        raise HTTPException(status_code=422, detail=err_msg or "Invalid attachment URL")
+
+
 def _require_comment_pro_features(user_plan: PlanType, enabled: bool, field_name: str) -> None:
     if enabled and user_plan != PlanType.Pro:
         raise HTTPException(status_code=403, detail=f"{field_name} is available on the Pro plan only")
@@ -150,6 +171,9 @@ def _serialize_rule(rule: dict) -> dict:
     serialized["comment_media_type"] = (rule.get("comment_media_type") or "").strip() or None
     serialized["dm_attachment_url"] = (rule.get("dm_attachment_url") or "").strip() or None
     serialized["dm_attachment_type"] = (rule.get("dm_attachment_type") or "").strip() or None
+    serialized["attachment_url_hash"] = rule.get("attachment_url_hash")
+    val_at = rule.get("attachment_validated_at")
+    serialized["attachment_validated_at"] = val_at.isoformat() if hasattr(val_at, "isoformat") else val_at
     serialized["any_comment_keyword"] = bool(rule.get("any_comment_keyword", True))
     serialized["public_comment_reply_enabled"] = bool(rule.get("public_comment_reply_enabled", False))
     serialized["public_comment_reply_template"] = (rule.get("public_comment_reply_template") or "").strip() or None
@@ -245,11 +269,16 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
     user_plan = get_plan_type(user.get("plan", PlanType.Free))
     plan_limits = get_plan_limits(user_plan)
     match_mode = _resolve_match_mode_for_plan(user_plan, data.match_mode)
+    hinglish_downgraded = (data.match_mode or "").strip().lower() == "hinglish" and user_plan != PlanType.Pro
     name, reply_message, keywords = _sanitize_and_validate_rule_payload(data)
     trigger_type = _normalize_trigger_type(data.trigger_type)
-    existing = await db.automation_rules.count_documents({"user_id": str(user["_id"])})
-    if plan_limits["rules"] is not None and existing >= plan_limits["rules"]:
-        raise HTTPException(status_code=403, detail=f"Rule limit reached. Upgrade your plan.")
+    total_rules_count = await db.automation_rules.count_documents({"user_id": str(user["_id"])})
+    if total_rules_count >= 50:
+        raise HTTPException(status_code=403, detail="Maximum limit of 50 total rules per account reached.")
+
+    active_rules_count = await db.automation_rules.count_documents({"user_id": str(user["_id"]), "is_active": True})
+    if plan_limits["rules"] is not None and active_rules_count >= plan_limits["rules"]:
+        raise HTTPException(status_code=403, detail="Rule limit reached. Upgrade your plan.")
 
     is_comment_rule = trigger_type in {TriggerType.COMMENT.value, TriggerType.POST_COMMENT.value, TriggerType.REEL_COMMENT.value}
     is_new_dm_rule = trigger_type == TriggerType.NEW_DM.value
@@ -261,8 +290,13 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
     comment_media_permalink = _optional_text(data.comment_media_permalink) if is_comment_rule else None
     comment_media_caption = _optional_text(data.comment_media_caption) if is_comment_rule else None
     comment_media_type = _optional_text(data.comment_media_type) if is_comment_rule else None
-    dm_attachment_url = _sanitize_attachment_url(data.dm_attachment_url) if is_comment_rule else None
-    dm_attachment_type = (data.dm_attachment_type or "").strip().lower() if is_comment_rule and data.dm_attachment_type else None
+
+    supports_attachment = trigger_type in ATTACHMENT_ALLOWED_TRIGGERS
+    dm_attachment_url = _sanitize_attachment_url(data.dm_attachment_url) if supports_attachment else None
+    dm_attachment_type = (data.dm_attachment_type or "").strip().lower() if supports_attachment and data.dm_attachment_type else None
+    if dm_attachment_url and not dm_attachment_type:
+        dm_attachment_type = "image"
+
     any_comment_keyword = bool(data.any_comment_keyword) if is_comment_rule and data.any_comment_keyword is not None else (True if is_comment_rule else False)
     public_comment_reply_enabled = bool(data.public_comment_reply_enabled) if is_comment_rule else False
 
@@ -314,7 +348,14 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
     if dm_attachment_type and dm_attachment_type not in {"image"}:
         raise HTTPException(status_code=422, detail="Only image attachments are supported for DM attachments")
 
+    attachment_url_hash = None
+    attachment_validated_at = None
     _require_comment_pro_features(user_plan, bool(dm_attachment_url), "DM image attachments")
+    if dm_attachment_url:
+        await _validate_rule_attachment_url(dm_attachment_url)
+        attachment_url_hash = hashlib.sha256(dm_attachment_url.encode("utf-8")).hexdigest()
+        attachment_validated_at = datetime.now(timezone.utc)
+
     _require_comment_pro_features(user_plan, public_comment_reply_enabled, "Public comment reply")
     _require_comment_starter_or_pro_features(user_plan, ask_follow_before_dm, "Follow-before-DM automation")
     _require_comment_starter_or_pro_features(user_plan, bool(dm_buttons), "Interactive DM buttons")
@@ -344,6 +385,8 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
         "comment_media_type": comment_media_type,
         "dm_attachment_url": dm_attachment_url,
         "dm_attachment_type": dm_attachment_type,
+        "attachment_url_hash": attachment_url_hash,
+        "attachment_validated_at": attachment_validated_at,
         "any_comment_keyword": any_comment_keyword,
         "public_comment_reply_enabled": public_comment_reply_enabled,
         "public_comment_reply_template": public_comment_reply_template,
@@ -370,7 +413,12 @@ async def create_rule(data: AutomationRuleCreate, db=Depends(get_db), user=Depen
     }
     result = await db.automation_rules.insert_one(rule_doc)
     rule_doc["_id"] = str(result.inserted_id)
-    return {"rule": _serialize_rule(rule_doc)}
+    resp = {"rule": _serialize_rule(rule_doc)}
+    if hinglish_downgraded:
+        warning_msg = "Hinglish keyword matching is available on the Pro plan only and has been downgraded to 'contains'."
+        resp["warning"] = warning_msg
+        resp["rule"]["warning"] = warning_msg
+    return resp
 
 
 @router.get("/rules")
@@ -390,6 +438,13 @@ async def toggle_rule(rule_id: str, db=Depends(get_db), user=Depends(get_current
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
     new_status = not rule["is_active"]
+    if new_status:
+        user_plan = get_plan_type(user.get("plan", PlanType.Free))
+        plan_limits = get_plan_limits(user_plan)
+        if plan_limits["rules"] is not None:
+            active_rules_count = await db.automation_rules.count_documents({"user_id": str(user["_id"]), "is_active": True})
+            if active_rules_count >= plan_limits["rules"]:
+                raise HTTPException(status_code=403, detail="Rule limit reached. Upgrade your plan or deactivate an existing rule.")
     await db.automation_rules.update_one(
         {"_id": rule_object_id, "user_id": str(user["_id"])},
         {"$set": {"is_active": new_status}},
@@ -402,8 +457,20 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
     if not ObjectId.is_valid(rule_id):
         raise HTTPException(status_code=400, detail="Invalid rule ID")
     rule_object_id = ObjectId(rule_id)
+    existing_rule = await db.automation_rules.find_one({"_id": rule_object_id, "user_id": str(user["_id"])})
+    if not existing_rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+
     user_plan = get_plan_type(user.get("plan", PlanType.Free))
     match_mode = _resolve_match_mode_for_plan(user_plan, data.match_mode)
+    hinglish_downgraded = (
+        user_plan != PlanType.Pro
+        and (
+            (data.match_mode or "").strip().lower() == "hinglish"
+            or existing_rule.get("match_mode") == "hinglish"
+        )
+    )
+
     name, reply_message, keywords = _sanitize_and_validate_rule_payload(data)
     trigger_type = _normalize_trigger_type(data.trigger_type)
     is_comment_rule = trigger_type in {TriggerType.COMMENT.value, TriggerType.POST_COMMENT.value, TriggerType.REEL_COMMENT.value}
@@ -416,13 +483,42 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
     comment_media_permalink = _optional_text(data.comment_media_permalink) if is_comment_rule else None
     comment_media_caption = _optional_text(data.comment_media_caption) if is_comment_rule else None
     comment_media_type = _optional_text(data.comment_media_type) if is_comment_rule else None
-    dm_attachment_url = _sanitize_attachment_url(data.dm_attachment_url) if is_comment_rule else None
-    dm_attachment_type = (data.dm_attachment_type or "").strip().lower() if is_comment_rule and data.dm_attachment_type else None
+
+    supports_attachment = trigger_type in ATTACHMENT_ALLOWED_TRIGGERS
+    dm_attachment_url = _sanitize_attachment_url(data.dm_attachment_url) if supports_attachment else None
+    dm_attachment_type = (data.dm_attachment_type or "").strip().lower() if supports_attachment and data.dm_attachment_type else None
+    if dm_attachment_url and not dm_attachment_type:
+        dm_attachment_type = "image"
+
     any_comment_keyword = bool(data.any_comment_keyword) if is_comment_rule and data.any_comment_keyword is not None else (True if is_comment_rule else False)
     public_comment_reply_enabled = bool(data.public_comment_reply_enabled) if is_comment_rule else False
-
     comment_templates = _sanitize_comment_templates(data.public_comment_reply_templates, data.public_comment_reply_template) if is_comment_rule else []
     public_comment_reply_template = comment_templates[0] if comment_templates else None
+
+    # On downgrade: strip Pro features rather than blocking PUT edits
+    attachment_url_hash = None
+    attachment_validated_at = None
+    if user_plan != PlanType.Pro:
+        dm_attachment_url = None
+        dm_attachment_type = None
+        public_comment_reply_enabled = False
+        public_comment_reply_template = None
+        comment_templates = []
+    else:
+        if dm_attachment_url:
+            current_hash = hashlib.sha256(dm_attachment_url.encode("utf-8")).hexdigest()
+            if (
+                existing_rule.get("attachment_url_hash") == current_hash
+                and existing_rule.get("attachment_validated_at")
+            ):
+                attachment_url_hash = current_hash
+                attachment_validated_at = existing_rule.get("attachment_validated_at")
+            else:
+                await _validate_rule_attachment_url(dm_attachment_url)
+                attachment_url_hash = current_hash
+                attachment_validated_at = datetime.now(timezone.utc)
+        if is_comment_rule and public_comment_reply_enabled and not comment_templates:
+            raise HTTPException(status_code=422, detail="public_comment_reply_template is required when public_comment_reply_enabled is true")
 
     dm_buttons = _sanitize_dm_buttons(data.dm_buttons)
 
@@ -469,8 +565,6 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
     if dm_attachment_type and dm_attachment_type not in {"image"}:
         raise HTTPException(status_code=422, detail="Only image attachments are supported for DM attachments")
 
-    _require_comment_pro_features(user_plan, bool(dm_attachment_url), "DM image attachments")
-    _require_comment_pro_features(user_plan, public_comment_reply_enabled, "Public comment reply")
     _require_comment_starter_or_pro_features(user_plan, ask_follow_before_dm, "Follow-before-DM automation")
     _require_comment_starter_or_pro_features(user_plan, bool(dm_buttons), "Interactive DM buttons")
     _reject_follow_up_feature(bool(data.send_follow_up_message))
@@ -481,10 +575,7 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
     if is_new_dm_rule:
         keywords = []
 
-    if is_comment_rule and public_comment_reply_enabled and not comment_templates:
-        raise HTTPException(status_code=422, detail="public_comment_reply_template is required when public_comment_reply_enabled is true")
-
-    result = await db.automation_rules.update_one(
+    await db.automation_rules.update_one(
         {"_id": rule_object_id, "user_id": str(user["_id"])},
         {"$set": {
             "name": name,
@@ -500,6 +591,8 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
             "comment_media_type": comment_media_type,
             "dm_attachment_url": dm_attachment_url,
             "dm_attachment_type": dm_attachment_type,
+            "attachment_url_hash": attachment_url_hash,
+            "attachment_validated_at": attachment_validated_at,
             "any_comment_keyword": any_comment_keyword,
             "public_comment_reply_enabled": public_comment_reply_enabled,
             "public_comment_reply_template": public_comment_reply_template,
@@ -518,13 +611,16 @@ async def update_rule(rule_id: str, data: AutomationRuleCreate, db=Depends(get_d
             "send_follow_up_message": send_follow_up_message,
         }}
     )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Rule not found")
     updated_rule = await db.automation_rules.find_one({"_id": rule_object_id, "user_id": str(user["_id"])})
     if not updated_rule:
         raise HTTPException(status_code=404, detail="Rule not found")
     updated_rule["_id"] = str(updated_rule["_id"])
-    return {"updated": True, "rule": _serialize_rule(updated_rule)}
+    resp = {"updated": True, "rule": _serialize_rule(updated_rule)}
+    if hinglish_downgraded:
+        warning_msg = "Hinglish keyword matching is available on the Pro plan only and has been downgraded to 'contains'."
+        resp["warning"] = warning_msg
+        resp["rule"]["warning"] = warning_msg
+    return resp
 
 
 @router.delete("/rules/{rule_id}")

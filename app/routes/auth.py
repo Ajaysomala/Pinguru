@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
 from urllib.parse import quote, urlencode, urlparse
+import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import logging
 logger = logging.getLogger(__name__)
@@ -85,14 +87,26 @@ def hash_password(pw: str) -> str:
     return pwd_ctx.hash(pw)
 
 
+_DUMMY_HASH = "$2b$12$e80yVjJ8.VbI8hN8PuhN0.0XU6E.C1L.7lY0w/aR7s2wR1m6B8y1."
+
+
 def verify_password(pw: str, hashed: str) -> bool:
     return pwd_ctx.verify(pw, hashed)
 
 
 def create_jwt(user_id: str, session_version: int = 0) -> str:
-    expire = _utcnow() + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
-    payload = {"sub": user_id, "exp": expire, "sv": int(session_version)}
+    now = _utcnow()
+    expire = now + timedelta(minutes=settings.JWT_EXPIRE_MINUTES)
+    payload = {
+        "sub": user_id,
+        "exp": expire,
+        "iat": int(now.timestamp()),
+        "jti": secrets.token_hex(16),
+        "typ": "session",
+        "sv": int(session_version),
+    }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
 
 
 def _session_version(user_doc: dict[str, Any]) -> int:
@@ -136,6 +150,55 @@ def _cookie_cleanup_domains() -> list[str | None]:
     return [None, *sorted(domains)]
 
 
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "127.0.0.1"
+
+
+async def _is_login_locked_for_email_ip(db, email: str, ip: str) -> bool:
+    lockout_key = f"{email}:{ip}"
+    record = await db.login_lockouts.find_one({"_id": lockout_key})
+    if not record:
+        return False
+    locked_until = _as_aware_utc(record.get("locked_until"))
+    return bool(locked_until and _utcnow() < locked_until)
+
+
+async def _record_failed_login_attempt(db, email: str, ip: str, user: dict[str, Any] | None = None) -> None:
+    now = _utcnow()
+    lockout_key = f"{email}:{ip}"
+    record = await db.login_lockouts.find_one({"_id": lockout_key})
+    attempts = int((record or {}).get("failed_attempts", 0) or 0) + 1
+    update: dict[str, Any] = {
+        "email": email,
+        "ip": ip,
+        "failed_attempts": attempts,
+        "last_attempt_at": now,
+    }
+    if attempts >= 5:
+        update["locked_until"] = now + timedelta(minutes=15)
+
+    await db.login_lockouts.update_one(
+        {"_id": lockout_key},
+        {"$set": update},
+        upsert=True,
+    )
+    if user:
+        await db.users.update_one({"_id": user["_id"]}, {"$set": {"failed_login_attempts": attempts}})
+
+
+async def _clear_login_lockout(db, email: str, ip: str, user: dict[str, Any] | None = None) -> None:
+    lockout_key = f"{email}:{ip}"
+    await db.login_lockouts.delete_one({"_id": lockout_key})
+    if user:
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"failed_login_attempts": 0, "login_lockout_until": None}},
+        )
+
+
 def _login_lockout_until(user_doc: dict[str, Any]) -> datetime | None:
     return _as_aware_utc(user_doc.get("login_lockout_until"))
 
@@ -143,6 +206,7 @@ def _login_lockout_until(user_doc: dict[str, Any]) -> datetime | None:
 def _is_login_locked(user_doc: dict[str, Any]) -> bool:
     locked_until = _login_lockout_until(user_doc)
     return bool(locked_until and _utcnow() < locked_until)
+
 
 
 def _set_auth_cookie(response: Response, token: str) -> None:
@@ -348,9 +412,15 @@ async def get_current_user(request: Request, db=Depends(get_db)):
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token payload")
 
+        if payload.get("typ") != "session":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+
         user = await db.users.find_one({"_id": ObjectId(user_id)})
+
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
+        if not user.get("is_active", True):
+            raise HTTPException(status_code=401, detail="Account has been deactivated")
         token_session_version = int(payload.get("sv") or 0)
         if token_session_version != _session_version(user):
             raise HTTPException(status_code=401, detail="Session expired")
@@ -370,6 +440,62 @@ async def register(request: Request, data: UserCreate, db=Depends(get_db)):
     existing = await db.users.find_one({"email": email})
 
     if existing:
+        if not existing.get("email_verified", False):
+            now = _utcnow()
+            # Per-email limit (3/hour) on re-register
+            raw_attempts = existing.get("reregister_timestamps", [])
+            valid_attempts = [
+                _as_aware_utc(t) for t in raw_attempts
+                if _as_aware_utc(t) and (now - _as_aware_utc(t)).total_seconds() < 3600
+            ]
+            if len(valid_attempts) >= 3:
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many registration attempts for this email. Please try again later.",
+                )
+
+            valid_attempts.append(now)
+            otp = generate_otp()
+            otp_expires = now + timedelta(minutes=5)
+            unverified_expires = now + timedelta(hours=24)
+
+            update_data: dict[str, Any] = {
+                "hashed_password": hash_password(data.password),
+                "otp_hash": hash_otp(otp),
+                "otp_expires_at": otp_expires,
+                "otp_attempts": 0,
+                "unverified_expires_at": unverified_expires,
+                "reregister_timestamps": valid_attempts,
+                "reregister_count": len(valid_attempts),
+                "reregister_window_started_at": valid_attempts[0],
+            }
+            if data.first_name:
+                update_data["first_name"] = _normalize_text(data.first_name, 80)
+            if data.last_name:
+                update_data["last_name"] = _normalize_text(data.last_name, 80)
+            if data.business_category:
+                update_data["business_category"] = _normalize_text(data.business_category, 100)
+            if data.instagram_username:
+                update_data["instagram_username"] = _normalize_text(data.instagram_username, 100)
+            display_name = _build_display_name(
+                update_data.get("first_name", existing.get("first_name")),
+                update_data.get("last_name", existing.get("last_name")),
+            )
+            if display_name:
+                update_data["display_name"] = display_name
+
+            await db.users.update_one({"_id": existing["_id"]}, {"$set": update_data})
+
+            otp_sent = await send_otp_email(email, otp)
+            if not otp_sent:
+                raise HTTPException(status_code=503, detail="Failed to send OTP email. Try again in a moment.")
+
+            return {
+                "message": "Verification code resent to your email.",
+                "email": email,
+                "otp_expires_in_seconds": 300,
+            }
+
         raise HTTPException(status_code=400, detail="Unable to create account. Please try again.")
 
     otp = generate_otp()
@@ -389,6 +515,7 @@ async def register(request: Request, data: UserCreate, db=Depends(get_db)):
         "dm_count_this_month": 0,
         "is_active": True,
         "email_verified": False,
+        "unverified_expires_at": _utcnow() + timedelta(hours=24),
         "otp_hash": hash_otp(otp),
         "otp_expires_at": otp_expires,
         "otp_attempts": 0,
@@ -425,25 +552,18 @@ async def verify_email(request: Request, data: OTPVerifyRequest, db=Depends(get_
     email = str(data.email).strip().lower()
     otp = data.otp.strip()
 
-    if len(otp) != 6 or not otp.isdigit():
-        raise HTTPException(status_code=400, detail="OTP must be a 6-digit code")
-
     user = await db.users.find_one({"email": email})
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        pwd_ctx.verify("dummy_password", _DUMMY_HASH)
+        raise HTTPException(status_code=404, detail="Invalid request")
 
     if user.get("email_verified"):
-        token = create_jwt(str(user["_id"]), _session_version(user))
-        response = Response(
-            json.dumps({
-                "message": "Already verified",
-                "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
-                "instagram_connected": bool(user.get("instagram_user_id")),
-            }),
-            media_type="application/json",
-        )
-        _set_auth_cookie(response, token)
-        return response
+        return {"message": "Already verified"}
+
+
+
+    if len(otp) != 6 or not otp.isdigit():
+        raise HTTPException(status_code=400, detail="OTP must be a 6-digit code")
 
     if int(user.get("otp_attempts", 0)) >= 3:
         raise HTTPException(status_code=429, detail="Too many invalid attempts. Request a new code.")
@@ -469,7 +589,10 @@ async def verify_email(request: Request, data: OTPVerifyRequest, db=Depends(get_
                 "otp_resend_window_started_at": None,
                 "failed_login_attempts": 0,
                 "login_lockout_until": None,
-            }
+            },
+            "$unset": {
+                "unverified_expires_at": "",
+            },
         },
     )
 
@@ -493,10 +616,12 @@ async def resend_otp(request: Request, data: OTPResendRequest, db=Depends(get_db
     user = await db.users.find_one({"email": email})
 
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        pwd_ctx.verify("dummy_password", _DUMMY_HASH)
+        raise HTTPException(status_code=404, detail="Invalid request")
 
     if user.get("email_verified"):
         return {"message": "Already verified"}
+
 
     now = _utcnow()
     window_start = _as_aware_utc(user.get("otp_resend_window_started_at"))
@@ -540,18 +665,30 @@ async def forgot_password_request(request: Request, data: ForgotPasswordRequest,
 
     response: dict[str, Any] = {"message": "If an account exists, a password reset link has been sent."}
     if not user:
+        pwd_ctx.verify("dummy_password", _DUMMY_HASH)
         return response
 
     reset_token = _create_password_reset_token(email)
+    token_hash = hashlib.sha256(reset_token.encode("utf-8")).hexdigest()
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "password_reset_token_hash": token_hash,
+                "password_reset_token_used": False,
+            }
+        },
+    )
+
     reset_url = f"{_password_reset_frontend_base()}/forgot-password?email={quote(email)}&token={quote(reset_token)}"
+
+    if str(getattr(settings, "ENVIRONMENT", "")).strip().lower() == "development":
+        print(f"[DEVELOPMENT ONLY] Password reset for {email}: reset_token={reset_token} reset_url={reset_url}")
+        logger.info(f"[DEVELOPMENT ONLY] Password reset for {email}: reset_token={reset_token} reset_url={reset_url}")
 
     email_sent = await send_password_reset_email(email, reset_url)
     if not email_sent:
         raise HTTPException(status_code=503, detail="Password reset email is temporarily unavailable")
-
-    if settings.ENVIRONMENT.lower() != "production":
-        response["reset_token"] = reset_token
-        response["reset_url"] = reset_url
 
     return response
 
@@ -566,11 +703,20 @@ async def forgot_password_reset(request: Request, data: ResetPasswordRequest, db
     payload = _decode_password_reset_token(data.reset_token)
     token_email = str(payload.get("sub") or "").strip().lower()
     if token_email != email:
-        raise HTTPException(status_code=401, detail="Invalid reset token")
+        raise HTTPException(status_code=400, detail="Invalid reset token")
 
     user = await db.users.find_one({"email": email})
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+        pwd_ctx.verify("dummy_password", _DUMMY_HASH)
+        raise HTTPException(status_code=404, detail="Invalid request")
+
+    # Single-use check: verify hash matches and used is False
+    stored_hash = user.get("password_reset_token_hash")
+    token_used = user.get("password_reset_token_used", False)
+    incoming_hash = hashlib.sha256(data.reset_token.encode("utf-8")).hexdigest()
+
+    if token_used or not stored_hash or not hmac.compare_digest(stored_hash, incoming_hash):
+        raise HTTPException(status_code=400, detail="Password reset link is invalid or has already been used.")
 
     await db.users.update_one(
         {"_id": user["_id"]},
@@ -580,11 +726,16 @@ async def forgot_password_reset(request: Request, data: ResetPasswordRequest, db
                 "failed_login_attempts": 0,
                 "login_lockout_until": None,
                 "session_version": _session_version(user) + 1,
-            }
+                "password_reset_token_used": True,
+            },
+            "$unset": {
+                "password_reset_token_hash": "",
+            },
         },
     )
 
     return {"message": "Password updated successfully. You can now sign in."}
+
 
 
 # ── Login / Session ───────────────────────────────────────────────────────────
@@ -593,27 +744,33 @@ async def forgot_password_reset(request: Request, data: ResetPasswordRequest, db
 @limiter.limit("10/minute")
 async def login(request: Request, data: UserLoginRequest, db=Depends(get_db)):
     email = str(data.email).strip().lower()
+    client_ip = _client_ip(request)
+
     user = await db.users.find_one({"email": email})
 
-    if user and _is_login_locked(user):
+    if user and not user.get("is_active", True):
+        raise HTTPException(status_code=403, detail="Account has been deactivated.")
+
+    if user and str(user.get("oauth_provider") or "").lower() == "google":
+        raise HTTPException(
+            status_code=400,
+            detail="This account was registered using Google Sign-In. Please sign in with Google.",
+        )
+
+    # Key lockout on (email + IP)
+    if await _is_login_locked_for_email_ip(db, email, client_ip):
         raise HTTPException(status_code=429, detail="Too many login attempts. Try again later.")
 
     if not user or not verify_password(data.password, user["hashed_password"]):
-        if user:
-            failed_login_attempts = int(user.get("failed_login_attempts", 0) or 0) + 1
-            update: dict[str, Any] = {"failed_login_attempts": failed_login_attempts}
-            if failed_login_attempts >= 5:
-                update["login_lockout_until"] = _utcnow() + timedelta(minutes=15)
-            await db.users.update_one({"_id": user["_id"]}, {"$set": update})
+        if not user:
+            pwd_ctx.verify(data.password or "dummy", _DUMMY_HASH)
+        await _record_failed_login_attempt(db, email, client_ip, user=user)
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     if not user.get("email_verified", False):
         raise HTTPException(status_code=403, detail="Email not verified. Check your inbox for OTP.")
 
-    await db.users.update_one(
-        {"_id": user["_id"]},
-        {"$set": {"failed_login_attempts": 0, "login_lockout_until": None}},
-    )
+    await _clear_login_lockout(db, email, client_ip, user=user)
 
     token = create_jwt(str(user["_id"]), _session_version(user))
     response_data = {
@@ -625,6 +782,7 @@ async def login(request: Request, data: UserLoginRequest, db=Depends(get_db)):
     return response
 
 
+
 @router.get("/me")
 @limiter.limit("60/minute")
 async def me(request: Request, user=Depends(get_current_user), db: Any = Depends(get_db)):
@@ -633,35 +791,22 @@ async def me(request: Request, user=Depends(get_current_user), db: Any = Depends
     full_name = " ".join(part for part in [first_name, last_name] if part)
     instagram_username = str(user.get("instagram_username") or "").strip()
 
-    if user.get("instagram_access_token") and user.get("instagram_user_id"):
-        account_ids = user.get("instagram_account_ids") or []
-        user_ig_id = str(user.get("instagram_user_id") or "")
-        needs_profile_sync = not instagram_username or len(user_ig_id) > 20 or len(account_ids) <= 1
-        if needs_profile_sync:
-            try:
-                profile = await InstagramService.get_user_profile(str(user.get("instagram_access_token") or ""))
-                ig_username = str(profile.get("username") or "").strip()
-                meta_biz_id = str(profile.get("user_id") or "").strip()
-                update_fields = {}
-                if ig_username and not instagram_username:
-                    instagram_username = ig_username
-                    update_fields["instagram_username"] = ig_username
-                if meta_biz_id and meta_biz_id not in account_ids:
-                    update_fields["instagram_user_id"] = meta_biz_id
-                    await db.users.update_one(
-                        {"_id": user["_id"]},
-                        {
-                            "$set": update_fields,
-                            "$addToSet": {"instagram_account_ids": meta_biz_id},
-                        },
-                    )
-                elif update_fields:
-                    await db.users.update_one(
-                        {"_id": user["_id"]},
-                        {"$set": update_fields},
-                    )
-            except Exception:
-                instagram_username = str(user.get("instagram_username") or "").strip()
+    connection_status = user.get("ig_connection_status")
+    if not connection_status and user.get("instagram_user_id"):
+        expires_at = user.get("ig_token_expires_at")
+        if expires_at:
+            if isinstance(expires_at, str):
+                try:
+                    expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                except Exception:
+                    expires_at = None
+            if isinstance(expires_at, datetime):
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if expires_at <= datetime.now(timezone.utc):
+                    connection_status = "expired"
+        if not connection_status:
+            connection_status = "active"
 
     return {
         "id": str(user["_id"]),
@@ -676,14 +821,39 @@ async def me(request: Request, user=Depends(get_current_user), db: Any = Depends
         "instagram_user_id": user.get("instagram_user_id", ""),
         "instagram_username": instagram_username,
         "email_verified": bool(user.get("email_verified", False)),
+        "ig_connection_status": connection_status,
+        "ig_connected_at": user.get("ig_connected_at"),
+        "ig_last_refreshed_at": user.get("ig_last_refreshed_at"),
+        "ig_profile_picture_url": user.get("ig_profile_picture_url"),
+        "ig_account_type": user.get("ig_account_type"),
+        "ig_followers_count": user.get("ig_followers_count"),
+        "webhook_subscribed": user.get("webhook_subscribed", False),
     }
 
 
 @router.post("/logout")
-async def logout():
+async def logout(request: Request, db=Depends(get_db)):
+    token = request.cookies.get("pg_token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+    if token:
+        try:
+            payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM], options={"verify_exp": False})
+            user_id = payload.get("sub")
+            if user_id:
+                await db.users.update_one(
+                    {"_id": ObjectId(user_id)},
+                    {"$inc": {"session_version": 1}},
+                )
+        except Exception:
+            pass
+
     response = Response(json.dumps({"message": "Logged out"}), media_type="application/json")
     _clear_auth_cookie(response)
     return response
+
 
 
 # ── Instagram OAuth ───────────────────────────────────────────────────────────
@@ -768,9 +938,31 @@ async def instagram_callback(
 
         await _ensure_unique_instagram_accounts(db, account_ids, user["_id"])
 
+        # 1. Verify granted scopes
+        granted_scopes = await InstagramService.get_granted_permissions(access_token)
+        logger.info("Instagram OAuth granted scopes for user %s: %s", user["_id"], granted_scopes)
+        if granted_scopes:
+            required_scopes = {"instagram_business_basic", "instagram_business_manage_messages"}
+            missing_scopes = required_scopes - set(granted_scopes)
+            if missing_scopes:
+                missing_str = ", ".join(sorted(missing_scopes))
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Missing required Instagram permissions: {missing_str}. Please reconnect and grant all permissions.",
+                )
+
+        # 2. Call POST graph.instagram.com/{ig_id}/subscribed_apps?subscribed_fields=messages,comments,messaging_postbacks (mentions if supported) and store webhook_subscribed
+        webhook_subscribed = await InstagramService.subscribe_app_to_webhooks(access_token, ig_user_id)
+        logger.info("Instagram webhook subscription for %s: %s", ig_user_id, webhook_subscribed)
+
         expires_in = token_data.get("expires_in", 5183944)
         expires_at = _utcnow() + timedelta(seconds=expires_in)
+        now = _utcnow()
         encrypted_access_token = InstagramService.encrypt_access_token(access_token)
+
+        profile_picture_url = profile.get("profile_picture_url")
+        account_type = profile.get("account_type")
+        followers_count = profile.get("followers_count")
 
         await db.users.update_one(
             {"_id": user["_id"]},
@@ -778,9 +970,18 @@ async def instagram_callback(
                 "$set": {
                     "instagram_user_id": ig_user_id,
                     "instagram_account_ids": account_ids,
+                    "meta_app_scoped_id": str(token_data.get("user_id") or "").strip() or None,
                     "instagram_username": ig_username,
                     "instagram_access_token": encrypted_access_token,
                     "ig_token_expires_at": expires_at,
+                    "ig_connection_status": "active",
+                    "ig_connected_at": now,
+                    "ig_last_refreshed_at": now,
+                    "ig_profile_picture_url": profile_picture_url,
+                    "ig_account_type": account_type,
+                    "ig_followers_count": followers_count,
+                    "webhook_subscribed": webhook_subscribed,
+                    "granted_scopes": granted_scopes,
                 }
             },
         )
@@ -863,6 +1064,12 @@ async def save_instagram_token(
     await _ensure_unique_instagram_accounts(db, [ig_user_id], update_filter["_id"])
 
     encrypted_access_token = InstagramService.encrypt_access_token(access_token)
+    now = _utcnow()
+    webhook_subscribed = await InstagramService.subscribe_app_to_webhooks(access_token, ig_user_id)
+    profile_picture_url = profile.get("profile_picture_url") if isinstance(profile, dict) else None
+    account_type = profile.get("account_type") if isinstance(profile, dict) else None
+    followers_count = profile.get("followers_count") if isinstance(profile, dict) else None
+
     result = await db.users.update_one(
         update_filter,
         {
@@ -871,6 +1078,13 @@ async def save_instagram_token(
                 "instagram_user_id": ig_user_id,
                 "instagram_account_ids": [ig_user_id],
                 "instagram_username": ig_username or None,
+                "ig_connection_status": "active",
+                "ig_connected_at": now,
+                "ig_last_refreshed_at": now,
+                "ig_profile_picture_url": profile_picture_url,
+                "ig_account_type": account_type,
+                "ig_followers_count": followers_count,
+                "webhook_subscribed": webhook_subscribed,
             }
         },
     )
@@ -925,10 +1139,7 @@ async def instagram_media(
             {"_id": user["_id"]},
             {
                 "$set": {
-                    "instagram_access_token": None,
-                    "instagram_user_id": None,
-                    "instagram_account_ids": [],
-                    "ig_token_expires_at": None,
+                    "ig_connection_status": "needs_reauth",
                 }
             },
         )
@@ -961,7 +1172,7 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
         if not user:
             user_doc = {
                 "email": email,
-                "hashed_password": hash_password(settings.DEFAULT_OAUTH_PASSWORD),
+                "hashed_password": hash_password(secrets.token_urlsafe(32)),
                 "plan": PlanType.Free.value,
                 "dm_limit": PLAN_LIMITS[PlanType.Free]["dm_limit"],
                 "dm_count_this_month": 0,
@@ -980,7 +1191,10 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
             user = await db.users.find_one({"_id": result.inserted_id})
 
         if not user.get("email_verified", False):
-            await db.users.update_one({"_id": user["_id"]}, {"$set": {"email_verified": True}})
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"email_verified": True}, "$unset": {"unverified_expires_at": ""}},
+            )
             user["email_verified"] = True
 
         token = create_jwt(str(user["_id"]), _session_version(user))
@@ -1071,6 +1285,14 @@ async def disconnect_instagram(
                 "instagram_access_token": None,
                 "ig_token_expires_at": None,
                 "instagram_username": None,
+                "ig_connection_status": None,
+                "ig_connected_at": None,
+                "ig_last_refreshed_at": None,
+                "ig_profile_picture_url": None,
+                "ig_account_type": None,
+                "ig_followers_count": None,
+                "webhook_subscribed": None,
+                "granted_scopes": [],
             }
         },
     )
@@ -1096,13 +1318,21 @@ async def refresh_instagram_token(
     result = await InstagramService.refresh_long_lived_token(encrypted_token)
     new_token = result.get("access_token")
     if not new_token:
+        error_obj = result.get("error") if isinstance(result.get("error"), dict) else {}
+        error_code = error_obj.get("code")
+        if error_code in (190, 102) or "token" in str(result).lower():
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"ig_connection_status": "needs_reauth"}},
+            )
         raise HTTPException(
             status_code=400,
             detail="Token refresh failed. Please reconnect your Instagram account.",
         )
 
     expires_in = int(result.get("expires_in") or 5183944)
-    expires_at = _utcnow() + timedelta(seconds=expires_in)
+    now = _utcnow()
+    expires_at = now + timedelta(seconds=expires_in)
     encrypted_new_token = InstagramService.encrypt_access_token(new_token)
 
     await db.users.update_one(
@@ -1111,6 +1341,8 @@ async def refresh_instagram_token(
             "$set": {
                 "instagram_access_token": encrypted_new_token,
                 "ig_token_expires_at": expires_at,
+                "ig_connection_status": "active",
+                "ig_last_refreshed_at": now,
             }
         },
     )
@@ -1122,7 +1354,96 @@ async def refresh_instagram_token(
     }
 
 
-# ── Data Deletion ──────────────────────────────────────────────────────────────
+# ── Data Deletion & Meta Callbacks ───────────────────────────────────────────
+
+def parse_meta_signed_request(signed_request: str) -> dict[str, Any]:
+    """Parse and verify a Meta/Facebook signed_request parameter using META_APP_SECRET."""
+    if not signed_request or "." not in signed_request:
+        raise HTTPException(status_code=400, detail="Invalid signed_request format")
+
+    parts = signed_request.split(".", 1)
+    if len(parts) != 2:
+        raise HTTPException(status_code=400, detail="Malformed signed_request")
+
+    encoded_sig, payload = parts
+
+    sig_padding = "=" * ((4 - len(encoded_sig) % 4) % 4)
+    try:
+        sig = base64.urlsafe_b64decode(encoded_sig + sig_padding)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid signature encoding in signed_request")
+
+    payload_padding = "=" * ((4 - len(payload) % 4) % 4)
+    try:
+        payload_bytes = base64.urlsafe_b64decode(payload + payload_padding)
+        data = json.loads(payload_bytes.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid payload JSON in signed_request")
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Payload must be a JSON object")
+
+    algo = str(data.get("algorithm") or "")
+    if algo != "HMAC-SHA256":
+        raise HTTPException(status_code=400, detail="Unsupported signature algorithm in signed_request")
+
+    expected_sig = hmac.new(
+        settings.META_APP_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+
+    if not hmac.compare_digest(sig, expected_sig):
+        raise HTTPException(status_code=400, detail="Invalid signed_request signature")
+
+    return data
+
+
+async def _extract_signed_request(request: Request) -> str | None:
+    # 1. Query parameter
+    sr = request.query_params.get("signed_request")
+    if sr:
+        return sr
+
+    # 2. Form data
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+        try:
+            form = await request.form()
+            if "signed_request" in form:
+                return str(form["signed_request"])
+        except Exception:
+            pass
+
+    # 3. JSON body
+    if "application/json" in content_type:
+        try:
+            json_body = await request.json()
+            if isinstance(json_body, dict) and "signed_request" in json_body:
+                return str(json_body["signed_request"])
+        except Exception:
+            pass
+
+    # 4. Fallback raw body inspection
+    try:
+        raw_body = await request.body()
+        raw_str = raw_body.decode("utf-8", errors="replace")
+        if "signed_request=" in raw_str:
+            from urllib.parse import parse_qs
+            parsed = parse_qs(raw_str)
+            if "signed_request" in parsed and parsed["signed_request"]:
+                return parsed["signed_request"][0]
+        try:
+            parsed_json = json.loads(raw_str)
+            if isinstance(parsed_json, dict) and "signed_request" in parsed_json:
+                return str(parsed_json["signed_request"])
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    return None
+
 
 @router.post("/data-deletion")
 async def request_data_deletion(
@@ -1131,16 +1452,49 @@ async def request_data_deletion(
     db=Depends(get_db),
 ):
     user_id_str = str(user["_id"])
+    now = _utcnow()
+
+    # 1. Automation rules
     await db.automation_rules.delete_many({"user_id": user_id_str})
+
+    # 2. DM logs
     await db.dm_logs.delete_many({"user_id": user_id_str})
+
+    # 3. Contacts
+    await db.contacts.delete_many({"user_id": user_id_str})
+
+    # 4. Webhook events (by user_id or by user's Instagram account IDs)
+    ig_ids = [str(x) for x in (user.get("instagram_account_ids") or []) if x]
+    if user.get("instagram_user_id"):
+        ig_ids.append(str(user.get("instagram_user_id")))
+    ig_ids = list(set(ig_ids))
+
+    webhook_queries: list[dict[str, Any]] = [{"user_id": user_id_str}]
+    for ig_id in ig_ids:
+        escaped_id = re.escape(ig_id)
+        webhook_queries.append({"_id": {"$regex": f"^(?:msg|chg):{escaped_id}:"}})
+    await db.webhook_events.delete_many({"$or": webhook_queries})
+
+    # 5. Deactivate user, clear tokens and personal details
     await db.users.update_one(
         {"_id": user["_id"]},
         {
             "$set": {
+                "is_active": False,
+                "deleted_at": now,
                 "instagram_user_id": None,
                 "instagram_account_ids": [],
                 "instagram_access_token": None,
                 "ig_token_expires_at": None,
+                "ig_connection_status": None,
+                "ig_connected_at": None,
+                "ig_last_refreshed_at": None,
+                "ig_profile_picture_url": None,
+                "ig_account_type": None,
+                "ig_followers_count": None,
+                "webhook_subscribed": None,
+                "granted_scopes": [],
+                "session_version": _session_version(user) + 1,
             },
             "$unset": {
                 "first_name": "",
@@ -1151,3 +1505,149 @@ async def request_data_deletion(
     )
     _clear_auth_cookie(response)
     return {"message": "Your data has been deleted. Account deactivated."}
+
+
+@router.post("/data-deletion-callback")
+@router.post("/meta/data-deletion")
+async def meta_data_deletion_callback(request: Request, db=Depends(get_db)):
+    signed_req = await _extract_signed_request(request)
+    if not signed_req:
+        raise HTTPException(status_code=400, detail="Missing signed_request parameter")
+
+    data = parse_meta_signed_request(signed_req)
+    meta_user_id = str(data.get("user_id") or "").strip()
+    now = _utcnow()
+    confirmation_code = secrets.token_hex(16)
+
+    matched_user = None
+    if meta_user_id:
+        matched_user = await db.users.find_one(
+            {
+                "$or": [
+                    {"instagram_user_id": meta_user_id},
+                    {"instagram_account_ids": meta_user_id},
+                    {"meta_app_scoped_id": meta_user_id},
+                    {"meta_user_id": meta_user_id},
+                    {"facebook_user_id": meta_user_id},
+                ]
+            }
+        )
+
+    if matched_user:
+        user_id_str = str(matched_user["_id"])
+        await db.automation_rules.delete_many({"user_id": user_id_str})
+        await db.dm_logs.delete_many({"user_id": user_id_str})
+        await db.contacts.delete_many({"user_id": user_id_str})
+
+        ig_ids = [str(x) for x in (matched_user.get("instagram_account_ids") or []) if x]
+        if matched_user.get("instagram_user_id"):
+            ig_ids.append(str(matched_user.get("instagram_user_id")))
+        ig_ids = list(set(ig_ids))
+
+        webhook_queries: list[dict[str, Any]] = [{"user_id": user_id_str}]
+        for ig_id in ig_ids:
+            escaped_id = re.escape(ig_id)
+            webhook_queries.append({"_id": {"$regex": f"^(?:msg|chg):{escaped_id}:"}})
+        await db.webhook_events.delete_many({"$or": webhook_queries})
+
+        await db.users.update_one(
+            {"_id": matched_user["_id"]},
+            {
+                "$set": {
+                    "is_active": False,
+                    "deleted_at": now,
+                    "data_deletion_confirmation_code": confirmation_code,
+                    "instagram_user_id": None,
+                    "instagram_account_ids": [],
+                    "instagram_access_token": None,
+                    "ig_token_expires_at": None,
+                    "ig_connection_status": None,
+                    "ig_connected_at": None,
+                    "ig_last_refreshed_at": None,
+                    "ig_profile_picture_url": None,
+                    "ig_account_type": None,
+                    "ig_followers_count": None,
+                    "webhook_subscribed": None,
+                    "granted_scopes": [],
+                    "session_version": _session_version(matched_user) + 1,
+                },
+                "$unset": {
+                    "first_name": "",
+                    "last_name": "",
+                    "business_category": "",
+                },
+            },
+        )
+
+    await db.data_deletion_requests.insert_one(
+        {
+            "confirmation_code": confirmation_code,
+            "meta_user_id": meta_user_id,
+            "user_id": str(matched_user["_id"]) if matched_user else None,
+            "status": "completed",
+            "requested_at": now,
+            "completed_at": now,
+        }
+    )
+
+    base_url = str(request.base_url).rstrip("/")
+    status_url = f"{base_url}/auth/data-deletion-status?code={confirmation_code}"
+    return {
+        "url": status_url,
+        "confirmation_code": confirmation_code,
+    }
+
+
+@router.get("/data-deletion-status")
+@router.get("/meta/data-deletion-status")
+async def meta_data_deletion_status(code: str = Query(...), db=Depends(get_db)):
+    req = await db.data_deletion_requests.find_one({"confirmation_code": code})
+    if not req:
+        raise HTTPException(status_code=404, detail="Data deletion request not found")
+
+    return {
+        "confirmation_code": code,
+        "status": req.get("status", "completed"),
+        "requested_at": req.get("requested_at").isoformat() if isinstance(req.get("requested_at"), datetime) else req.get("requested_at"),
+        "completed_at": req.get("completed_at").isoformat() if isinstance(req.get("completed_at"), datetime) else req.get("completed_at"),
+        "message": "Your data has been successfully deleted from PinGuru.",
+    }
+
+
+@router.post("/deauthorize")
+@router.post("/meta/deauthorize")
+async def meta_deauthorize_callback(request: Request, db=Depends(get_db)):
+    signed_req = await _extract_signed_request(request)
+    if not signed_req:
+        raise HTTPException(status_code=400, detail="Missing signed_request parameter")
+
+    data = parse_meta_signed_request(signed_req)
+    meta_user_id = str(data.get("user_id") or "").strip()
+
+    if meta_user_id:
+        user = await db.users.find_one(
+            {
+                "$or": [
+                    {"instagram_user_id": meta_user_id},
+                    {"instagram_account_ids": meta_user_id},
+                    {"meta_app_scoped_id": meta_user_id},
+                    {"meta_user_id": meta_user_id},
+                    {"facebook_user_id": meta_user_id},
+                ]
+            }
+        )
+        if user:
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {
+                    "$set": {
+                        "instagram_access_token": None,
+                        "ig_token_expires_at": None,
+                        "ig_connection_status": "expired",
+                        "webhook_subscribed": False,
+                    }
+                },
+            )
+            logger.info("Meta deauthorized for user %s (meta_user_id=%s)", user["_id"], meta_user_id)
+
+    return {"success": True}

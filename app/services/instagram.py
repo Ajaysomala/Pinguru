@@ -1,13 +1,25 @@
+import asyncio
+import ipaddress
+import logging
+import socket
+import urllib.parse
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from app.config import settings
-import logging
 
 logger = logging.getLogger(__name__)
 
 BASE_GRAPH_FB = f"https://graph.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSION}"  # for FB Login / admin
 BASE_GRAPH_IG = "https://graph.instagram.com"  # for IG Business Login — NO version in URL
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
+
+METADATA_IPS = {
+    "169.254.169.254",
+    "169.254.170.2",
+    "100.100.100.200",
+    "fd00:ec2::254",
+}
+CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 class InstagramTokenExpiredError(Exception):
     """Raised when Instagram Graph API returns error code 190 or 102 indicating expired or revoked token."""
@@ -95,7 +107,7 @@ class InstagramService:
             access_token = InstagramService.decrypt_access_token(access_token)
         except (InvalidToken, ValueError) as exc:
             logger.error("Failed to decrypt access token in send_dm: %s", exc)
-            return {"success": False, "error": "Invalid or corrupted access token", "status_code": 401}
+            return {"success": False, "error": "Invalid or corrupted access token", "status_code": 401, "error_code": 190}
         endpoint_id = ig_user_id or "me"
         url = f"{BASE_GRAPH_IG}/{endpoint_id}/messages"
         recipient_payload = {"comment_id": comment_id} if comment_id else {"id": recipient_ig_id}
@@ -168,7 +180,13 @@ class InstagramService:
                     comment_id=comment_id,
                     buttons=None,
                 )
-            return {"success": False, "error": data.get("error", {}).get("message", "Instagram API request failed"), "status_code": resp.status_code}
+            error_obj = data.get("error") or {}
+            return {
+                "success": False,
+                "error": error_obj.get("message", "Instagram API request failed"),
+                "status_code": resp.status_code,
+                "error_code": error_obj.get("code"),
+            }
         return {"success": True, "data": data}
 
     @staticmethod
@@ -209,13 +227,23 @@ class InstagramService:
             return {}
         url = f"{BASE_GRAPH_IG}/me"
         params = {
-            "fields": "id,name,username,user_id",
+            "fields": "id,name,username,user_id,profile_picture_url,account_type,followers_count",
             "access_token": access_token,
         }
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
                 resp = await client.get(url, params=params)
-            return resp.json()
+                if resp.status_code == 200:
+                    return resp.json() or {}
+                # Fallback to basic fields if extended fields are unsupported on this node
+                logger.info("Extended profile fetch returned %s, falling back to basic fields", resp.status_code)
+                fallback_resp = await client.get(url, params={
+                    "fields": "id,name,username,user_id",
+                    "access_token": access_token,
+                })
+                if fallback_resp.status_code == 200:
+                    return fallback_resp.json() or {}
+                return {}
         except httpx.RequestError:
             logger.exception("Instagram profile fetch failed")
             return {}
@@ -332,7 +360,7 @@ class InstagramService:
                     payload = {}
                 error_obj = payload.get("error") or {}
                 error_code = error_obj.get("code")
-                if error_code in (190, 102) or (resp.status_code == 401 and "token" in body_sample.lower()):
+                if error_code in (190, 102) or (resp.status_code in (400, 401) and ("token" in body_sample.lower() or error_code in (190, 102))):
                     raise InstagramTokenExpiredError(
                         error_message=str(error_obj.get("message") or "Instagram token expired or invalid"),
                         error_code=error_code or 190,
@@ -422,21 +450,17 @@ class InstagramService:
                 ll_data = {}
             logger.info("Long-lived token response status: %s", resp.status_code)
             if "access_token" not in ll_data:
-                # Fall back to short-lived token if long-lived exchange fails
-                logger.warning("Long-lived token exchange failed, using short-lived token: status=%s body=%s", resp.status_code, ll_data)
-                return {"success": True, "token_data": {
-                    "access_token": short["access_token"],
-                    "expires_in": 3600,
-                    "user_id": short_user_id,
-                }}
+                error_message = str(
+                    ll_data.get("error", {}).get("message")
+                    or ll_data.get("error_message")
+                    or "Failed to exchange for long-lived Instagram access token"
+                )
+                logger.warning("Long-lived token exchange failed: status=%s body=%s", resp.status_code, ll_data)
+                return {"success": False, "error": error_message}
             return {"success": True, "token_data": {**ll_data, "user_id": short_user_id}}
         except httpx.RequestError:
             logger.exception("Instagram long-lived token exchange failed")
-            return {"success": True, "token_data": {
-                "access_token": short["access_token"],
-                "expires_in": 3600,
-                "user_id": short_user_id,
-            }}
+            return {"success": False, "error": "Instagram long-lived token exchange request failed"}
 
     @staticmethod
     async def reply_to_comment(access_token: str, comment_id: str, message: str) -> dict:
@@ -457,7 +481,77 @@ class InstagramService:
         except httpx.RequestError:
             logger.exception("Instagram comment reply failed")
             return {"success": False, "error": "Instagram API request failed"}
-    # Add to instagram.py
+    @staticmethod
+    async def subscribe_app_to_webhooks(access_token: str, ig_id: str) -> bool:
+        """Call POST graph.instagram.com/{ig_id}/subscribed_apps?subscribed_fields=messages,comments,messaging_postbacks (mentions if supported).
+        Returns True if successful, False otherwise.
+        """
+        try:
+            token = InstagramService.decrypt_access_token(access_token)
+        except (InvalidToken, ValueError) as exc:
+            logger.error("Failed to decrypt access token in subscribe_app_to_webhooks: %s", exc)
+            return False
+
+        if not ig_id:
+            logger.warning("Missing ig_id for subscribe_app_to_webhooks")
+            return False
+
+        url = f"{BASE_GRAPH_IG}/{ig_id}/subscribed_apps"
+        fields_with_mentions = "messages,comments,messaging_postbacks,mentions"
+        fields_fallback = "messages,comments,messaging_postbacks"
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                resp = await client.post(url, params={
+                    "subscribed_fields": fields_with_mentions,
+                    "access_token": token,
+                })
+                if resp.status_code == 200:
+                    data = resp.json() or {}
+                    return bool(data.get("success") is True or data.get("data") is not None or resp.status_code == 200)
+
+                # Retry without mentions if first call fails (e.g. mentions unsupported on this node)
+                logger.info("Subscribed apps with mentions returned %s: %s; retrying with fallback fields", resp.status_code, resp.text[:200])
+                resp_fallback = await client.post(url, params={
+                    "subscribed_fields": fields_fallback,
+                    "access_token": token,
+                })
+                if resp_fallback.status_code == 200:
+                    data = resp_fallback.json() or {}
+                    return bool(data.get("success") is True or data.get("data") is not None or resp_fallback.status_code == 200)
+
+                logger.warning("Subscribed apps failed with fallback fields: %s %s", resp_fallback.status_code, resp_fallback.text[:200])
+                return False
+        except httpx.RequestError:
+            logger.exception("Network error while subscribing app to Instagram webhooks")
+            return False
+
+    @staticmethod
+    async def get_granted_permissions(access_token: str) -> list[str]:
+        """Fetch list of granted scopes/permissions for the Instagram access token."""
+        try:
+            token = InstagramService.decrypt_access_token(access_token)
+        except (InvalidToken, ValueError) as exc:
+            logger.error("Failed to decrypt access token in get_granted_permissions: %s", exc)
+            return []
+
+        url = f"{BASE_GRAPH_IG}/me/permissions"
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                resp = await client.get(url, params={"access_token": token})
+            if resp.status_code == 200:
+                payload = resp.json() or {}
+                granted = [
+                    str(item.get("permission"))
+                    for item in payload.get("data", [])
+                    if item.get("status") == "granted" and item.get("permission")
+                ]
+                return granted
+            logger.warning("Fetching permissions returned %s: %s", resp.status_code, resp.text[:200])
+            return []
+        except httpx.RequestError:
+            logger.exception("Network error while fetching granted permissions")
+            return []
+
     @staticmethod
     async def refresh_long_lived_token(access_token: str) -> dict:
         """Refresh a long-lived token. Call every 30-45 days."""
@@ -466,9 +560,187 @@ class InstagramService:
         except (InvalidToken, ValueError) as exc:
             logger.error("Failed to decrypt access token in refresh_long_lived_token: %s", exc)
             return {"error": "Invalid or corrupted access token"}
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{BASE_GRAPH_IG}/refresh_access_token", params={
-                "grant_type": "ig_refresh_token",
-                "access_token": decrypted,
-            })
-            return resp.json()  # returns {access_token, token_type, expires_in}
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                resp = await client.get(f"{BASE_GRAPH_IG}/refresh_access_token", params={
+                    "grant_type": "ig_refresh_token",
+                    "access_token": decrypted,
+                })
+                try:
+                    payload = resp.json() or {}
+                except ValueError:
+                    payload = {}
+                if resp.status_code != 200:
+                    logger.warning("Instagram token refresh returned %s: %s", resp.status_code, resp.text[:200])
+                return payload
+        except httpx.RequestError:
+            logger.exception("Network error while refreshing Instagram token")
+            return {"error": "Network error while refreshing Instagram token"}
+
+    @staticmethod
+    def is_forbidden_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        """Reject loopback, private, link-local, reserved, multicast, unspecified, and cloud metadata IPs."""
+        if isinstance(ip_obj, ipaddress.IPv6Address) and getattr(ip_obj, "ipv4_mapped", None):
+            ip_obj = ip_obj.ipv4_mapped
+
+        if (
+            ip_obj.is_loopback
+            or ip_obj.is_private
+            or ip_obj.is_link_local
+            or ip_obj.is_reserved
+            or ip_obj.is_multicast
+            or ip_obj.is_unspecified
+        ):
+            return True
+
+        if isinstance(ip_obj, ipaddress.IPv4Address) and ip_obj in CGNAT_NETWORK:
+            return True
+
+        if str(ip_obj).lower() in METADATA_IPS:
+            return True
+
+        return False
+
+    @staticmethod
+    async def _resolve_and_validate_host(hostname: str) -> tuple[bool, str]:
+        """Resolve hostname and reject loopback, private, link-local, reserved, and metadata IPs (IPv4 and IPv6)."""
+        clean_host = hostname.strip().strip("[]")
+        if not clean_host:
+            return False, "Missing hostname in attachment URL"
+
+        # 1. Direct IP literal check
+        try:
+            direct_ip = ipaddress.ip_address(clean_host)
+            if InstagramService.is_forbidden_ip(direct_ip):
+                return False, f"Attachment URL references forbidden IP: {direct_ip}"
+            return True, ""
+        except ValueError:
+            pass
+
+        # 2. Reject obvious local hostnames before DNS resolution
+        lower_host = clean_host.lower()
+        if lower_host in {"localhost", "localhost.localdomain", "broadcasthost"} or lower_host.endswith(".local"):
+            return False, f"Attachment URL references forbidden host: {clean_host}"
+
+        # 3. DNS resolution via getaddrinfo
+        loop = asyncio.get_running_loop()
+        try:
+            addr_infos = await loop.run_in_executor(
+                None,
+                socket.getaddrinfo,
+                clean_host,
+                443,
+                socket.AF_UNSPEC,
+                socket.SOCK_STREAM,
+            )
+        except socket.gaierror as exc:
+            return False, f"Could not resolve host '{clean_host}': {exc}"
+        except Exception as exc:
+            return False, f"DNS resolution failed for host '{clean_host}': {exc}"
+
+        if not addr_infos:
+            return False, f"No IP addresses resolved for host '{clean_host}'"
+
+        for item in addr_infos:
+            sockaddr = item[4]
+            ip_str = sockaddr[0]
+            try:
+                ip_obj = ipaddress.ip_address(ip_str)
+                if InstagramService.is_forbidden_ip(ip_obj):
+                    return False, f"Attachment URL host '{clean_host}' resolves to forbidden IP: {ip_str}"
+            except ValueError:
+                return False, f"Invalid resolved IP '{ip_str}' for host '{clean_host}'"
+
+        return True, ""
+
+    @staticmethod
+    async def validate_attachment_url(url: str, max_size_bytes: int = 8 * 1024 * 1024) -> tuple[bool, str]:
+        """Validate an image attachment URL:
+        - Must start with https://
+        - Require port 443
+        - Resolve hostname and reject loopback, private, link-local, reserved, and metadata IPs (IPv4 and IPv6)
+        - Use follow_redirects=False, re-validating every redirect hop with max 3 hops
+        - 3.0s timeout
+        - Content-Type must be an image (starts with image/)
+        - Content-Length must not exceed max_size_bytes (8MB)
+        Returns (is_valid, error_message).
+        """
+        clean_url = (url or "").strip()
+        if not clean_url:
+            return False, "Attachment URL is required"
+        if len(clean_url) > 2048:
+            return False, "Attachment URL must be 2048 characters or fewer"
+
+        current_url = clean_url
+        max_redirects = 3
+        redirect_count = 0
+        timeout = httpx.Timeout(3.0, connect=3.0)
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+                while True:
+                    parsed = urllib.parse.urlsplit(current_url)
+                    if parsed.scheme.lower() != "https":
+                        return False, f"Attachment URL must use https (got '{parsed.scheme}')"
+
+                    port = parsed.port or 443
+                    if port != 443:
+                        return False, f"Attachment URL must use port 443 (got port {port})"
+
+                    hostname = parsed.hostname
+                    if not hostname:
+                        return False, "Attachment URL missing valid hostname"
+
+                    valid_host, host_err = await InstagramService._resolve_and_validate_host(hostname)
+                    if not valid_host:
+                        return False, host_err
+
+                    try:
+                        resp = await client.head(current_url)
+                    except httpx.RequestError as exc:
+                        return False, f"Could not reach attachment URL: {exc}"
+
+                    # Re-validate every redirect hop with a max of 3
+                    if resp.status_code in {301, 302, 303, 307, 308}:
+                        if redirect_count >= max_redirects:
+                            return False, f"Too many redirects (max {max_redirects} allowed)"
+                        loc = resp.headers.get("location")
+                        if not loc:
+                            return False, f"Redirect status {resp.status_code} missing Location header"
+                        current_url = urllib.parse.urljoin(current_url, loc)
+                        redirect_count += 1
+                        continue
+
+                    # Fallback if server doesn't allow HEAD
+                    if resp.status_code == 405:
+                        try:
+                            resp = await client.get(current_url, headers={"Range": "bytes=0-1024"})
+                        except httpx.RequestError as exc:
+                            return False, f"Could not reach attachment URL: {exc}"
+
+                        if resp.status_code in {301, 302, 303, 307, 308}:
+                            if redirect_count >= max_redirects:
+                                return False, f"Too many redirects (max {max_redirects} allowed)"
+                            loc = resp.headers.get("location")
+                            if not loc:
+                                return False, f"Redirect status {resp.status_code} missing Location header"
+                            current_url = urllib.parse.urljoin(current_url, loc)
+                            redirect_count += 1
+                            continue
+
+                    if resp.status_code not in {200, 206}:
+                        return False, f"Attachment URL returned HTTP status {resp.status_code}"
+
+                    content_type = (resp.headers.get("content-type") or "").strip().lower()
+                    if not content_type.startswith("image/"):
+                        return False, f"Attachment URL must point to an image, got Content-Type: '{content_type or 'unknown'}'"
+
+                    content_length_str = resp.headers.get("content-length")
+                    if content_length_str and content_length_str.isdigit():
+                        size = int(content_length_str)
+                        if size > max_size_bytes:
+                            return False, "Attachment image size exceeds the 8MB limit"
+
+                    return True, ""
+        except Exception as exc:
+            return False, f"Attachment URL validation failed: {str(exc)}"

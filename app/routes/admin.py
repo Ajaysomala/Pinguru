@@ -44,10 +44,23 @@ class AdminActionPayload(BaseModel):
     note: str | None = None
 
 
-def _create_admin_token(email: str) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(hours=1)
-    payload = {"sub": email, "exp": expire, "type": "admin"}
+_DUMMY_ADMIN_HASH = "$2b$12$e80yVjJ8.VbI8hN8PuhN0.0XU6E.C1L.7lY0w/aR7s2wR1m6B8y1."
+
+
+def _create_admin_token(email: str, session_version: int = 0) -> str:
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(hours=1)
+    payload = {
+        "sub": email,
+        "exp": expire,
+        "iat": int(now.timestamp()),
+        "jti": secrets.token_hex(16),
+        "type": "admin",
+        "typ": "session",
+        "sv": int(session_version),
+    }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
 
 
 def _create_admin_password_reset_token(email: str) -> str:
@@ -200,6 +213,7 @@ def _clear_admin_cookie(response: Response) -> None:
 async def get_admin_user(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(admin_bearer),
+    db=Depends(get_db),
 ):
     # Cookie-first (httpOnly) — XSS safe
     token = request.cookies.get("pg_admin_token")
@@ -226,7 +240,16 @@ async def get_admin_user(
     if not email or email.strip().lower() != admin_email:
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
+    admin_config = getattr(db, "admin_config", None)
+    if admin_config is not None:
+        doc = await admin_config.find_one({"_id": "admin_session"})
+        expected_sv = int((doc or {}).get("admin_session_version", 0) or 0)
+        token_sv = int(payload.get("sv") or 0)
+        if token_sv != expected_sv:
+            raise HTTPException(status_code=401, detail="Session expired")
+
     return {"email": email}
+
 
 
 @router.post("/login")
@@ -241,6 +264,7 @@ async def admin_login(request: Request, data: AdminLoginRequest, response: Respo
         raise HTTPException(status_code=503, detail="Admin credentials are not configured")
 
     if email != admin_email:
+        pwd_ctx.verify(password or "dummy", _DUMMY_ADMIN_HASH)
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
     try:
@@ -252,11 +276,16 @@ async def admin_login(request: Request, data: AdminLoginRequest, response: Respo
     if not password_valid:
         raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
-    token = _create_admin_token(email)
+    admin_config = getattr(db, "admin_config", None)
+    admin_sv = 0
+    if admin_config is not None:
+        doc = await admin_config.find_one({"_id": "admin_session"})
+        admin_sv = int((doc or {}).get("admin_session_version", 0) or 0)
+
+    token = _create_admin_token(email, session_version=admin_sv)
     # Set httpOnly cookie — XSS safe, no localStorage exposure
     _set_admin_cookie(response, token)
-    # Also return token for backward compat (admin frontend will ignore once updated)
-    return {"ok": True, "token": token}
+    return {"ok": True}
 
 
 @router.post("/auth/login")
@@ -265,10 +294,19 @@ async def admin_login_alias(request: Request, data: AdminLoginRequest, response:
     return await admin_login(request, data, response, db)
 
 
+@router.post("/logout")
 @router.post("/auth/logout")
-async def admin_logout_alias(response: Response, _admin=Depends(get_admin_user)):
+async def admin_logout_alias(response: Response, db=Depends(get_db)):
+    admin_config = getattr(db, "admin_config", None)
+    if admin_config is not None:
+        await admin_config.update_one(
+            {"_id": "admin_session"},
+            {"$inc": {"admin_session_version": 1}},
+            upsert=True,
+        )
     _clear_admin_cookie(response)
     return {"ok": True}
+
 
 
 @router.get("/me")
@@ -288,11 +326,14 @@ async def admin_forgot_password_request(data: AdminForgotPasswordRequest):
     if not admin_email:
         raise HTTPException(status_code=503, detail="Admin credentials are not configured")
 
-    # Keep response generic to avoid exposing account existence.
-    response = {"ok": True, "message": "If the account exists, a reset token has been generated."}
-    if data.email.strip().lower() == admin_email and settings.ENVIRONMENT.lower() != "production":
-        response["reset_token"] = _create_admin_password_reset_token(admin_email)
-    return response
+    if str(data.email).strip().lower() == admin_email:
+        reset_token = _create_admin_password_reset_token(admin_email)
+        if str(getattr(settings, "ENVIRONMENT", "")).strip().lower() == "development":
+            print(f"[DEVELOPMENT ONLY] Admin password reset token: {reset_token}")
+            logger.info(f"[DEVELOPMENT ONLY] Admin password reset token: {reset_token}")
+
+    # Keep response generic to avoid exposing account existence. Never return token/url.
+    return {"ok": True, "message": "If the account exists, a reset token has been generated."}
 
 
 @router.post("/auth/forgot-password/reset")

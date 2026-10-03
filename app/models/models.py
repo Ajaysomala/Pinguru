@@ -136,7 +136,18 @@ class UserInDB(BaseModel):
     instagram_user_id: Optional[str] = None
     instagram_access_token: Optional[str] = None
     ig_token_expires_at: Optional[datetime] = None
+    ig_connection_status: Optional[str] = None  # active | needs_reauth | expired
+    ig_connected_at: Optional[datetime] = None
+    ig_last_refreshed_at: Optional[datetime] = None
+    ig_profile_picture_url: Optional[str] = None
+    ig_account_type: Optional[str] = None
+    ig_followers_count: Optional[int] = None
+    webhook_subscribed: Optional[bool] = None
+    granted_scopes: List[str] = []
+    oauth_provider: Optional[str] = None
+    unverified_expires_at: Optional[datetime] = None
     dm_count_this_month: int = 0
+    dm_count_reset_at: Optional[datetime] = None
     dm_limit: Optional[int] = None
     razorpay_subscription_id: Optional[str] = None
     pending_plan: Optional[str] = None
@@ -144,6 +155,8 @@ class UserInDB(BaseModel):
     pending_plan_billing_cycle: Optional[str] = None
     checkout_initiated_at: Optional[datetime] = None
     is_active: bool = True
+    deleted_at: Optional[datetime] = None
+    data_deletion_confirmation_code: Optional[str] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 # ── Automation Rule ────────────────────────────────────────────────────────────
@@ -164,6 +177,8 @@ class AutomationRule(BaseModel):
     comment_media_type: Optional[str] = None
     dm_attachment_url: Optional[str] = None
     dm_attachment_type: Optional[str] = None
+    attachment_validated_at: Optional[datetime] = None
+    attachment_url_hash: Optional[str] = None
     any_comment_keyword: bool = True
     public_comment_reply_enabled: bool = False
     public_comment_reply_template: Optional[str] = None

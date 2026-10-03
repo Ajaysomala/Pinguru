@@ -212,21 +212,33 @@ def _normalize_comment_media_filter(value: Any, trigger_type: str) -> str:
 
 
 def _extract_comment_media_context(value: dict[str, Any]) -> tuple[str, str | None]:
-    media_id = str(value.get("media_id") or value.get("media", {}).get("id") or value.get("id") or "").strip()
-    media_type_raw = str(
-        value.get("media_type")
-        or value.get("media", {}).get("media_type")
+    media_obj = value.get("media") if isinstance(value.get("media"), dict) else {}
+    media_id = str(value.get("media_id") or media_obj.get("id") or value.get("id") or "").strip()
+
+    media_product_type = str(
+        media_obj.get("media_product_type")
         or value.get("media_product_type")
         or value.get("product_type")
+        or ""
+    ).strip().upper()
+
+    if media_product_type == "STORY":
+        return media_id, None
+    elif media_product_type == "FEED":
+        return media_id, "post"
+    elif media_product_type == "REELS":
+        return media_id, "reel"
+
+    media_type_raw = str(
+        value.get("media_type")
+        or media_obj.get("media_type")
         or ""
     ).strip().lower()
 
     media_kind: str | None = None
-    if media_type_raw in {"image", "photo", "carousel_album", "post"}:
+    if media_type_raw in {"image", "photo", "carousel_album", "post", "feed"}:
         media_kind = "post"
     elif media_type_raw in {"video", "reel", "reels"}:
-        media_kind = "reel"
-    elif str(value.get("media_product_type") or "").strip().upper() == "REELS":
         media_kind = "reel"
 
     return media_id, media_kind
@@ -272,28 +284,38 @@ def _apply_plan_footer(message: str, user_plan: PlanType) -> str:
     return base
 
 
-async def _ensure_contact_create_allowed(db, user: dict[str, Any], ig_user_id: str) -> None:
+async def _ensure_contact_create_allowed(db, user: dict[str, Any], ig_user_id: str) -> bool:
     user_plan = get_plan_type(user.get("plan", PlanType.Free))
     if user_plan != PlanType.Free:
-        return
+        return True
 
     existing = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": ig_user_id})
     if existing:
-        return
+        return True
 
     contact_limit = int(get_plan_limits(PlanType.Free).get("contacts_limit") or 0)
     total_contacts = await db.contacts.count_documents({"user_id": str(user["_id"])})
     if contact_limit and total_contacts >= contact_limit:
-        raise HTTPException(status_code=403, detail="Free plan contact limit reached. Upgrade to continue automations.")
+        logger.warning(
+            "Free plan contact limit reached (%d/%d) for user %s; skipping new contact %s",
+            total_contacts,
+            contact_limit,
+            user.get("_id"),
+            ig_user_id,
+        )
+        return False
+
+    return True
 
 
 def _is_follow_confirmation_message(message_text: str) -> bool:
     normalized = _normalize_text(message_text or "")
     if not normalized:
         return False
-    if normalized in FOLLOW_CONFIRMATION_TOKENS:
-        return True
-    return any(token in normalized for token in FOLLOW_CONFIRMATION_TOKENS)
+    words = normalized.split()
+    if len(words) > 4 or len(normalized) > 30:
+        return False
+    return normalized in FOLLOW_CONFIRMATION_TOKENS
 
 
 def _build_follow_buttons(user: dict[str, Any]) -> list[dict[str, str]]:
@@ -343,6 +365,42 @@ async def _mark_event_if_new(db, event_key: str, source: str) -> bool:
     return result.upserted_id is not None
 
 
+async def _ensure_monthly_dm_count_current(db, user: dict[str, Any]) -> dict[str, Any]:
+    """Ensure that the user's dm_count_this_month is reset to 0 if a new calendar month has started."""
+    now = datetime.now(timezone.utc)
+    reset_at = user.get("dm_count_reset_at")
+    should_reset = False
+    if reset_at is None:
+        created_at = user.get("created_at")
+        if created_at:
+            if getattr(created_at, "tzinfo", None) is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            if (created_at.year, created_at.month) != (now.year, now.month):
+                should_reset = True
+        else:
+            should_reset = True
+    else:
+        if isinstance(reset_at, str):
+            try:
+                reset_at = datetime.fromisoformat(reset_at.replace("Z", "+00:00"))
+            except Exception:
+                reset_at = None
+        if reset_at:
+            if getattr(reset_at, "tzinfo", None) is None:
+                reset_at = reset_at.replace(tzinfo=timezone.utc)
+            if (reset_at.year, reset_at.month) != (now.year, now.month):
+                should_reset = True
+
+    if should_reset:
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"dm_count_this_month": 0, "dm_count_reset_at": now}},
+        )
+        user["dm_count_this_month"] = 0
+        user["dm_count_reset_at"] = now
+    return user
+
+
 async def _find_user_for_ig_account(db, ig_account_id: str) -> dict[str, Any] | None:
     # Step 1: Direct match in database
     user = await db.users.find_one(
@@ -374,7 +432,7 @@ async def _find_user_for_ig_account(db, ig_account_id: str) -> dict[str, Any] | 
                 ig_account_id,
                 str(user.get("_id")),
             )
-        return user
+        return await _ensure_monthly_dm_count_current(db, user)
 
     # Step 2: Fetch candidate users who have an Instagram access token (newest users first)
     candidates = await db.users.find(
@@ -424,7 +482,7 @@ async def _find_user_for_ig_account(db, ig_account_id: str) -> dict[str, Any] | 
                         str(candidate["_id"]),
                         candidate.get("email"),
                     )
-                    return candidate
+                    return await _ensure_monthly_dm_count_current(db, candidate)
         except Exception:
             logger.exception("Error checking account ownership for candidate user %s", candidate.get("_id"))
 
@@ -461,7 +519,7 @@ async def _find_user_for_ig_account(db, ig_account_id: str) -> dict[str, Any] | 
             len(candidates),
             len(active_candidates),
         )
-        return fallback_user
+        return await _ensure_monthly_dm_count_current(db, fallback_user)
 
     logger.warning(
         "No user found for webhook ig_account_id=%s; connected_candidates=%s; active_candidates=%s",
@@ -570,7 +628,16 @@ async def _send_rule_reply(
     skip_follow_gate: bool = False,
     skip_email_capture: bool = False,
     skip_phone_capture: bool = False,
-):
+) -> bool:
+    # Check contact creation limit BEFORE sending any DM
+    if not await _ensure_contact_create_allowed(db, user, recipient_id):
+        logger.warning(
+            "Contact creation limit reached for user %s; skipping reply to %s",
+            user.get("_id"),
+            recipient_id,
+        )
+        return False
+
     user_plan = get_plan_type(user.get("plan", PlanType.Free))
     base_reply = await _render_template(db, user, recipient_id, rule, matched_keyword)
     reply = _apply_plan_footer(base_reply, user_plan)
@@ -594,11 +661,13 @@ async def _send_rule_reply(
     ):
         contact = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": recipient_id})
         rule_id_str = str(rule.get("_id"))
-        completed_rules = set(contact.get("completed_follow_gate_rule_ids") or [])
-        if contact and str(contact.get("follow_gate_status") or "") == "completed":
-            saved_rule_id = str(contact.get("follow_gate_rule_id") or "").strip()
-            if saved_rule_id:
-                completed_rules.add(saved_rule_id)
+        completed_rules: set[str] = set()
+        if contact:
+            completed_rules = set(contact.get("completed_follow_gate_rule_ids") or [])
+            if str(contact.get("follow_gate_status") or "") == "completed":
+                saved_rule_id = str(contact.get("follow_gate_rule_id") or "").strip()
+                if saved_rule_id:
+                    completed_rules.add(saved_rule_id)
 
         is_completed = rule_id_str in completed_rules
         is_awaiting_for_rule = (
@@ -626,7 +695,6 @@ async def _send_rule_reply(
                     user.get("instagram_username"),
                 )
                 now = datetime.now(timezone.utc)
-                await _ensure_contact_create_allowed(db, user, recipient_id)
                 await db.contacts.update_one(
                     {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
                     {
@@ -672,7 +740,6 @@ async def _send_rule_reply(
 
                 if prompt_result["success"]:
                     now = datetime.now(timezone.utc)
-                    await _ensure_contact_create_allowed(db, user, recipient_id)
                     await db.contacts.update_one(
                         {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
                         {
@@ -692,7 +759,7 @@ async def _send_rule_reply(
                         upsert=True,
                     )
                     await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
-                return
+                return bool(prompt_result.get("success"))
 
     # Check In-DM Email Capture (if enabled and not skipped)
     email_capture_requested = bool(rule.get("capture_email_enabled", False))
@@ -734,7 +801,6 @@ async def _send_rule_reply(
 
             if prompt_result["success"]:
                 now = datetime.now(timezone.utc)
-                await _ensure_contact_create_allowed(db, user, recipient_id)
                 await db.contacts.update_one(
                     {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
                     {
@@ -753,7 +819,7 @@ async def _send_rule_reply(
                     upsert=True,
                 )
                 await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
-            return
+            return bool(prompt_result.get("success"))
 
     # Check In-DM Phone Capture (if enabled and not skipped)
     phone_capture_requested = bool(rule.get("capture_phone_enabled", False))
@@ -795,7 +861,6 @@ async def _send_rule_reply(
 
             if prompt_result["success"]:
                 now = datetime.now(timezone.utc)
-                await _ensure_contact_create_allowed(db, user, recipient_id)
                 await db.contacts.update_one(
                     {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
                     {
@@ -814,7 +879,7 @@ async def _send_rule_reply(
                     upsert=True,
                 )
                 await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
-            return
+            return bool(prompt_result.get("success"))
 
     # Optional simulated human jitter delay
     delay_secs = int(rule.get("reply_delay_seconds") or 0)
@@ -832,16 +897,103 @@ async def _send_rule_reply(
             elif b_type == "postback":
                 dm_buttons.append({"type": "postback", "title": str(btn.get("title") or "Select")[:20], "payload": str(btn.get("payload") or btn.get("title") or "Select")[:100]})
 
-    result = await InstagramService.send_dm(
-        access_token=user["instagram_access_token"],
-        recipient_ig_id=recipient_id,
-        message=reply,
-        ig_user_id=user["instagram_user_id"],
-        attachment_url=str(rule.get("dm_attachment_url") or "").strip() or None,
-        attachment_type=str(rule.get("dm_attachment_type") or "image").strip().lower() or "image",
-        comment_id=comment_id,
-        buttons=dm_buttons,
-    )
+    # Re-check plan at send time for dm_attachment_url
+    raw_attachment_url = str(rule.get("dm_attachment_url") or "").strip() or None
+    attachment_type = str(rule.get("dm_attachment_type") or "image").strip().lower() or "image"
+    attachment_url = None
+
+    if raw_attachment_url and user_plan == PlanType.Pro:
+        current_hash = hashlib.sha256(raw_attachment_url.encode("utf-8")).hexdigest()
+        cached_hash = rule.get("attachment_url_hash")
+        cached_at = rule.get("attachment_validated_at")
+
+        if cached_hash == current_hash and cached_at:
+            # Cache hit: URL was already validated and hash unchanged. Do not re-fetch on every send.
+            attachment_url = raw_attachment_url
+        else:
+            # Cache miss or hash changed: revalidate
+            is_valid, val_err = await InstagramService.validate_attachment_url(raw_attachment_url)
+            if is_valid:
+                attachment_url = raw_attachment_url
+                validated_at = datetime.now(timezone.utc)
+                rule["attachment_url_hash"] = current_hash
+                rule["attachment_validated_at"] = validated_at
+                rule_id = rule.get("_id")
+                if rule_id:
+                    try:
+                        filter_id = ObjectId(rule_id) if isinstance(rule_id, str) and ObjectId.is_valid(rule_id) else rule_id
+                        await db.automation_rules.update_one(
+                            {"_id": filter_id},
+                            {"$set": {
+                                "attachment_url_hash": current_hash,
+                                "attachment_validated_at": validated_at,
+                            }}
+                        )
+                    except Exception as cache_err:
+                        logger.warning("Failed to cache rule attachment validation in db: %s", cache_err)
+            else:
+                logger.warning(
+                    "Attachment URL validation failed at send time for user %s: %s (url=%s)",
+                    user.get("_id"),
+                    val_err,
+                    raw_attachment_url,
+                )
+
+    if attachment_url:
+        # Send image first, then text sequentially
+        img_result = await InstagramService.send_dm(
+            access_token=user["instagram_access_token"],
+            recipient_ig_id=recipient_id,
+            message="",
+            ig_user_id=user["instagram_user_id"],
+            attachment_url=attachment_url,
+            attachment_type=attachment_type,
+            comment_id=comment_id,
+        )
+
+        img_status_code = img_result.get("status_code")
+        img_error_code = img_result.get("error_code")
+        img_token_expired = (
+            img_status_code == 401
+            or img_error_code in (190, 102)
+            or (img_status_code == 400 and img_error_code in (190, 102))
+        )
+        if not img_result.get("success") and img_token_expired:
+            logger.warning(
+                "Image DM failed with token expiration/invalid error (status=%s, code=%s) for user %s (%s). Flagging token as needing reauth.",
+                img_status_code,
+                img_error_code,
+                user.get("_id"),
+                img_result.get("error"),
+            )
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"ig_connection_status": "needs_reauth"}},
+            )
+            return False
+
+        # If image succeeded with comment_id, subsequent text message goes to recipient_id directly
+        text_comment_id = None if img_result.get("success") else comment_id
+
+        text_result = await InstagramService.send_dm(
+            access_token=user["instagram_access_token"],
+            recipient_ig_id=recipient_id,
+            message=reply,
+            ig_user_id=user["instagram_user_id"],
+            comment_id=text_comment_id,
+            buttons=dm_buttons,
+        )
+
+        result = text_result if text_result.get("success") else (img_result if img_result.get("success") else text_result)
+    else:
+        result = await InstagramService.send_dm(
+            access_token=user["instagram_access_token"],
+            recipient_ig_id=recipient_id,
+            message=reply,
+            ig_user_id=user["instagram_user_id"],
+            comment_id=comment_id,
+            buttons=dm_buttons,
+        )
 
     await db.dm_logs.insert_one(
         {
@@ -864,9 +1016,18 @@ async def _send_rule_reply(
             upsert=True,
         )
 
-    if not result["success"] and result.get("status_code") == 401:
+    status_code = result.get("status_code")
+    error_code = result.get("error_code")
+    is_token_expired = (
+        status_code == 401
+        or error_code in (190, 102)
+        or (status_code == 400 and error_code in (190, 102))
+    )
+    if not result["success"] and is_token_expired:
         logger.warning(
-            "DM failed with 401/token error for user %s (%s). Flagging token as needing reauth.",
+            "DM failed with token expiration/invalid error (status=%s, code=%s) for user %s (%s). Flagging token as needing reauth.",
+            status_code,
+            error_code,
             user.get("_id"),
             result.get("error"),
         )
@@ -874,10 +1035,7 @@ async def _send_rule_reply(
             {"_id": user["_id"]},
             {
                 "$set": {
-                    "instagram_access_token": None,
-                    "instagram_user_id": None,
-                    "instagram_account_ids": [],
-                    "ig_token_expires_at": None,
+                    "ig_connection_status": "needs_reauth",
                 }
             },
         )
@@ -886,7 +1044,6 @@ async def _send_rule_reply(
         await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
         await db.automation_rules.update_one({"_id": rule["_id"]}, {"$inc": {"sent_count": 1}})
         now = datetime.now(timezone.utc)
-        await _ensure_contact_create_allowed(db, user, recipient_id)
         await db.contacts.update_one(
             {"user_id": str(user["_id"]), "ig_user_id": recipient_id},
             {
@@ -896,6 +1053,8 @@ async def _send_rule_reply(
             },
             upsert=True,
         )
+
+    return bool(result.get("success"))
 
 
 async def _process_webhook_payload(db, body: dict[str, Any], raw_body: bytes) -> dict[str, int]:
@@ -1152,45 +1311,67 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
         if isinstance(is_following, bool):
             update_fields["is_following"] = is_following
 
-        # If Meta explicitly indicates the user is NOT following
-        if is_following is False:
-            logger.info(
-                "Follow gate check rejected for sender_id=%s: user is NOT following %s",
-                sender_id,
-                user.get("instagram_username") or ig_account_id,
-            )
-            await db.contacts.update_one(
-                {"_id": contact["_id"]},
-                {"$set": update_fields},
-            )
-            reminder_msg = _build_follow_not_followed_reminder(user)
-            reminder_msg = _apply_plan_footer(reminder_msg, user_plan)
-            follow_buttons = _build_follow_buttons(user)
-            prompt_res = await InstagramService.send_dm(
-                access_token=user["instagram_access_token"],
-                recipient_ig_id=sender_id,
-                message=reminder_msg,
-                ig_user_id=user["instagram_user_id"],
-                buttons=follow_buttons,
-            )
-            await db.dm_logs.insert_one(
-                {
-                    "user_id": str(user["_id"]),
-                    "rule_id": pending_rule_id,
-                    "recipient_ig_id": sender_id,
-                    "message_sent": reminder_msg,
-                    "trigger_type": "follow_gate_reminder",
-                    "status": "sent" if prompt_res.get("success") else "failed",
-                    "sent_at": datetime.now(timezone.utc),
-                }
-            )
-            if prompt_res.get("success"):
-                await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
-            return
+        now = datetime.now(timezone.utc)
+        reprompt_count = int(contact.get("follow_gate_reprompt_count") or 0)
+        reprompt_at = contact.get("follow_gate_reprompt_at")
+        if reprompt_at:
+            if reprompt_at.tzinfo is None:
+                reprompt_at = reprompt_at.replace(tzinfo=timezone.utc)
+            if (now - reprompt_at).total_seconds() >= 86400:
+                reprompt_count = 0
+
+        # If Meta explicitly indicates the user is NOT following or status cannot be confirmed
+        if is_following is not True:
+            if reprompt_count >= 2:
+                logger.info(
+                    "Follow gate reprompt limit reached (%s in 24h) for sender_id=%s. Letting user through.",
+                    reprompt_count,
+                    sender_id,
+                )
+                # Cap reached: let the user through! Fall through to delivery below.
+            else:
+                new_reprompt_count = reprompt_count + 1
+                update_fields["follow_gate_reprompt_count"] = new_reprompt_count
+                update_fields["follow_gate_reprompt_at"] = now
+                logger.info(
+                    "Follow gate check rejected for sender_id=%s: is_user_follow_business is %s (reprompt %s/2 in 24h).",
+                    sender_id,
+                    is_following,
+                    new_reprompt_count,
+                )
+                await db.contacts.update_one(
+                    {"_id": contact["_id"]},
+                    {"$set": update_fields},
+                )
+                reminder_msg = _build_follow_not_followed_reminder(user)
+                reminder_msg = _apply_plan_footer(reminder_msg, user_plan)
+                follow_buttons = _build_follow_buttons(user)
+                prompt_res = await InstagramService.send_dm(
+                    access_token=user["instagram_access_token"],
+                    recipient_ig_id=sender_id,
+                    message=reminder_msg,
+                    ig_user_id=user["instagram_user_id"],
+                    buttons=follow_buttons,
+                )
+                await db.dm_logs.insert_one(
+                    {
+                        "user_id": str(user["_id"]),
+                        "rule_id": pending_rule_id,
+                        "recipient_ig_id": sender_id,
+                        "message_sent": reminder_msg,
+                        "trigger_type": "follow_gate_reminder",
+                        "status": "sent" if prompt_res.get("success") else "failed",
+                        "sent_at": now,
+                    }
+                )
+                if prompt_res.get("success"):
+                    await db.users.update_one({"_id": user["_id"]}, {"$inc": {"dm_count_this_month": 1}})
+                return
 
         logger.info(
-            "Follow gate check passed (is_following=%s) for sender_id=%s. Delivering rule reply.",
+            "Follow gate check passed (is_following=%s, reprompt_count=%s) for sender_id=%s. Delivering rule reply.",
             is_following,
+            reprompt_count,
             sender_id,
         )
 
@@ -1404,10 +1585,40 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
     # If no keyword rule matched, check for NEW_DM (welcome/default reply) rules
     if not matched_keyword_rule and new_dm_rules:
         new_dm_rule = new_dm_rules[0]
-        await db.automation_rules.update_one({"_id": new_dm_rule["_id"]}, {"$inc": {"triggers_count": 1}})
-        logger.info("Triggering NEW_DM rule %s for sender_id=%s", new_dm_rule.get("_id"), sender_id)
-        await _send_rule_reply(db, user, sender_id, new_dm_rule, TriggerType.NEW_DM)
-        
+        contact = await db.contacts.find_one({"user_id": str(user["_id"]), "ig_user_id": sender_id})
+        last_new_dm = contact.get("last_new_dm_at") if contact else None
+        if isinstance(last_new_dm, str):
+            try:
+                last_new_dm = datetime.fromisoformat(last_new_dm.replace("Z", "+00:00"))
+            except Exception:
+                last_new_dm = None
+
+        should_fire = True
+        if last_new_dm is not None:
+            elapsed = (datetime.now(timezone.utc) - last_new_dm).total_seconds()
+            if elapsed < 24 * 3600:
+                should_fire = False
+                logger.info(
+                    "NEW_DM rule skipped for sender_id=%s: already fired %ss ago (< 24h)",
+                    sender_id,
+                    int(elapsed),
+                )
+
+        if should_fire:
+            now = datetime.now(timezone.utc)
+            await db.automation_rules.update_one({"_id": new_dm_rule["_id"]}, {"$inc": {"triggers_count": 1}})
+            logger.info("Triggering NEW_DM rule %s for sender_id=%s", new_dm_rule.get("_id"), sender_id)
+            dm_sent = await _send_rule_reply(db, user, sender_id, new_dm_rule, TriggerType.NEW_DM)
+            if dm_sent:
+                await db.contacts.update_one(
+                    {"user_id": str(user["_id"]), "ig_user_id": sender_id},
+                    {
+                        "$set": {"last_new_dm_at": now},
+                        "$setOnInsert": {"user_id": str(user["_id"]), "ig_user_id": sender_id, "first_seen_at": now},
+                    },
+                    upsert=True,
+                )
+
 async def handle_story_mention_event(db, ig_account_id: str, value: dict):
     # Meta sends: {"media_id": "...", "comment_id": "...", "from": {"id": "..."}}
     sender_id = (value.get("from") or {}).get("id")
@@ -1429,20 +1640,17 @@ async def handle_story_mention_event(db, ig_account_id: str, value: dict):
         "is_active": True,
         "trigger_type": {"$in": [
             TriggerType.STORY_MENTION.value,
-            TriggerType.STORY_REPLY.value,
             TriggerType.STORY_MENTION,
-            TriggerType.STORY_REPLY,
         ]},
     }).to_list(100)
 
-    mention_rules = [r for r in rules if str(r.get("trigger_type")) in {TriggerType.STORY_MENTION.value, str(TriggerType.STORY_MENTION)}]
-    target_rule = mention_rules[0] if mention_rules else (rules[0] if rules else None)
+    if not rules:
+        return
 
-    if target_rule:
-        matched_kw = (target_rule.get("keywords") or ["story_mention"])[0]
-        actual_tt = TriggerType.STORY_MENTION if str(target_rule.get("trigger_type")) in {TriggerType.STORY_MENTION.value, str(TriggerType.STORY_MENTION)} else TriggerType.STORY_REPLY
-        await db.automation_rules.update_one({"_id": target_rule["_id"]}, {"$inc": {"triggers_count": 1}})
-        await _send_rule_reply(db, user, sender_id, target_rule, actual_tt, matched_keyword=matched_kw)
+    target_rule = rules[0]
+    matched_kw = (target_rule.get("keywords") or ["story_mention"])[0]
+    await db.automation_rules.update_one({"_id": target_rule["_id"]}, {"$inc": {"triggers_count": 1}})
+    await _send_rule_reply(db, user, sender_id, target_rule, TriggerType.STORY_MENTION, matched_keyword=matched_kw)
 
 async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
     sender_id = (messaging.get("sender") or {}).get("id")
@@ -1468,26 +1676,28 @@ async def handle_story_reply_event(db, ig_account_id: str, messaging: dict):
         {
             "user_id": str(user["_id"]),
             "is_active": True,
-            "trigger_type": TriggerType.STORY_REPLY,
+            "trigger_type": {"$in": [TriggerType.STORY_REPLY.value, TriggerType.STORY_REPLY]},
         }
     ).to_list(100)
 
     for rule in rules:
-        keywords = [k.lower() for k in rule.get("keywords", [])]
-        if not keywords or any(kw in message_text for kw in keywords):
-            matched_kw = next((kw for kw in (rule.get("keywords") or []) if kw.lower() in message_text), "")
-            if not matched_kw and rule.get("keywords"):
-                matched_kw = rule["keywords"][0]
-            if not matched_kw and (messaging.get("message") or {}).get("text"):
-                first_word = ((messaging.get("message") or {}).get("text") or "").strip().split()[0]
-                matched_kw = first_word
+        rule_keywords = [k for k in rule.get("keywords", []) if k]
+        match_mode = str(rule.get("match_mode") or "contains").lower()
+        if rule_keywords:
+            is_match, matched_kw = _evaluate_keyword_match(message_text, rule_keywords, match_mode, user_plan)
+        else:
+            is_match = True
+            raw_text = ((messaging.get("message") or {}).get("text") or "").strip()
+            matched_kw = raw_text.split()[0] if raw_text else ""
+        if is_match:
+            await db.automation_rules.update_one({"_id": rule["_id"]}, {"$inc": {"triggers_count": 1}})
             await _send_rule_reply(db, user, sender_id, rule, TriggerType.STORY_REPLY, matched_keyword=matched_kw)
             break
 
 
 async def handle_comment_event(db, ig_account_id: str, value: dict):
     from_obj = value.get("from", {}) or {}
-    commenter_id = from_obj.get("id")
+    commenter_id = str(from_obj.get("id") or "").strip()
     commenter_username = str(from_obj.get("username") or "").strip()
     commenter_name = str(from_obj.get("name") or "").strip()
     raw_comment_text = str(value.get("text", "") or "")
@@ -1498,8 +1708,40 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
     if not commenter_id or not comment_text:
         return
 
+    # Skip when commenter_id == ig_account_id
+    if commenter_id == str(ig_account_id):
+        logger.info("Skipping comment from our own account ig_account_id=%s", ig_account_id)
+        return
+
+    parent_ids = {
+        str(value.get("parent_id") or "").strip(),
+        str((value.get("parent") or {}).get("id") or "").strip(),
+        str((value.get("parent") or {}).get("from", {}).get("id") or "").strip(),
+    }
+    parent_ids.discard("")
+
+    if str(ig_account_id) in parent_ids:
+        logger.info("Skipping comment with parent_id matching ig_account_id=%s", ig_account_id)
+        return
+
     user = await _find_user_for_ig_account(db, ig_account_id)
     if not user:
+        return
+
+    our_account_ids = {str(ig_account_id)}
+    if user.get("instagram_user_id"):
+        our_account_ids.add(str(user["instagram_user_id"]))
+    for acc in user.get("instagram_account_ids") or []:
+        if acc:
+            our_account_ids.add(str(acc))
+    our_account_ids.discard("")
+
+    if commenter_id in our_account_ids:
+        logger.info("Skipping comment from our own account (user account ID match)")
+        return
+
+    if parent_ids & our_account_ids:
+        logger.info("Skipping comment with parent_id from our account: %s", parent_ids & our_account_ids)
         return
 
     if not user.get("instagram_access_token") or not user.get("instagram_user_id"):
@@ -1524,18 +1766,19 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
         if not _comment_rule_matches(rule, media_id, media_kind):
             continue
 
-        any_comment_keyword = bool(rule.get("any_comment_keyword", True))
         rule_keywords = [k for k in rule.get("keywords", []) if k]
         match_mode = str(rule.get("match_mode") or "contains").lower()
-        keyword_match, matched_kw = _evaluate_keyword_match(raw_comment_text, rule_keywords, match_mode, user_plan)
+        any_comment_keyword = bool(rule.get("any_comment_keyword", False))
 
-        if not keyword_match and any_comment_keyword:
+        if rule_keywords:
+            keyword_match, matched_kw = _evaluate_keyword_match(raw_comment_text, rule_keywords, match_mode, user_plan)
+        elif any_comment_keyword:
             keyword_match = True
-            if rule_keywords:
-                matched_kw = rule_keywords[0]
-            else:
-                first_word = raw_comment_text.strip().split()[0] if raw_comment_text.strip() else ""
-                matched_kw = first_word.strip("!?. ,#")
+            first_word = raw_comment_text.strip().split()[0] if raw_comment_text.strip() else ""
+            matched_kw = first_word.strip("!?. ,#")
+        else:
+            keyword_match = False
+            matched_kw = ""
 
         if keyword_match:
             raw_trigger = str(rule.get("trigger_type") or TriggerType.POST_COMMENT)
@@ -1565,8 +1808,8 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
                     upsert=True,
                 )
 
-            # 1. Public comment reply (if enabled)
-            if bool(rule.get("public_comment_reply_enabled", False)) and comment_id:
+            # 1. Public comment reply (if enabled and user is Pro)
+            if user_plan == PlanType.Pro and bool(rule.get("public_comment_reply_enabled", False)) and comment_id:
                 templates = list(rule.get("public_comment_reply_templates") or [])
                 if not templates and rule.get("public_comment_reply_template"):
                     templates = [rule["public_comment_reply_template"]]
@@ -1615,7 +1858,7 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
                     first_word = raw_comment_text.strip().split()[0] if raw_comment_text.strip() else ""
                     matched_kw = first_word
 
-                await _send_rule_reply(
+                dm_sent = await _send_rule_reply(
                     db,
                     user,
                     commenter_id,
@@ -1625,7 +1868,7 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
                     comment_id=comment_id,
                 )
 
-                if media_id:
+                if dm_sent and media_id:
                     media_key = str(media_id).replace(".", "_")
                     now = datetime.now(timezone.utc)
                     await db.contacts.update_one(

@@ -3,9 +3,11 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import hmac
-from app.config import settings
+import asyncio
+from app.config import settings, validate_startup_config
 from app.database import connect_db, disconnect_db
 from app.routes import webhook, auth, automation, dashboard, plans, admin, contacts, billing
+from app.services.token_refresh import token_refresh_background_loop
 from app.security import limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -14,15 +16,31 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
-CSRF_EXEMPT_PATHS = {"/auth/logout", "/admin/auth/logout"}
+CSRF_EXEMPT_PATHS = {
+    "/auth/logout",
+    "/admin/auth/logout",
+    "/auth/data-deletion-callback",
+    "/auth/meta/data-deletion",
+    "/auth/deauthorize",
+    "/auth/meta/deauthorize",
+}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_startup_config()
     await connect_db()
     logger.info("✅ PinGuru backend started — MongoDB connected")
-    yield
-    await disconnect_db()
-    logger.info("🛑 PinGuru backend shutting down")
+    refresh_task = asyncio.create_task(token_refresh_background_loop())
+    try:
+        yield
+    finally:
+        refresh_task.cancel()
+        try:
+            await refresh_task
+        except asyncio.CancelledError:
+            pass
+        await disconnect_db()
+        logger.info("🛑 PinGuru backend shutting down")
 
 app = FastAPI(
     title="PinGuru API",

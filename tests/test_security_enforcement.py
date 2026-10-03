@@ -258,11 +258,14 @@ def test_free_contact_limit_enforced():
     db = SimpleNamespace(contacts=_FakeContacts(exists=False, total=500))
     user = {"_id": ObjectId(), "plan": "free"}
 
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(_ensure_contact_create_allowed(db, user, "ig_123"))
+    allowed = asyncio.run(_ensure_contact_create_allowed(db, user, "ig_123"))
+    assert allowed is False
 
-    assert exc.value.status_code == 403
-    assert "contact limit reached" in str(exc.value.detail).lower()
+    db_existing = SimpleNamespace(contacts=_FakeContacts(exists=True, total=500))
+    assert asyncio.run(_ensure_contact_create_allowed(db_existing, user, "ig_123")) is True
+
+    user_pro = {"_id": ObjectId(), "plan": "pro"}
+    assert asyncio.run(_ensure_contact_create_allowed(db, user_pro, "ig_123")) is True
 
 
 def test_verify_email_constant_time_otp_verification():

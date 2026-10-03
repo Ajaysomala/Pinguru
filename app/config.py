@@ -49,8 +49,46 @@ class Settings(BaseSettings):
     SMTP_EMAIL: str = ""
     SMTP_APP_PASSWORD: str = ""
     OTP_FROM_EMAIL: str = ""
-    ENVIRONMENT: str = "development"
+    ENVIRONMENT: str = "production"
     DISABLE_WEBHOOK_SIGNATURE: bool = False
 
 
 settings = Settings()  # pyright: ignore[reportCallIssue]
+
+
+def validate_startup_config(target_settings: Settings | None = None) -> None:
+    """Validate critical environment secrets and keys at startup.
+
+    Refuses to boot in production if:
+    - JWT_SECRET must be at least 32 characters long
+    - ENCRYPTION_KEY must be a valid 32-byte urlsafe base64-encoded Fernet key
+    - META_APP_SECRET must be non-empty
+    - RAZORPAY_WEBHOOK_SECRET must be non-empty
+    """
+    cfg = target_settings or settings
+    env = str(getattr(cfg, "ENVIRONMENT", "production") or "production").strip().lower()
+
+    if env == "production":
+        from cryptography.fernet import Fernet
+
+        jwt_sec = str(getattr(cfg, "JWT_SECRET", "") or "").strip()
+        if len(jwt_sec) < 32:
+            raise RuntimeError("Startup validation failed: JWT_SECRET must be at least 32 characters long in production")
+
+        enc_key = getattr(cfg, "ENCRYPTION_KEY", "") or ""
+        if isinstance(enc_key, str):
+            enc_key = enc_key.strip().encode("utf-8")
+        try:
+            Fernet(enc_key)
+        except Exception as e:
+            raise RuntimeError(f"Startup validation failed: ENCRYPTION_KEY must be a valid Fernet key in production: {e}")
+
+        meta_sec = str(getattr(cfg, "META_APP_SECRET", "") or "").strip()
+        if not meta_sec:
+            raise RuntimeError("Startup validation failed: META_APP_SECRET must not be empty in production")
+
+        rp_webhook_sec = str(getattr(cfg, "RAZORPAY_WEBHOOK_SECRET", "") or "").strip()
+        if not rp_webhook_sec:
+            raise RuntimeError("Startup validation failed: RAZORPAY_WEBHOOK_SECRET must not be empty in production")
+
+

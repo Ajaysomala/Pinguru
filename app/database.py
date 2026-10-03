@@ -11,45 +11,80 @@ class Database:
 
 db_instance = Database()
 
+async def _safe_create_index(collection, keys, **kwargs):
+    """Safely create an index on a MongoDB collection, wrapping in try/except and logging any error."""
+    try:
+        return await collection.create_index(keys, **kwargs)
+    except Exception as exc:
+        col_name = getattr(collection, "name", str(collection))
+        logger.error("Failed to create index %s on %s: %s", keys, col_name, exc)
+        return None
+
+
 async def _create_indexes(db) -> None:
     # ── users ──────────────────────────────────────────────────────────────────
-    await db.users.create_index("email", unique=True)
-    await db.users.create_index("instagram_user_id", sparse=True)
-    await db.users.create_index("instagram_account_ids", sparse=True)
-    await db.users.create_index("razorpay_subscription_id", sparse=True)
-    await db.users.create_index([("created_at", DESCENDING)])
+    await _safe_create_index(db.users, "email", unique=True)
+    await _safe_create_index(db.users, "instagram_user_id", sparse=True)
+    await _safe_create_index(db.users, "instagram_account_ids", sparse=True)
+    await _safe_create_index(db.users, "razorpay_subscription_id", sparse=True)
+    await _safe_create_index(db.users, [("created_at", DESCENDING)])
+    # TTL: auto-delete unverified user records when unverified_expires_at is reached
+    await _safe_create_index(db.users, "unverified_expires_at", expireAfterSeconds=0)
 
     # ── automation_rules ───────────────────────────────────────────────────────
-    await db.automation_rules.create_index("user_id")
-    await db.automation_rules.create_index([("user_id", ASCENDING), ("is_active", ASCENDING)])
-    await db.automation_rules.create_index([("user_id", ASCENDING), ("trigger_type", ASCENDING)])
+    await _safe_create_index(db.automation_rules, "user_id")
+    await _safe_create_index(db.automation_rules, [("user_id", ASCENDING), ("is_active", ASCENDING)])
+    await _safe_create_index(db.automation_rules, [("user_id", ASCENDING), ("trigger_type", ASCENDING)])
 
     # ── dm_logs ────────────────────────────────────────────────────────────────
-    await db.dm_logs.create_index("user_id")
-    await db.dm_logs.create_index([("user_id", ASCENDING), ("sent_at", DESCENDING)])
-    await db.dm_logs.create_index([("sent_at", DESCENDING)])
-    await db.dm_logs.create_index("status")
+    await _safe_create_index(db.dm_logs, "user_id")
+    await _safe_create_index(db.dm_logs, [("user_id", ASCENDING), ("sent_at", DESCENDING)])
+    await _safe_create_index(db.dm_logs, [("sent_at", DESCENDING)])
+    await _safe_create_index(db.dm_logs, "status")
+    # Drop legacy/conflicting sent_at index before creating distinct ASCENDING TTL index
+    if hasattr(db.dm_logs, "drop_index"):
+        try:
+            await db.dm_logs.drop_index("sent_at_1")
+        except Exception as exc:
+            logger.debug("Old sent_at_1 index drop skipped or not present: %s", exc)
+        try:
+            await db.dm_logs.drop_index("sent_at_ttl")
+        except Exception as exc:
+            logger.debug("Old sent_at_ttl index drop skipped or not present: %s", exc)
+    # Distinct ASCENDING TTL index: auto-delete DM log records after 90 days (7,776,000 seconds)
+    await _safe_create_index(
+        db.dm_logs,
+        [("sent_at", ASCENDING)],
+        expireAfterSeconds=7776000,
+        name="sent_at_ttl_asc",
+    )
 
     # ── contacts ───────────────────────────────────────────────────────────────
-    await db.contacts.create_index(
+    await _safe_create_index(
+        db.contacts,
         [("user_id", ASCENDING), ("ig_user_id", ASCENDING)],
         unique=True,
     )
-    await db.contacts.create_index([("user_id", ASCENDING), ("last_seen_at", DESCENDING)])
+    await _safe_create_index(db.contacts, [("user_id", ASCENDING), ("last_seen_at", DESCENDING)])
 
     # ── webhook_events (dedup store) ───────────────────────────────────────────
     # TTL: auto-delete dedup records after 48 hours — keeps collection lean
-    await db.webhook_events.create_index(
+    await _safe_create_index(
+        db.webhook_events,
         "received_at",
         expireAfterSeconds=172800,  # 48 hours
     )
 
+    # ── data_deletion_requests ─────────────────────────────────────────────────
+    await _safe_create_index(db.data_deletion_requests, "confirmation_code", unique=True)
+    await _safe_create_index(db.data_deletion_requests, [("requested_at", DESCENDING)])
+
     # ── refund_requests ────────────────────────────────────────────────────────
-    await db.refund_requests.create_index("user_id")
-    await db.refund_requests.create_index([("created_at", DESCENDING)])
+    await _safe_create_index(db.refund_requests, "user_id")
+    await _safe_create_index(db.refund_requests, [("created_at", DESCENDING)])
 
     # ── admin_audit ────────────────────────────────────────────────────────────
-    await db.admin_audit.create_index([("createdAt", DESCENDING)])
+    await _safe_create_index(db.admin_audit, [("createdAt", DESCENDING)])
 
     logger.info("✅ MongoDB indexes created")
 

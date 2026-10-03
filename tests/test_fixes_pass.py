@@ -255,7 +255,7 @@ def test_fix_2_and_4_comment_trigger_extracts_username_and_enriches_contact(monk
         "_id": user_id,
         "instagram_user_id": "biz_123",
         "instagram_access_token": "token_abc",
-        "plan": "Starter",
+        "plan": "Pro",
         "instagram_username": "my_brand",
     }
     rule = {
@@ -411,11 +411,11 @@ def test_fix_3_instagram_media_error_190_flags_user(monkeypatch):
     )
     assert res == {"media": [], "source": "token_expired", "connected": True}
 
-    # Verify user's token was cleared in DB
+    # Verify user's connection status was updated to needs_reauth and other fields kept
     updated_user = asyncio.run(users_col.find_one({"_id": user_id}))
-    assert updated_user["instagram_access_token"] is None
-    assert updated_user["instagram_user_id"] is None
-    assert updated_user["ig_token_expires_at"] is None
+    assert updated_user.get("ig_connection_status") == "needs_reauth"
+    assert updated_user["instagram_access_token"] == "token_abc"
+    assert updated_user["instagram_user_id"] == "biz_123"
 
 
 def test_dev_simulator_endpoints_with_sample_payloads(monkeypatch):
@@ -647,12 +647,11 @@ def test_corrupted_access_token_in_production_returns_clean_response_and_flags_r
     assert res["source"] == "token_expired"
     assert res["media"] == []
 
-    # Confirm user account in DB was flagged for reauth (tokens cleared)
+    # Confirm user account in DB was flagged for reauth (needs_reauth, other fields kept)
     updated_user = asyncio.run(users_col.find_one({"_id": user_id}))
-    assert updated_user["instagram_access_token"] is None
-    assert updated_user["instagram_user_id"] is None
-    assert updated_user["instagram_account_ids"] == []
-    assert updated_user["ig_token_expires_at"] is None
+    assert updated_user.get("ig_connection_status") == "needs_reauth"
+    assert updated_user["instagram_access_token"] == corrupted_token
+    assert updated_user["instagram_user_id"] == "biz_12345"
 
     # 2. TestClient HTTP GET /auth/instagram/media test
     # Reset DB with corrupted user
@@ -673,7 +672,8 @@ def test_corrupted_access_token_in_production_returns_clean_response_and_flags_r
 
         # Confirm DB was updated to flag reauth
         client_updated_user = asyncio.run(users_col.find_one({"_id": user_id}))
-        assert client_updated_user["instagram_access_token"] is None
+        assert client_updated_user.get("ig_connection_status") == "needs_reauth"
+        assert client_updated_user["instagram_access_token"] == corrupted_token
     finally:
         main_module.app.dependency_overrides.clear()
 
