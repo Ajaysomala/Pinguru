@@ -848,8 +848,9 @@ async def logout(request: Request, db=Depends(get_db)):
                     {"_id": ObjectId(user_id)},
                     {"$inc": {"session_version": 1}},
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            # Logout always succeeds for the client; note why revocation was skipped.
+            logger.debug("Logout session revocation skipped: %s", type(exc).__name__)
 
     response = Response(json.dumps({"message": "Logged out"}), media_type="application/json")
     _clear_auth_cookie(response)

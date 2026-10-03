@@ -239,16 +239,31 @@ async def admin_login_alias(request: Request, data: AdminLoginRequest, response:
     return await admin_login(request, data, response, db)
 
 
+async def get_optional_admin_user(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(admin_bearer),
+    db=Depends(get_db),
+):
+    """Like get_admin_user, but returns None instead of raising 401."""
+    try:
+        return await get_admin_user(request, credentials, db)
+    except HTTPException:
+        return None
+
+
 @router.post("/logout")
 @router.post("/auth/logout")
-async def admin_logout_alias(response: Response, db=Depends(get_db)):
-    admin_config = getattr(db, "admin_config", None)
-    if admin_config is not None:
-        await admin_config.update_one(
-            {"_id": "admin_session"},
-            {"$inc": {"admin_session_version": 1}},
-            upsert=True,
-        )
+async def admin_logout_alias(response: Response, admin=Depends(get_optional_admin_user), db=Depends(get_db)):
+    # /admin/auth/logout is CSRF-exempt, so only a valid admin session may revoke
+    # sessions; anyone else just gets their cookies cleared.
+    if admin is not None:
+        admin_config = getattr(db, "admin_config", None)
+        if admin_config is not None:
+            await admin_config.update_one(
+                {"_id": "admin_session"},
+                {"$inc": {"admin_session_version": 1}},
+                upsert=True,
+            )
     _clear_admin_cookie(response)
     return {"ok": True}
 

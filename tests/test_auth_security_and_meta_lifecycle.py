@@ -10,6 +10,7 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
 
+import jwt
 import pytest
 from bson import ObjectId
 from fastapi import HTTPException
@@ -1013,6 +1014,48 @@ def test_jwt_claims_and_type_enforcement(test_setup):
     wrong_type_resp = client.get("/auth/me", headers={"Authorization": f"Bearer {wrong_type_token}"})
     assert wrong_type_resp.status_code == 401
     assert "Invalid token type" in wrong_type_resp.json()["detail"]
+
+
+def test_unauthenticated_admin_logout_does_not_touch_session_version(test_setup, monkeypatch):
+    """Without a valid admin session, admin logout must only clear cookies."""
+    client, mock_db = test_setup
+    import app.routes.admin as admin_module
+
+    admin_email = "admin_unauth_logout@example.com"
+    monkeypatch.setattr(admin_module.settings, "ADMIN_EMAIL", admin_email)
+    asyncio.run(mock_db.admin_config.update_one(
+        {"_id": "admin_session"}, {"$set": {"admin_session_version": 3}}, upsert=True,
+    ))
+
+    def _version():
+        doc = asyncio.run(mock_db.admin_config.find_one({"_id": "admin_session"}))
+        return doc.get("admin_session_version")
+
+    stale_token = admin_module._create_admin_token(admin_email, session_version=2)
+    forged_token = jwt.encode({"sub": admin_email, "type": "admin", "sv": 3}, "not-the-secret", algorithm="HS256")
+    attempts = [None, forged_token, stale_token]
+
+    for path in ("/admin/logout", "/admin/auth/logout"):
+        for token in attempts:
+            client.cookies.clear()
+            headers = {}
+            if token:
+                # /admin/logout is not CSRF-exempt; send a valid pair so the handler is reached.
+                client.cookies.set("pg_admin_token", token)
+                client.cookies.set("pg_admin_csrf", "csrf-ok")
+                headers["X-CSRF-Token"] = "csrf-ok"
+            resp = client.post(path, headers=headers)
+            assert resp.status_code == 200, (path, resp.text)
+            assert resp.json() == {"ok": True}
+            assert "pg_admin_token" in resp.headers.get("set-cookie", "")  # cookie cleared
+            assert _version() == 3, f"{path} with token={bool(token)} changed admin_session_version"
+
+    # A valid session still revokes.
+    client.cookies.clear()
+    client.cookies.set("pg_admin_token", admin_module._create_admin_token(admin_email, session_version=3))
+    client.cookies.set("pg_admin_csrf", "csrf-ok")
+    assert client.post("/admin/logout", headers={"X-CSRF-Token": "csrf-ok"}).status_code == 200
+    assert _version() == 4
 
 
 def test_user_and_admin_logout_revokes_session(test_setup, monkeypatch):
