@@ -456,6 +456,7 @@ def test_razorpay_webhook_writes_canonical_lowercase_plan(monkeypatch):
     from app.routes.billing import razorpay_webhook
 
     monkeypatch.setattr(settings, "RAZORPAY_WEBHOOK_SECRET", "test_secret_123")
+    monkeypatch.setattr(settings, "RAZORPAY_PLAN_STARTER_MONTHLY", "plan_starter_monthly")
 
     user_id = ObjectId()
     user = {
@@ -473,6 +474,7 @@ def test_razorpay_webhook_writes_canonical_lowercase_plan(monkeypatch):
             "subscription": {
                 "entity": {
                     "id": "sub_test_001",
+                    "plan_id": "plan_starter_monthly",
                     "notes": {
                         "user_id": str(user_id),
                         "plan": "Starter",  # Capitalized string from webhook payload

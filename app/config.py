@@ -1,3 +1,5 @@
+import logging
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pathlib import Path
 
@@ -100,6 +102,12 @@ def validate_startup_config(target_settings: Settings | None = None) -> None:
         meta_sec = str(getattr(cfg, "META_APP_SECRET", "") or "").strip()
         if not meta_sec:
             raise RuntimeError("Startup validation failed: META_APP_SECRET must not be empty in production")
+
+        verify_token = str(getattr(cfg, "META_WEBHOOK_VERIFY_TOKEN", "") or "").strip()
+        if verify_token in {"", "pinguru_webhook_secret_2024", "CHANGE_ME_random_token"}:
+            logging.getLogger(__name__).warning(
+                "META_WEBHOOK_VERIFY_TOKEN is empty or a published example value; set a random token"
+            )
 
         rp_webhook_sec = str(getattr(cfg, "RAZORPAY_WEBHOOK_SECRET", "") or "").strip()
         if not rp_webhook_sec:

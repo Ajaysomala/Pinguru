@@ -6,6 +6,7 @@ import urllib.parse
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from app.config import settings
+from app.security import summarize_api_error
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +152,7 @@ class InstagramService:
             data = {}
 
         if resp.status_code != 200:
-            logger.error("DM failed: status=%s body=%s", resp.status_code, data)
+            logger.error("DM failed: status=%s %s", resp.status_code, summarize_api_error(data))
             # If a specific user ID was used and failed with 400/404, retry via /me/messages
             if endpoint_id != "me" and resp.status_code in {400, 404}:
                 logger.info("Retrying DM request via /me/messages fallback")
@@ -274,7 +275,7 @@ class InstagramService:
                 logger.warning(
                     "Instagram messaging user profile lookup returned %s: %s",
                     resp.status_code,
-                    resp.text[:300],
+                    summarize_api_error(resp),
                 )
                 return {}
             return resp.json() or {}
@@ -353,7 +354,7 @@ class InstagramService:
                 resp = await client.get(url, params=params)
             if resp.status_code != 200:
                 body_sample = resp.text[:300]
-                logger.warning("Instagram media fetch returned %s: %s", resp.status_code, body_sample)
+                logger.warning("Instagram media fetch returned %s: %s", resp.status_code, summarize_api_error(resp))
                 try:
                     payload = resp.json() or {}
                 except ValueError:
@@ -426,7 +427,7 @@ class InstagramService:
                     or short.get("error")
                     or "Instagram token exchange failed"
                 )
-                logger.warning("Instagram short-lived token exchange failed: status=%s body=%s", resp.status_code, short)
+                logger.warning("Instagram short-lived token exchange failed: status=%s %s", resp.status_code, summarize_api_error(short))
                 return {"success": False, "error": error_message}
         except httpx.RequestError:
             logger.exception("Instagram short-lived token exchange failed")
@@ -455,7 +456,7 @@ class InstagramService:
                     or ll_data.get("error_message")
                     or "Failed to exchange for long-lived Instagram access token"
                 )
-                logger.warning("Long-lived token exchange failed: status=%s body=%s", resp.status_code, ll_data)
+                logger.warning("Long-lived token exchange failed: status=%s %s", resp.status_code, summarize_api_error(ll_data))
                 return {"success": False, "error": error_message}
             return {"success": True, "token_data": {**ll_data, "user_id": short_user_id}}
         except httpx.RequestError:
@@ -510,7 +511,7 @@ class InstagramService:
                     return bool(data.get("success") is True or data.get("data") is not None or resp.status_code == 200)
 
                 # Retry without mentions if first call fails (e.g. mentions unsupported on this node)
-                logger.info("Subscribed apps with mentions returned %s: %s; retrying with fallback fields", resp.status_code, resp.text[:200])
+                logger.info("Subscribed apps with mentions returned %s: %s; retrying with fallback fields", resp.status_code, summarize_api_error(resp))
                 resp_fallback = await client.post(url, params={
                     "subscribed_fields": fields_fallback,
                     "access_token": token,
@@ -519,7 +520,7 @@ class InstagramService:
                     data = resp_fallback.json() or {}
                     return bool(data.get("success") is True or data.get("data") is not None or resp_fallback.status_code == 200)
 
-                logger.warning("Subscribed apps failed with fallback fields: %s %s", resp_fallback.status_code, resp_fallback.text[:200])
+                logger.warning("Subscribed apps failed with fallback fields: %s %s", resp_fallback.status_code, summarize_api_error(resp_fallback))
                 return False
         except httpx.RequestError:
             logger.exception("Network error while subscribing app to Instagram webhooks")
@@ -546,7 +547,7 @@ class InstagramService:
                     if item.get("status") == "granted" and item.get("permission")
                 ]
                 return granted
-            logger.warning("Fetching permissions returned %s: %s", resp.status_code, resp.text[:200])
+            logger.warning("Fetching permissions returned %s: %s", resp.status_code, summarize_api_error(resp))
             return []
         except httpx.RequestError:
             logger.exception("Network error while fetching granted permissions")
@@ -571,7 +572,7 @@ class InstagramService:
                 except ValueError:
                     payload = {}
                 if resp.status_code != 200:
-                    logger.warning("Instagram token refresh returned %s: %s", resp.status_code, resp.text[:200])
+                    logger.warning("Instagram token refresh returned %s: %s", resp.status_code, summarize_api_error(resp))
                 return payload
         except httpx.RequestError:
             logger.exception("Network error while refreshing Instagram token")

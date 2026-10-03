@@ -1,6 +1,10 @@
 import ipaddress
 import logging
+import re
+from typing import Any
 from urllib.parse import urlparse
+
+import httpx
 
 from fastapi import Request, Response
 from slowapi import Limiter
@@ -150,3 +154,42 @@ def clear_session_cookies(response: Response, *bases: str) -> None:
 
 def get_cookie(request: Request, base: str) -> str | None:
     return request.cookies.get(cookie_name(base))
+
+
+# ── Log redaction ─────────────────────────────────────────────────────────────
+
+_TOKEN_LIKE = re.compile(r"[A-Za-z0-9_\-|.]{40,}")
+_ERROR_FIELDS = ("code", "error_subcode", "type", "fbtrace_id", "error_type", "source", "step", "reason")
+
+
+def summarize_api_error(source: Any) -> str:
+    """Safe one-line summary of a third-party API error for logs.
+
+    Logs error codes/types and a short message with token-like strings removed,
+    never the raw response body (which can echo tokens or user data).
+    """
+    payload: Any = source
+    if isinstance(source, httpx.Response):
+        try:
+            payload = source.json()
+        except ValueError:
+            return f"non-JSON body ({len(source.content)} bytes)"
+    if not isinstance(payload, dict):
+        return "unparsed error body"
+
+    error = payload.get("error")
+    parts: list[str] = []
+    if isinstance(error, dict):
+        for key in _ERROR_FIELDS:
+            if error.get(key) not in (None, ""):
+                parts.append(f"{key}={error[key]}")
+        message = error.get("message") or error.get("description")
+    else:
+        if error:
+            parts.append(f"error={str(error)[:60]}")
+        message = payload.get("error_message") or payload.get("error_description")
+    if payload.get("error_type"):
+        parts.append(f"error_type={payload['error_type']}")
+    if message:
+        parts.append(f"message={_TOKEN_LIKE.sub('[REDACTED]', str(message))[:160]!r}")
+    return " ".join(parts) or "no error details"

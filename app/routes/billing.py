@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote, quote_plus
@@ -16,7 +17,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.models import PlanType, get_plan_limits, get_plan_type
 from app.routes.auth import get_current_user
-from app.security import limiter
+from app.security import limiter, summarize_api_error
 from app.services.email import send_subscription_expired_email
 
 router = APIRouter()
@@ -184,13 +185,13 @@ async def create_checkout_session(
         resp = await client.post("https://api.razorpay.com/v1/subscriptions", json=sub_payload, auth=auth)
 
     if resp.status_code != 200:
-        logger.error(f"Razorpay subscription creation failed: {resp.text}")
+        logger.error("Razorpay subscription creation failed: status=%s %s", resp.status_code, summarize_api_error(resp))
         raise HTTPException(status_code=502, detail="Failed to create payment session")
 
     sub = resp.json()
     sub_id = sub.get("id")
     if not sub_id:
-        logger.error("Razorpay response missing subscription id: %s", resp.text)
+        logger.error("Razorpay response missing subscription id")
         raise HTTPException(status_code=502, detail="Invalid response from payment provider")
 
     await db.users.update_one(
@@ -251,7 +252,7 @@ async def cancel_pending_checkout(
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.post(cancel_url, auth=auth)
             if resp.status_code >= 400:
-                logger.warning("Razorpay pending cancellation returned %s: %s", resp.status_code, resp.text)
+                logger.warning("Razorpay pending cancellation returned %s: %s", resp.status_code, summarize_api_error(resp))
         except httpx.RequestError as exc:
             logger.warning("Failed to cancel pending Razorpay subscription %s: %s", sub_id, exc)
 
@@ -293,89 +294,200 @@ async def razorpay_webhook(request: Request, db=Depends(get_db)):
         raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
     event = json.loads(raw_body)
-    event_type = event.get("event")
-    logger.info(f"Razorpay webhook: {event_type}")
+    event_type = str(event.get("event") or "")
+    logger.info("Razorpay webhook: %s", event_type)
+    sub_entity = event.get("payload", {}).get("subscription", {}).get("entity", {}) or {}
 
     if event_type == "subscription.activated":
-        payload = event.get("payload", {}).get("subscription", {}).get("entity", {})
-        notes = payload.get("notes", {})
-        user_id = notes.get("user_id")
-        plan_str = notes.get("plan")
-        incoming_sub_id = payload.get("id")
-        billing_cycle = _normalize_billing_cycle(notes.get("billing_cycle"))
-        if user_id and plan_str:
-            plan_enum = get_plan_type(plan_str)
-            if plan_enum not in {PlanType.Starter, PlanType.Pro}:
-                logger.warning("Ignoring unsupported plan in webhook notes: %s", plan_str)
-                return {"status": "ignored"}
+        return await _handle_subscription_activated(db, sub_entity)
 
-            try:
-                user_object_id = ObjectId(user_id)
-            except InvalidId:
-                logger.warning("Ignoring webhook with invalid user id: %s", user_id)
-                return {"status": "ignored"}
+    if event_type in ("subscription.charged", "subscription.resumed"):
+        return await _handle_subscription_renewed(db, sub_entity, event_type)
 
-            user_doc = await db.users.find_one({"_id": user_object_id})
-            if not user_doc:
-                logger.warning("Webhook for unknown user id: %s", user_id)
-                return {"status": "ignored"}
+    if event_type == "subscription.pending":
+        # Renewal payment failed; Razorpay keeps retrying. Keep access during retries.
+        await _set_subscription_status(db, sub_entity.get("id"), "past_due")
+        return {"status": "ok"}
 
-            stored_sub_id = str(user_doc.get("razorpay_subscription_id") or "")
-            if stored_sub_id and stored_sub_id != str(incoming_sub_id or ""):
-                logger.warning(
-                    "Subscription id mismatch user=%s stored=%s incoming=%s",
-                    user_id,
-                    stored_sub_id,
-                    incoming_sub_id,
-                )
-                return {"status": "ignored"}
+    if event_type in ("subscription.halted", "subscription.paused"):
+        # Retries exhausted (halted) or paused: remove paid access, keep the
+        # subscription id so a later charged/resumed event can restore it.
+        status = "halted" if event_type == "subscription.halted" else "paused"
+        await _downgrade_subscription(db, sub_entity.get("id"), status, keep_subscription_id=True)
+        return {"status": "ok"}
 
-            await db.users.update_one(
-                {"_id": user_object_id},
-                {
-                    "$set": {
-                        "plan": plan_enum.value,
-                        "dm_limit": get_plan_limits(plan_enum).get("dm_limit"),
-                        "razorpay_subscription_id": incoming_sub_id,
-                        "pending_plan": None,
-                        "billing_cycle": billing_cycle,
-                        "pending_plan_billing_cycle": None,
-                        "checkout_initiated_at": None,
-                    }
-                },
-            )
+    if event_type in ("subscription.cancelled", "subscription.expired", "subscription.completed"):
+        await _downgrade_subscription(db, sub_entity.get("id"), event_type.split(".", 1)[1], keep_subscription_id=False)
+        return {"status": "ok"}
 
-    elif event_type in ("subscription.cancelled", "subscription.expired"):
-        payload = event.get("payload", {}).get("subscription", {}).get("entity", {})
-        sub_id = payload.get("id")
+    if event_type == "payment.failed":
+        payment = event.get("payload", {}).get("payment", {}).get("entity", {}) or {}
+        sub_id = str(payment.get("subscription_id") or "").strip()
+        logger.warning(
+            "Razorpay payment failed: payment_id=%s subscription_id=%s error_code=%s",
+            payment.get("id"),
+            sub_id or None,
+            payment.get("error_code"),
+        )
         if sub_id:
-            # Fetch user before downgrading to get email + current plan
-            user_doc = await db.users.find_one({"razorpay_subscription_id": sub_id})
-            previous_plan = str((user_doc or {}).get("plan") or "paid")
-
             await db.users.update_one(
                 {"razorpay_subscription_id": sub_id},
-                {
-                    "$set": {
-                        "plan": PlanType.Free.value,
-                        "dm_limit": get_plan_limits(PlanType.Free).get("dm_limit"),
-                        "razorpay_subscription_id": None,
-                        "pending_plan": None,
-                        "billing_cycle": None,
-                        "pending_plan_billing_cycle": None,
-                        "checkout_initiated_at": None,
-                    }
-                },
+                {"$set": {"last_payment_failed_at": datetime.now(timezone.utc)}},
             )
-
-            # Notify user their plan has ended
-            if user_doc and user_doc.get("email"):
-                try:
-                    await send_subscription_expired_email(user_doc["email"], previous_plan)
-                except Exception:
-                    logger.warning("Failed to send subscription expired email to %s", user_doc.get("email"))
+        return {"status": "ok"}
 
     return {"status": "ok"}
+
+
+def _plan_from_subscription(sub_entity: dict[str, Any]) -> tuple[PlanType, str] | None:
+    """Return (plan, billing_cycle) from notes, only if plan_id matches our configured plan."""
+    notes = sub_entity.get("notes") or {}
+    plan_enum = get_plan_type(notes.get("plan") or "")
+    if plan_enum not in {PlanType.Starter, PlanType.Pro}:
+        logger.warning("Ignoring unsupported plan in webhook notes: %s", notes.get("plan"))
+        return None
+    billing_cycle = _normalize_billing_cycle(notes.get("billing_cycle"))
+    expected_plan_id = _resolve_razorpay_plan_id(plan_enum, billing_cycle)
+    incoming_plan_id = str(sub_entity.get("plan_id") or "").strip()
+    if not expected_plan_id or not hmac.compare_digest(incoming_plan_id, expected_plan_id):
+        logger.warning(
+            "Razorpay plan_id mismatch for subscription %s: notes plan=%s cycle=%s incoming plan_id=%s",
+            sub_entity.get("id"),
+            plan_enum.value,
+            billing_cycle,
+            incoming_plan_id or None,
+        )
+        return None
+    return plan_enum, billing_cycle
+
+
+def _paid_plan_fields(plan_enum: PlanType, billing_cycle: str, sub_id: str) -> dict[str, Any]:
+    return {
+        "plan": plan_enum.value,
+        "dm_limit": get_plan_limits(plan_enum).get("dm_limit"),
+        "razorpay_subscription_id": sub_id,
+        "subscription_status": "active",
+        "pending_plan": None,
+        "billing_cycle": billing_cycle,
+        "pending_plan_billing_cycle": None,
+        "checkout_initiated_at": None,
+    }
+
+
+async def _handle_subscription_activated(db, sub_entity: dict[str, Any]) -> dict[str, str]:
+    notes = sub_entity.get("notes") or {}
+    user_id = notes.get("user_id")
+    incoming_sub_id = str(sub_entity.get("id") or "")
+    if not user_id or not notes.get("plan"):
+        return {"status": "ok"}
+
+    resolved = _plan_from_subscription(sub_entity)
+    if not resolved:
+        return {"status": "ignored"}
+    plan_enum, billing_cycle = resolved
+
+    try:
+        user_object_id = ObjectId(user_id)
+    except InvalidId:
+        logger.warning("Ignoring webhook with invalid user id: %s", user_id)
+        return {"status": "ignored"}
+
+    user_doc = await db.users.find_one({"_id": user_object_id})
+    if not user_doc:
+        logger.warning("Webhook for unknown user id: %s", user_id)
+        return {"status": "ignored"}
+
+    stored_sub_id = str(user_doc.get("razorpay_subscription_id") or "")
+    if stored_sub_id and stored_sub_id != incoming_sub_id:
+        logger.warning(
+            "Subscription id mismatch user=%s stored=%s incoming=%s",
+            user_id,
+            stored_sub_id,
+            incoming_sub_id,
+        )
+        return {"status": "ignored"}
+
+    await db.users.update_one(
+        {"_id": user_object_id},
+        {"$set": _paid_plan_fields(plan_enum, billing_cycle, incoming_sub_id)},
+    )
+    return {"status": "ok"}
+
+
+async def _handle_subscription_renewed(db, sub_entity: dict[str, Any], event_type: str) -> dict[str, str]:
+    """A successful charge (or resume) restores paid access for the subscription's owner."""
+    sub_id = str(sub_entity.get("id") or "").strip()
+    if not sub_id:
+        return {"status": "ok"}
+    if event_type == "subscription.resumed" and str(sub_entity.get("status") or "active") != "active":
+        return {"status": "ok"}
+
+    user_doc = await db.users.find_one({"razorpay_subscription_id": sub_id})
+    if not user_doc:
+        logger.warning("Razorpay %s for unknown subscription %s", event_type, sub_id)
+        return {"status": "ignored"}
+
+    notes = sub_entity.get("notes") or {}
+    if str(notes.get("user_id") or "") != str(user_doc["_id"]):
+        logger.warning("Razorpay %s notes.user_id does not match owner of %s", event_type, sub_id)
+        return {"status": "ignored"}
+
+    resolved = _plan_from_subscription(sub_entity)
+    if not resolved:
+        return {"status": "ignored"}
+    plan_enum, billing_cycle = resolved
+
+    fields = _paid_plan_fields(plan_enum, billing_cycle, sub_id)
+    if event_type == "subscription.charged":
+        fields["last_charged_at"] = datetime.now(timezone.utc)
+    await db.users.update_one({"_id": user_doc["_id"]}, {"$set": fields})
+    return {"status": "ok"}
+
+
+async def _set_subscription_status(db, sub_id: Any, status: str) -> None:
+    sub_id = str(sub_id or "").strip()
+    if not sub_id:
+        return
+    await db.users.update_one(
+        {"razorpay_subscription_id": sub_id},
+        {"$set": {"subscription_status": status, "subscription_status_at": datetime.now(timezone.utc)}},
+    )
+
+
+async def _downgrade_subscription(db, sub_id: Any, status: str, keep_subscription_id: bool) -> None:
+    sub_id = str(sub_id or "").strip()
+    if not sub_id:
+        return
+    # Fetch user before downgrading to get email + current plan
+    user_doc = await db.users.find_one({"razorpay_subscription_id": sub_id})
+    if not user_doc:
+        return
+    previous_plan = str(user_doc.get("plan") or "paid")
+    was_paid = get_plan_type(user_doc.get("plan", PlanType.Free)) in {PlanType.Starter, PlanType.Pro}
+
+    await db.users.update_one(
+        {"_id": user_doc["_id"]},
+        {
+            "$set": {
+                "plan": PlanType.Free.value,
+                "dm_limit": get_plan_limits(PlanType.Free).get("dm_limit"),
+                "razorpay_subscription_id": sub_id if keep_subscription_id else None,
+                "subscription_status": status,
+                "subscription_status_at": datetime.now(timezone.utc),
+                "pending_plan": None,
+                "billing_cycle": None,
+                "pending_plan_billing_cycle": None,
+                "checkout_initiated_at": None,
+            }
+        },
+    )
+
+    # Notify user their plan has ended
+    if was_paid and user_doc.get("email"):
+        try:
+            await send_subscription_expired_email(user_doc["email"], previous_plan)
+        except Exception:
+            logger.warning("Failed to send subscription expired email to user %s", user_doc.get("_id"))
 
 
 @router.get("/status")
@@ -400,6 +512,37 @@ async def get_billing_status(user=Depends(get_current_user)):
     }
 
 
+_PAYMENT_ID_RE = re.compile(r"^pay_[A-Za-z0-9]{6,40}$")
+
+
+async def _payment_belongs_to_subscription(payment_id: str, sub_id: str) -> bool:
+    """True if payment_id paid one of this subscription's invoices (checked with Razorpay)."""
+    if not _is_razorpay_configured():
+        raise HTTPException(status_code=503, detail="Payments are temporarily unavailable")
+    auth = (settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
+    skip = 0
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            while True:
+                resp = await client.get(
+                    "https://api.razorpay.com/v1/invoices",
+                    params={"subscription_id": sub_id, "count": 100, "skip": skip},
+                    auth=auth,
+                )
+                if resp.status_code != 200:
+                    logger.warning("Razorpay invoice lookup for %s returned %s", sub_id, resp.status_code)
+                    raise HTTPException(status_code=502, detail="Could not verify payment. Please try again later.")
+                items = (resp.json() or {}).get("items") or []
+                if any(str(item.get("payment_id") or "") == payment_id for item in items):
+                    return True
+                if len(items) < 100 or skip >= 1000:
+                    return False
+                skip += 100
+    except httpx.RequestError as exc:
+        logger.warning("Razorpay invoice lookup for %s failed: %s", sub_id, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Could not verify payment. Please try again later.")
+
+
 @router.post("/refund")
 @limiter.limit("5/minute")
 async def request_refund(
@@ -419,12 +562,21 @@ async def request_refund(
     if not reason:
         raise HTTPException(status_code=400, detail="Please provide a reason for your refund request.")
 
+    payment_id = (data.payment_id or "").strip() or None
+    if payment_id:
+        sub_id = str(user.get("razorpay_subscription_id") or "").strip()
+        if not _PAYMENT_ID_RE.match(payment_id) or not sub_id:
+            raise HTTPException(status_code=400, detail="Payment not found for your subscription.")
+        if not await _payment_belongs_to_subscription(payment_id, sub_id):
+            raise HTTPException(status_code=400, detail="Payment not found for your subscription.")
+
     await db.refund_requests.insert_one({
         "user_id": str(user["_id"]),
         "email": user.get("email"),
         "plan": user.get("plan"),
         "reason": reason,
-        "payment_id": data.payment_id,
+        "payment_id": payment_id,
+        "subscription_id": user.get("razorpay_subscription_id"),
         "status": "pending",
         "created_at": datetime.now(timezone.utc),
     })

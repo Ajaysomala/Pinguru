@@ -1119,7 +1119,9 @@ async def verify_webhook(
     hub_verify_token: str = Query(None, alias="hub.verify_token"),
     hub_challenge: str = Query(None, alias="hub.challenge"),
 ):
-    if hub_mode == "subscribe" and hub_verify_token == settings.META_WEBHOOK_VERIFY_TOKEN:
+    expected_token = (settings.META_WEBHOOK_VERIFY_TOKEN or "").encode("utf-8")
+    provided_token = (hub_verify_token or "").encode("utf-8")
+    if hub_mode == "subscribe" and expected_token and hmac.compare_digest(provided_token, expected_token):
         logger.info("Webhook verified by Meta")
         return PlainTextResponse(hub_challenge)
     raise HTTPException(status_code=403, detail="Verification failed")

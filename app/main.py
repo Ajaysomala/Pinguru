@@ -14,6 +14,10 @@ from slowapi.middleware import SlowAPIMiddleware
 import logging
 
 logging.basicConfig(level=logging.INFO)
+# httpx logs every request URL at INFO; Graph API calls carry access_token in the
+# query string, so keep these loggers at WARNING to keep tokens out of logs.
+for _noisy_logger in ("httpx", "httpcore"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 CSRF_EXEMPT_PATHS = {

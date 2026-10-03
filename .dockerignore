@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# VCS and CI
+.git
+.gitignore
+.github
+.do
+
+# Not needed at runtime
+tests
+docs
+README.md
+Dockerfile
+.dockerignore
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
