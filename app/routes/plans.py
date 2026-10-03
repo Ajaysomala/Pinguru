@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, Request, Query
 from app.database import get_db
 from app.models.models import PLAN_LIMITS, PlanType
 from app.routes.auth import get_current_user
-from app.routes.billing import CheckoutRequest, create_checkout_session, get_billing_status, razorpay_webhook
+from app.routes.billing import CheckoutRequest, create_checkout_session, get_billing_status, razorpay_webhook, upgrade_notice_for
 from app.security import limiter
 
 router = APIRouter()
@@ -107,4 +107,6 @@ async def plans_razorpay_webhook(request: Request, db=Depends(get_db)):
 @router.get("/status")
 @limiter.limit("20/minute")
 async def plans_billing_status(request: Request, user=Depends(get_current_user), db=Depends(get_db)):
-    return await get_billing_status(user=user, db=db)
+    status = await get_billing_status(user=user, db=db)
+    status["upgrade_notice"] = upgrade_notice_for(status)
+    return status

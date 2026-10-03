@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from passlib.context import CryptContext
 from passlib.exc import UnknownHashError
@@ -477,6 +477,80 @@ async def admin_audit(admin=Depends(get_admin_user), db=Depends(get_db)):
         }
         for item in logs
     ]
+
+
+ADMIN_ALERT_TYPES = {
+    "razorpay_cancel_failed",
+    "unmatched_subscription_activation",
+    "pending_subscription_unexpected_status",
+}
+
+
+def _serialize_alert(item: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in item.items():
+        if key == "_id":
+            out["id"] = str(value)
+        elif isinstance(value, datetime):
+            out[key] = _to_iso(value)
+        elif isinstance(value, ObjectId):
+            out[key] = str(value)
+        else:
+            out[key] = value
+    return out
+
+
+@router.get("/alerts")
+async def admin_alerts(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    type: str | None = Query(None, max_length=64),
+    resolved: bool | None = Query(None),
+    admin=Depends(get_admin_user),
+    db=Depends(get_db),
+):
+    query: dict[str, Any] = {}
+    if type:
+        if type not in ADMIN_ALERT_TYPES:
+            raise HTTPException(status_code=400, detail="Unknown alert type")
+        query["type"] = type
+    if resolved is not None:
+        query["resolved"] = resolved
+
+    total = await db.admin_alerts.count_documents(query)
+    items = (
+        await db.admin_alerts.find(query)
+        .sort("created_at", -1)
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .to_list(limit)
+    )
+    return {
+        "alerts": [_serialize_alert(item) for item in items],
+        "total": total,
+        "page": page,
+        "limit": limit,
+    }
+
+
+@router.post("/alerts/{alert_id}/resolve")
+async def admin_resolve_alert(alert_id: str, admin=Depends(get_admin_user), db=Depends(get_db)):
+    if not ObjectId.is_valid(alert_id):
+        raise HTTPException(status_code=404, detail="Alert not found")
+    alert_object_id = ObjectId(alert_id)
+    alert = await db.admin_alerts.find_one({"_id": alert_object_id})
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    if alert.get("resolved"):
+        return {"id": alert_id, "resolved": True, "already_resolved": True}
+
+    now = datetime.now(timezone.utc)
+    await db.admin_alerts.update_one(
+        {"_id": alert_object_id},
+        {"$set": {"resolved": True, "resolved_at": now, "resolved_by": admin["email"]}},
+    )
+    await _write_admin_audit(db, admin["email"], f"Resolved alert {alert.get('type')}", alert_id)
+    return {"id": alert_id, "resolved": True, "already_resolved": False}
 
 
 @router.get("/users/{user_id}/timeline")

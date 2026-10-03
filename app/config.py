@@ -47,6 +47,8 @@ class Settings(BaseSettings):
     ENCRYPTION_KEY: str
     admin_api_key: str = ""
     ADMIN_EMAIL: str = ""
+    # Where admin alert emails go (defaults to ADMIN_EMAIL).
+    ADMIN_ALERT_EMAIL: str = ""
     ADMIN_PASSWORD_HASH: str = ""
     GOOGLE_CLIENT_ID: str = ""
     DEFAULT_OAUTH_PASSWORD: str = ""

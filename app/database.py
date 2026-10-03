@@ -76,6 +76,10 @@ async def _create_indexes(db) -> None:
         expireAfterSeconds=172800,  # 48 hours
     )
 
+    # ── admin_alerts ───────────────────────────────────────────────────────────
+    await _safe_create_index(db.admin_alerts, [("type", ASCENDING), ("resolved", ASCENDING), ("created_at", DESCENDING)])
+    await _safe_create_index(db.admin_alerts, [("created_at", DESCENDING)])
+
     # ── data_deletion_requests ─────────────────────────────────────────────────
     await _safe_create_index(db.data_deletion_requests, "confirmation_code", unique=True)
     await _safe_create_index(db.data_deletion_requests, [("requested_at", DESCENDING)])

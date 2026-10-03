@@ -19,7 +19,7 @@ from app.database import get_db
 from app.models.models import PlanType, get_plan_limits, get_plan_type
 from app.routes.auth import get_current_user
 from app.security import limiter, summarize_api_error
-from app.services.email import send_subscription_expired_email
+from app.services.email import send_admin_alert_email, send_subscription_expired_email
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -139,11 +139,50 @@ def _cleared_pending_fields(user: dict[str, Any], pending_sub_id: str | None) ->
     return fields
 
 
-PENDING_CHECKOUT_TTL_MINUTES = 30
+PENDING_CHECKOUT_TTL_MINUTES = 60
+# Shown to paid users before upgrading (F6 cancels the old subscription immediately,
+# with no proration, credit or refund for unused days).
+UPGRADE_PRORATION_NOTICE = (
+    "Upgrading starts your new plan immediately and charges its full price today. "
+    "Your current plan is cancelled at the same time, and unused days on it are not "
+    "prorated, credited or refunded."
+)
+
+
+def upgrade_notice_for(billing_status: dict[str, Any]) -> str | None:
+    """Proration notice when an upgrade would replace an active paid (Starter) subscription."""
+    if billing_status.get("current_plan") == PlanType.Starter.value and billing_status.get("is_active_paid"):
+        return UPGRADE_PRORATION_NOTICE
+    return None
 _TERMINAL_SUBSCRIPTION_STATES = {"cancelled", "completed", "expired"}
+# Razorpay states meaning the customer completed payment/mandate for the checkout.
+_PAID_SUBSCRIPTION_STATES = {"active", "authenticated", "charged"}
+# States meaning the checkout link was never paid and can safely be cancelled.
+_UNPAID_SUBSCRIPTION_STATES = {"created", "pending", "unpaid"}
 _CANCEL_ATTEMPTS = 3
 _CANCEL_BACKOFF_SECONDS = 0.5
 _backoff_sleep = asyncio.sleep  # patched in tests
+
+
+async def _fetch_razorpay_subscription(sub_id: str) -> dict[str, Any] | None:
+    """GET a subscription from Razorpay; None if it could not be fetched."""
+    if not _is_razorpay_configured():
+        return None
+    auth = (settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+            resp = await client.get(f"https://api.razorpay.com/v1/subscriptions/{sub_id}", auth=auth)
+    except httpx.RequestError as exc:
+        logger.warning("Razorpay fetch of subscription %s failed: %s", sub_id, type(exc).__name__)
+        return None
+    if resp.status_code != 200:
+        logger.warning("Razorpay fetch of subscription %s returned %s: %s", sub_id, resp.status_code, summarize_api_error(resp))
+        return None
+    try:
+        entity = resp.json() or {}
+    except ValueError:
+        return None
+    return entity if isinstance(entity, dict) else None
 
 
 async def _razorpay_subscription_status(client: httpx.AsyncClient, auth, sub_id: str) -> str | None:
@@ -188,13 +227,28 @@ async def _cancel_razorpay_subscription(sub_id: str, attempts: int = _CANCEL_ATT
     return False, detail
 
 
+EMAILED_ALERT_TYPES = {"razorpay_cancel_failed", "unmatched_subscription_activation"}
+
+
 async def _write_admin_alert(db, alert_type: str, **fields: Any) -> None:
     doc = {"type": alert_type, "resolved": False, "created_at": datetime.now(timezone.utc), **fields}
     collection = getattr(db, "admin_alerts", None)
     if collection is None:
         logger.error("admin_alerts collection unavailable; alert not stored: %s", doc)
-        return
-    await collection.insert_one(doc)
+    else:
+        await collection.insert_one(dict(doc))
+    if alert_type in EMAILED_ALERT_TYPES:
+        recipient = (settings.ADMIN_ALERT_EMAIL or settings.ADMIN_EMAIL or "").strip()
+        if not recipient:
+            logger.error("Admin alert %s not emailed: ADMIN_ALERT_EMAIL/ADMIN_EMAIL not set", alert_type)
+            return
+        try:
+            sent = await send_admin_alert_email(recipient, doc)
+        except Exception:
+            logger.exception("Admin alert email failed for %s", alert_type)
+            return
+        if not sent:
+            logger.error("Admin alert email for %s was not sent (Resend unavailable)", alert_type)
 
 
 async def _cancel_previous_subscription(db, user_id: Any, previous_sub_id: str, new_sub_id: str) -> None:
@@ -258,18 +312,74 @@ async def _clear_stale_pending_checkout(db, user: dict[str, Any]) -> bool:
         return False
 
     pending_sub_id = _pending_subscription_id(user)
+    if not pending_sub_id:
+        return await _drop_pending_checkout(db, user, pending_plan, None, "no subscription id")
+
+    # The customer may have paid after the webhook was missed: ask Razorpay before cancelling.
+    entity = await _fetch_razorpay_subscription(pending_sub_id)
+    if entity is None:
+        logger.warning("Keeping expired pending checkout %s for user=%s: Razorpay fetch failed; retry next sweep",
+                       pending_sub_id, user.get("_id"))
+        return False
+
+    status = str(entity.get("status") or "").lower()
+    if status in _PAID_SUBSCRIPTION_STATES:
+        return await _promote_paid_pending_subscription(db, user, pending_plan, pending_sub_id, entity)
+
+    if status in _UNPAID_SUBSCRIPTION_STATES:
+        done, detail = await _cancel_razorpay_subscription(pending_sub_id, attempts=1)
+        if not done:
+            logger.warning("Keeping expired pending checkout %s: cancel failed (%s); retry next sweep", pending_sub_id, detail)
+            return False
+        return await _drop_pending_checkout(db, user, pending_plan, pending_sub_id, f"unpaid ({status}), {detail}")
+
+    if status in _TERMINAL_SUBSCRIPTION_STATES:
+        return await _drop_pending_checkout(db, user, pending_plan, pending_sub_id, f"already {status}")
+
+    # halted/paused or an unknown state on a checkout that never activated here: needs a human.
+    await _write_admin_alert(
+        db,
+        "pending_subscription_unexpected_status",
+        user_id=str(user["_id"]),
+        subscription_id=pending_sub_id,
+        status=status or None,
+    )
+    return await _drop_pending_checkout(db, user, pending_plan, pending_sub_id, f"unexpected status {status!r}")
+
+
+async def _drop_pending_checkout(db, user: dict[str, Any], pending_plan: str, pending_sub_id: str | None, reason: str) -> bool:
     result = await db.users.update_one(
         {"_id": user["_id"], "pending_plan": pending_plan},
         {"$set": _cleared_pending_fields(user, pending_sub_id)},
     )
     if getattr(result, "matched_count", 1) == 0:
         return False
-    logger.info("Auto-cleared stale pending checkout for user=%s", str(user.get("_id")))
-    if pending_sub_id:
-        # Stop the abandoned checkout link from being paid later (best effort, single try).
-        done, detail = await _cancel_razorpay_subscription(pending_sub_id, attempts=1)
-        if not done:
-            logger.warning("Could not cancel expired pending subscription %s: %s", pending_sub_id, detail)
+    logger.info("Expired pending checkout %s for user=%s: %s", pending_sub_id, user.get("_id"), reason)
+    return True
+
+
+async def _promote_paid_pending_subscription(
+    db, user: dict[str, Any], pending_plan: str, sub_id: str, entity: dict[str, Any]
+) -> bool:
+    """Apply a paid pending subscription found by the sweep, exactly like its activation event."""
+    notes = entity.get("notes") or {}
+    resolved = _plan_from_subscription({**entity, "id": entity.get("id") or sub_id})
+    if str(notes.get("user_id") or "") != str(user["_id"]) or not resolved:
+        logger.error("Paid pending subscription %s does not match user=%s or a configured plan", sub_id, user.get("_id"))
+        await _write_admin_alert(
+            db,
+            "unmatched_subscription_activation",
+            user_id=str(user["_id"]),
+            subscription_id=sub_id,
+            status=str(entity.get("status") or "") or None,
+            reason="found paid by expiry sweep but notes/plan_id do not match",
+        )
+        return await _drop_pending_checkout(db, user, pending_plan, None, "paid but unmatched; admin alerted")
+
+    plan_enum, billing_cycle = resolved
+    logger.warning("Pending subscription %s for user=%s was paid without a processed webhook; promoting",
+                   sub_id, user.get("_id"))
+    await _activate_subscription(db, user, plan_enum, billing_cycle, sub_id)
     return True
 
 
@@ -309,6 +419,9 @@ async def create_checkout_session(
 
     if await _clear_stale_pending_checkout(db, user):
         user = await db.users.find_one({"_id": user["_id"]}) or user
+        # The expired checkout may have turned out to be paid and was just applied.
+        if _plan_rank(target_plan) <= _plan_rank(_normalize_user_plan(user)):
+            raise HTTPException(status_code=400, detail="Only upgrades are allowed")
 
     pending_plan = user.get("pending_plan")
     if pending_plan in {PlanType.Starter.value, PlanType.Pro.value}:
