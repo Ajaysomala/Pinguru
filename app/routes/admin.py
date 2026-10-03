@@ -11,11 +11,10 @@ from bson import ObjectId
 from bson.errors import InvalidId
 import jwt
 import secrets
-from urllib.parse import urlparse
 
 from app.config import settings
 from app.database import get_db
-from app.security import limiter
+from app.security import clear_session_cookies, get_cookie, limiter, set_session_cookie
 from app.services.instagram import InstagramService
 
 router = APIRouter()
@@ -145,69 +144,15 @@ def _user_selector(user_id: str) -> dict[str, Any]:
         return {"_id": user_id}
 
 
-def _shared_cookie_domain() -> str | None:
-    if settings.ENVIRONMENT.lower() != "production":
-        return None
-    frontend_url = (settings.FRONTEND_URL or "").strip()
-    if not frontend_url:
-        return None
-    host = (urlparse(frontend_url).hostname or "").strip().lower()
-    if not host or host in {"localhost", "127.0.0.1"}:
-        return None
-    host_parts = host.split(".")
-    if len(host_parts) < 2:
-        return None
-    return f".{'.'.join(host_parts[-2:])}"
-
-
-def _cookie_cleanup_domains() -> list[str | None]:
-    domains: set[str] = set()
-
-    shared_domain = _shared_cookie_domain()
-    if shared_domain:
-        domains.add(shared_domain)
-        domains.add(shared_domain.lstrip("."))
-
-    for source in (settings.FRONTEND_URL, settings.BASE_URL):
-        host = (urlparse(source or "").hostname or "").strip().lower()
-        if not host or host in {"localhost", "127.0.0.1"}:
-            continue
-        domains.add(host)
-        if host.startswith("www."):
-            domains.add(host[4:])
-
-    return [None, *sorted(domains)]
-
-
-def _set_admin_cookie(response: Response, token: str) -> None:
+def _set_admin_cookie(response: Response, token: str) -> str:
     csrf_token = secrets.token_urlsafe(32)
-    cookie_domain = _shared_cookie_domain()
-    response.set_cookie(
-        key="pg_admin_token",
-        value=token,
-        httponly=True,
-        secure=settings.ENVIRONMENT.lower() == "production",
-        samesite="lax",
-        max_age=3600,
-        path="/",
-        domain=cookie_domain,
-    )
-    response.set_cookie(
-        key="pg_admin_csrf",
-        value=csrf_token,
-        httponly=False,
-        secure=settings.ENVIRONMENT.lower() == "production",
-        samesite="lax",
-        max_age=3600,
-        path="/",
-        domain=cookie_domain,
-    )
+    set_session_cookie(response, "pg_admin_token", token, max_age=3600, httponly=True)
+    set_session_cookie(response, "pg_admin_csrf", csrf_token, max_age=3600, httponly=False)
+    return csrf_token
 
 
 def _clear_admin_cookie(response: Response) -> None:
-    for domain in _cookie_cleanup_domains():
-        response.delete_cookie(key="pg_admin_token", path="/", domain=domain)
-        response.delete_cookie(key="pg_admin_csrf", path="/", domain=domain)
+    clear_session_cookies(response, "pg_admin_token", "pg_admin_csrf")
 
 
 async def get_admin_user(
@@ -216,7 +161,7 @@ async def get_admin_user(
     db=Depends(get_db),
 ):
     # Cookie-first (httpOnly) — XSS safe
-    token = request.cookies.get("pg_admin_token")
+    token = get_cookie(request, "pg_admin_token")
 
     # Bearer fallback for backward compatibility
     if not token and credentials and credentials.credentials:
@@ -284,8 +229,8 @@ async def admin_login(request: Request, data: AdminLoginRequest, response: Respo
 
     token = _create_admin_token(email, session_version=admin_sv)
     # Set httpOnly cookie — XSS safe, no localStorage exposure
-    _set_admin_cookie(response, token)
-    return {"ok": True}
+    csrf_token = _set_admin_cookie(response, token)
+    return {"ok": True, "csrf_token": csrf_token}
 
 
 @router.post("/auth/login")
@@ -307,6 +252,17 @@ async def admin_logout_alias(response: Response, db=Depends(get_db)):
     _clear_admin_cookie(response)
     return {"ok": True}
 
+
+
+@router.get("/csrf")
+@router.get("/auth/csrf")
+async def admin_csrf(request: Request, response: Response, admin=Depends(get_admin_user)):
+    """Return the admin CSRF token (cookie is host-only on the API host)."""
+    token = get_cookie(request, "pg_admin_csrf")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        set_session_cookie(response, "pg_admin_csrf", token, max_age=3600, httponly=False)
+    return {"csrf_token": token}
 
 
 @router.get("/me")

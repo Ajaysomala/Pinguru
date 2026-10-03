@@ -52,6 +52,20 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "production"
     DISABLE_WEBHOOK_SIGNATURE: bool = False
 
+    # Real client IP behind a proxy. Leave CLIENT_IP_HEADER empty to use the
+    # direct peer. Set to "cf-connecting-ip", "x-real-ip" or "x-forwarded-for"
+    # only when that header is set by a proxy you control.
+    CLIENT_IP_HEADER: str = ""
+    # Comma-separated CIDRs of proxies allowed to set CLIENT_IP_HEADER (empty = any peer).
+    TRUSTED_PROXY_IPS: str = ""
+    # For x-forwarded-for: number of trusted proxies that append to the header.
+    TRUSTED_PROXY_COUNT: int = 1
+    # Rate-limit store. "memory://" is per-process; use a mongodb:// or redis://
+    # URI when running more than one worker/instance.
+    RATE_LIMIT_STORAGE_URI: str = "memory://"
+    # Rollback switch: True restores the old .parent-domain cookies without __Host- prefix.
+    LEGACY_SHARED_COOKIES: bool = False
+
 
 settings = Settings()  # pyright: ignore[reportCallIssue]
 

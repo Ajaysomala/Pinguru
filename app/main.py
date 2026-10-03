@@ -8,7 +8,7 @@ from app.config import settings, validate_startup_config
 from app.database import connect_db, disconnect_db
 from app.routes import webhook, auth, automation, dashboard, plans, admin, contacts, billing
 from app.services.token_refresh import token_refresh_background_loop
-from app.security import limiter
+from app.security import get_cookie, limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 import logging
@@ -62,8 +62,8 @@ async def rate_limit_handler(request, exc):
 
 @app.middleware("http")
 async def add_security_headers(request, call_next):
-    has_user_cookie = bool(request.cookies.get("pg_token"))
-    has_admin_cookie = bool(request.cookies.get("pg_admin_token"))
+    has_user_cookie = bool(get_cookie(request, "pg_token"))
+    has_admin_cookie = bool(get_cookie(request, "pg_admin_token"))
     path = request.url.path
 
     if request.method.upper() not in SAFE_HTTP_METHODS and (has_user_cookie or has_admin_cookie) and path not in CSRF_EXEMPT_PATHS:
@@ -78,7 +78,7 @@ async def add_security_headers(request, call_next):
 
         csrf_header = request.headers.get("X-CSRF-Token") or ""
         csrf_cookie_name = "pg_admin_csrf" if has_admin_cookie else "pg_csrf"
-        csrf_cookie = request.cookies.get(csrf_cookie_name) or ""
+        csrf_cookie = get_cookie(request, csrf_cookie_name) or ""
         if not csrf_header or not csrf_cookie or not hmac.compare_digest(csrf_header, csrf_cookie):
             return JSONResponse(status_code=403, content={"detail": "Invalid CSRF token"})
 

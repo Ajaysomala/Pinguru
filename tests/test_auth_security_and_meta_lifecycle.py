@@ -1145,9 +1145,11 @@ def test_generic_404_and_dummy_bcrypt_verify(test_setup):
         assert mock_verify.called, "Dummy bcrypt verify was not invoked for unknown email on /auth/login!"
 
 
-def test_lockout_keyed_on_email_and_ip(test_setup):
+def test_lockout_keyed_on_email_and_ip(test_setup, monkeypatch):
     """Lockout must be keyed on (email + IP) so an attacker cannot DoS a user on another IP."""
     client, mock_db = test_setup
+    # Simulates deployment behind a trusted proxy that sets X-Forwarded-For.
+    monkeypatch.setattr(settings, "CLIENT_IP_HEADER", "x-forwarded-for")
     email = f"lockout_{secrets.token_hex(4)}@example.com"
     correct_pass = "GoodPassword123!"
     attacker_ip = "198.51.100.22"

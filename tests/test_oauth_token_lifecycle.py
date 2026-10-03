@@ -136,12 +136,13 @@ class _MockCollection:
         return len([item for item in self.data if self._matches_filter(item, query)])
 
 
-def _make_dummy_request():
+def _make_dummy_request(cookies: dict[str, str] | None = None):
+    cookie_header = "; ".join(f"{k}={v}" for k, v in (cookies or {}).items())
     scope = {
         "type": "http",
         "method": "GET",
         "path": "/test",
-        "headers": [],
+        "headers": [(b"cookie", cookie_header.encode())] if cookie_header else [],
         "client": ("127.0.0.1", 12345),
         "app": SimpleNamespace(state=SimpleNamespace()),
     }
@@ -228,7 +229,7 @@ def test_oauth_callback_saves_fields_and_verifies_scopes(monkeypatch):
     users_col = _MockCollection([user_doc])
     db = SimpleNamespace(users=users_col)
 
-    state = create_oauth_state(str(user_id))
+    state = create_oauth_state(str(user_id), "test-nonce")
 
     monkeypatch.setattr(
         InstagramService,
@@ -259,7 +260,7 @@ def test_oauth_callback_saves_fields_and_verifies_scopes(monkeypatch):
     )
     monkeypatch.setattr(InstagramService, "subscribe_app_to_webhooks", AsyncMock(return_value=True))
 
-    req = _make_dummy_request()
+    req = _make_dummy_request({"pg_oauth_nonce": "test-nonce"})
     resp = asyncio.run(instagram_callback(
         request=req,
         code="valid_code",
@@ -287,7 +288,7 @@ def test_oauth_callback_rejects_missing_scope(monkeypatch):
     user_doc = {"_id": user_id, "email": "test@pinguru.io"}
     users_col = _MockCollection([user_doc])
     db = SimpleNamespace(users=users_col)
-    state = create_oauth_state(str(user_id))
+    state = create_oauth_state(str(user_id), "test-nonce")
 
     monkeypatch.setattr(
         InstagramService,
@@ -310,7 +311,7 @@ def test_oauth_callback_rejects_missing_scope(monkeypatch):
         AsyncMock(return_value=["instagram_business_basic"]),
     )
 
-    req = _make_dummy_request()
+    req = _make_dummy_request({"pg_oauth_nonce": "test-nonce"})
     resp = asyncio.run(instagram_callback(request=req, code="valid_code", state=state, db=db))
     # Callback catches HTTPException and redirects with error detail in URL
     assert "error=" in resp.headers.get("location", "")

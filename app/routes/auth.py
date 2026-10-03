@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode
 import base64
 import hashlib
 import hmac
@@ -24,7 +24,7 @@ from pydantic import BaseModel, EmailStr, field_validator
 from app.config import settings
 from app.database import get_db
 from app.models.models import PLAN_LIMITS, PlanType, UserCreate, get_plan_type
-from app.security import limiter
+from app.security import clear_session_cookies, client_ip, get_cookie, limiter, set_session_cookie
 from app.services.email import send_otp_email, send_password_reset_email
 from app.services.instagram import InstagramService, InstagramTokenExpiredError
 from cryptography.fernet import InvalidToken
@@ -116,45 +116,8 @@ def _session_version(user_doc: dict[str, Any]) -> int:
         return 0
 
 
-def _shared_cookie_domain() -> str | None:
-    if settings.ENVIRONMENT.lower() != "production":
-        return None
-    frontend_url = (settings.FRONTEND_URL or "").strip()
-    if not frontend_url:
-        return None
-    host = (urlparse(frontend_url).hostname or "").strip().lower()
-    if not host or host in {"localhost", "127.0.0.1"}:
-        return None
-    host_parts = host.split(".")
-    if len(host_parts) < 2:
-        return None
-    return f".{'.'.join(host_parts[-2:])}"
-
-
-def _cookie_cleanup_domains() -> list[str | None]:
-    domains: set[str] = set()
-
-    shared_domain = _shared_cookie_domain()
-    if shared_domain:
-        domains.add(shared_domain)
-        domains.add(shared_domain.lstrip("."))
-
-    for source in (settings.FRONTEND_URL, settings.BASE_URL):
-        host = (urlparse(source or "").hostname or "").strip().lower()
-        if not host or host in {"localhost", "127.0.0.1"}:
-            continue
-        domains.add(host)
-        if host.startswith("www."):
-            domains.add(host[4:])
-
-    return [None, *sorted(domains)]
-
-
 def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "127.0.0.1"
+    return client_ip(request)
 
 
 async def _is_login_locked_for_email_ip(db, email: str, ip: str) -> bool:
@@ -209,35 +172,27 @@ def _is_login_locked(user_doc: dict[str, Any]) -> bool:
 
 
 
-def _set_auth_cookie(response: Response, token: str) -> None:
+def _set_auth_cookie(response: Response, token: str, csrf_token: str | None = None) -> str:
+    csrf_token = csrf_token or secrets.token_urlsafe(32)
+    set_session_cookie(response, "pg_token", token, max_age=604800, httponly=True)
+    set_session_cookie(response, "pg_csrf", csrf_token, max_age=604800, httponly=False)
+    return csrf_token
+
+
+def _auth_response(payload: dict[str, Any], token: str) -> Response:
+    """JSON response that sets session cookies and returns the CSRF token in the body.
+
+    The CSRF cookie is host-only on the API host, so the frontend (another host)
+    cannot read it from document.cookie and must use this value instead.
+    """
     csrf_token = secrets.token_urlsafe(32)
-    cookie_domain = _shared_cookie_domain()
-    response.set_cookie(
-        key="pg_token",
-        value=token,
-        httponly=True,
-        secure=settings.ENVIRONMENT.lower() == "production",
-        samesite="lax",
-        max_age=604800,
-        path="/",
-        domain=cookie_domain,
-    )
-    response.set_cookie(
-        key="pg_csrf",
-        value=csrf_token,
-        httponly=False,
-        secure=settings.ENVIRONMENT.lower() == "production",
-        samesite="lax",
-        max_age=604800,
-        path="/",
-        domain=cookie_domain,
-    )
+    response = Response(json.dumps({**payload, "csrf_token": csrf_token}), media_type="application/json")
+    _set_auth_cookie(response, token, csrf_token)
+    return response
 
 
 def _clear_auth_cookie(response: Response) -> None:
-    for domain in _cookie_cleanup_domains():
-        response.delete_cookie(key="pg_token", path="/", domain=domain)
-        response.delete_cookie(key="pg_csrf", path="/", domain=domain)
+    clear_session_cookies(response, "pg_token", "pg_csrf")
 
 
 def generate_otp() -> str:
@@ -352,10 +307,47 @@ def _collect_instagram_account_ids(
     )
 
 
-def create_oauth_state(user_id: str) -> str:
-    expire = _utcnow() + timedelta(minutes=10)
-    payload = {"sub": user_id, "exp": expire, "type": "instagram_oauth_state"}
+OAUTH_NONCE_COOKIE = "pg_oauth_nonce"
+OAUTH_NONCE_PATH = "/auth/instagram"
+OAUTH_STATE_TTL_SECONDS = 600
+
+
+def _hash_oauth_nonce(nonce: str) -> str:
+    return hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+
+
+def create_oauth_state(user_id: str, nonce: str | None = None) -> str:
+    expire = _utcnow() + timedelta(seconds=OAUTH_STATE_TTL_SECONDS)
+    payload: dict[str, Any] = {"sub": user_id, "exp": expire, "type": "instagram_oauth_state"}
+    if nonce is not None:
+        payload["nh"] = _hash_oauth_nonce(nonce)
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+
+def verify_oauth_state(state: str, nonce: str | None) -> str:
+    """Decode the state JWT and require it to match the browser's nonce cookie.
+
+    Binding state to a cookie in the initiating browser stops an attacker from
+    sending a victim their own connect link (login CSRF on account linking).
+    """
+    try:
+        payload = jwt.decode(state, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+    expected_hash = str(payload.get("nh") or "")
+    if not nonce or not expected_hash or not hmac.compare_digest(_hash_oauth_nonce(nonce), expected_hash):
+        raise HTTPException(status_code=400, detail="Instagram connection expired. Please start again from PinGuru.")
+    return decode_oauth_state(state)
+
+
+def _clear_oauth_nonce(response: Response) -> None:
+    response.delete_cookie(
+        key=OAUTH_NONCE_COOKIE,
+        path=OAUTH_NONCE_PATH,
+        secure=settings.ENVIRONMENT.lower() == "production",
+        httponly=True,
+        samesite="lax",
+    )
 
 
 def decode_oauth_state(state: str) -> str:
@@ -396,7 +388,7 @@ def _oauth_success_redirect() -> RedirectResponse:
 
 async def get_current_user(request: Request, db=Depends(get_db)):
     """Supports cookie-first auth with Bearer fallback for compatibility."""
-    token = request.cookies.get("pg_token")
+    token = get_cookie(request, "pg_token")
 
     if not token:
         auth_header = request.headers.get("Authorization", "")
@@ -597,16 +589,14 @@ async def verify_email(request: Request, data: OTPVerifyRequest, db=Depends(get_
     )
 
     token = create_jwt(str(user["_id"]), _session_version(user))
-    response = Response(
-        json.dumps({
+    return _auth_response(
+        {
             "message": "Email verified",
             "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
             "instagram_connected": bool(user.get("instagram_user_id")),
-        }),
-        media_type="application/json",
+        },
+        token,
     )
-    _set_auth_cookie(response, token)
-    return response
 
 
 @router.post("/resend-otp")
@@ -777,9 +767,7 @@ async def login(request: Request, data: UserLoginRequest, db=Depends(get_db)):
         "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
         "instagram_connected": bool(user.get("instagram_user_id")),
     }
-    response = Response(json.dumps(response_data), media_type="application/json")
-    _set_auth_cookie(response, token)
-    return response
+    return _auth_response(response_data, token)
 
 
 
@@ -831,9 +819,22 @@ async def me(request: Request, user=Depends(get_current_user), db: Any = Depends
     }
 
 
+@router.get("/csrf")
+@limiter.limit("60/minute")
+async def csrf_token(request: Request, user=Depends(get_current_user)):
+    """Return the CSRF token for the X-CSRF-Token header (cookie is not readable cross-host)."""
+    token = get_cookie(request, "pg_csrf")
+    if token:
+        return {"csrf_token": token}
+    token = secrets.token_urlsafe(32)
+    response = Response(json.dumps({"csrf_token": token}), media_type="application/json")
+    set_session_cookie(response, "pg_csrf", token, max_age=604800, httponly=False)
+    return response
+
+
 @router.post("/logout")
 async def logout(request: Request, db=Depends(get_db)):
-    token = request.cookies.get("pg_token")
+    token = get_cookie(request, "pg_token")
     if not token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.lower().startswith("bearer "):
@@ -859,8 +860,19 @@ async def logout(request: Request, db=Depends(get_db)):
 # ── Instagram OAuth ───────────────────────────────────────────────────────────
 
 @router.get("/instagram/initiate")
-async def instagram_initiate(user=Depends(get_current_user)):
-    state = create_oauth_state(str(user["_id"]))
+async def instagram_initiate(response: Response, user=Depends(get_current_user)):
+    nonce = secrets.token_urlsafe(32)
+    state = create_oauth_state(str(user["_id"]), nonce)
+    # Host-only, httpOnly; SameSite=Lax is sent on the top-level redirect back from Instagram.
+    response.set_cookie(
+        key=OAUTH_NONCE_COOKIE,
+        value=nonce,
+        httponly=True,
+        secure=settings.ENVIRONMENT.lower() == "production",
+        samesite="lax",
+        max_age=OAUTH_STATE_TTL_SECONDS,
+        path=OAUTH_NONCE_PATH,
+    )
     redirect_uri = _instagram_redirect_uri()
     # Use IG_APP_ID (Instagram sub-app) for instagram.com/oauth/authorize
     # Fall back to META_APP_ID only if IG_APP_ID not set
@@ -898,7 +910,7 @@ async def instagram_callback(
         if not state:
             raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
-        user_id = decode_oauth_state(state)
+        user_id = verify_oauth_state(state, request.cookies.get(OAUTH_NONCE_COOKIE))
 
         try:
             user_object_id = ObjectId(user_id)
@@ -986,12 +998,18 @@ async def instagram_callback(
             },
         )
     except HTTPException as exc:
-        return _oauth_error_redirect(str(exc.detail))
+        redirect = _oauth_error_redirect(str(exc.detail))
+        _clear_oauth_nonce(redirect)
+        return redirect
     except Exception:
         logger.exception("Unexpected Instagram callback failure")
-        return _oauth_error_redirect("Instagram connection failed. Please try again.")
+        redirect = _oauth_error_redirect("Instagram connection failed. Please try again.")
+        _clear_oauth_nonce(redirect)
+        return redirect
 
-    return _oauth_success_redirect()
+    redirect = _oauth_success_redirect()
+    _clear_oauth_nonce(redirect)
+    return redirect
 
 
 @router.post("/instagram/token")
@@ -1198,17 +1216,13 @@ async def google_callback(data: GoogleAuthRequest, db=Depends(get_db)):
             user["email_verified"] = True
 
         token = create_jwt(str(user["_id"]), _session_version(user))
-        response = Response(
-            json.dumps(
-                {
-                    "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
-                    "instagram_connected": bool(user.get("instagram_user_id")),
-                }
-            ),
-            media_type="application/json",
+        return _auth_response(
+            {
+                "plan": get_plan_type(user.get("plan", PlanType.Free)).name,
+                "instagram_connected": bool(user.get("instagram_user_id")),
+            },
+            token,
         )
-        _set_auth_cookie(response, token)
-        return response
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail="Google authentication failed.")
