@@ -1058,6 +1058,99 @@ def test_unauthenticated_admin_logout_does_not_touch_session_version(test_setup,
     assert _version() == 4
 
 
+def test_logout_with_non_session_token_does_not_revoke(test_setup):
+    """OAuth state / reset tokens are signed with the same secret but must not revoke sessions."""
+    from app.routes.auth import _create_password_reset_token, create_oauth_state
+
+    client, mock_db = test_setup
+    user_id = ObjectId()
+    email = f"state_logout_{secrets.token_hex(4)}@example.com"
+    asyncio.run(mock_db.users.insert_one({
+        "_id": user_id,
+        "email": email,
+        "email_verified": True,
+        "is_active": True,
+        "plan": PlanType.Free.value,
+        "session_version": 5,
+        "created_at": datetime.now(timezone.utc),
+    }))
+    oauth_state = create_oauth_state(str(user_id), "nonce")
+    reset_token = _create_password_reset_token(email)
+    untyped = jwt.encode({"sub": str(user_id)}, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+    for token in (oauth_state, reset_token, untyped):
+        for send in ("bearer", "cookie"):
+            client.cookies.clear()
+            headers = {}
+            if send == "bearer":
+                headers["Authorization"] = f"Bearer {token}"
+            else:
+                client.cookies.set("pg_token", token)
+            resp = client.post("/auth/logout", headers=headers)
+            assert resp.status_code == 200
+            assert "pg_token=" in resp.headers.get("set-cookie", "")
+            user = asyncio.run(mock_db.users.find_one({"_id": user_id}))
+            assert user["session_version"] == 5, f"{send} logout with non-session token revoked the session"
+
+    # A real session token still revokes.
+    client.cookies.clear()
+    resp = client.post("/auth/logout", headers={"Authorization": f"Bearer {create_jwt(str(user_id), session_version=5)}"})
+    assert resp.status_code == 200
+    assert asyncio.run(mock_db.users.find_one({"_id": user_id}))["session_version"] == 6
+
+
+def _parse_set_cookies(response):
+    cookies = []
+    for raw_name, raw_value in response.headers.raw:
+        if raw_name.decode().lower() != "set-cookie":
+            continue
+        parts = [p.strip() for p in raw_value.decode().split(";")]
+        name, _, value = parts[0].partition("=")
+        attrs = {}
+        for part in parts[1:]:
+            key, _, val = part.partition("=")
+            attrs[key.lower()] = val
+        cookies.append({"name": name, "value": value, "attrs": attrs})
+    return cookies
+
+
+def _is_deletion(cookie):
+    return cookie["attrs"].get("max-age") == "0" or "1970" in cookie["attrs"].get("expires", "")
+
+
+@pytest.mark.parametrize("environment", ["production", "development"])
+def test_logout_clears_each_auth_cookie_with_matching_path_and_secure(test_setup, monkeypatch, environment):
+    """Browsers only delete a cookie when name, Path, Domain (and Secure for __Host-) match how it was set."""
+    from fastapi import Response as FastAPIResponse
+    from app.routes.admin import _set_admin_cookie
+    from app.routes.auth import _auth_response
+
+    client, _mock_db = test_setup
+    monkeypatch.setattr(settings, "ENVIRONMENT", environment)
+    monkeypatch.setattr(settings, "LEGACY_SHARED_COOKIES", False)
+
+    admin_set = FastAPIResponse()
+    _set_admin_cookie(admin_set, "admin-jwt")
+    set_cookies = {c["name"]: c for c in _parse_set_cookies(_auth_response({}, "user-jwt")) + _parse_set_cookies(admin_set)}
+
+    prefix = "__Host-" if environment == "production" else ""
+    expected = {f"{prefix}{base}" for base in ("pg_token", "pg_csrf", "pg_admin_token", "pg_admin_csrf")}
+    assert set(set_cookies) == expected
+
+    cleared = _parse_set_cookies(client.post("/auth/logout")) + _parse_set_cookies(client.post("/admin/auth/logout"))
+    for name, set_cookie in set_cookies.items():
+        matches = [
+            c for c in cleared
+            if c["name"] == name and _is_deletion(c) and "domain" not in c["attrs"]
+        ]
+        assert matches, f"logout did not clear {name} (host-only)"
+        for deletion in matches:
+            assert deletion["attrs"].get("path") == set_cookie["attrs"].get("path") == "/"
+            assert ("secure" in deletion["attrs"]) == ("secure" in set_cookie["attrs"]), name
+        if name.startswith("__Host-"):
+            assert "secure" in set_cookie["attrs"] and "domain" not in set_cookie["attrs"]
+
+
 def test_user_and_admin_logout_revokes_session(test_setup, monkeypatch):
     """User and admin logout increments session version, invalidating previously issued tokens."""
     client, mock_db = test_setup

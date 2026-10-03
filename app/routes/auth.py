@@ -843,7 +843,11 @@ async def logout(request: Request, db=Depends(get_db)):
         try:
             payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM], options={"verify_exp": False})
             user_id = payload.get("sub")
-            if user_id:
+            # Only session tokens may revoke sessions; OAuth state, reset or other
+            # signed tokens just get the cookies cleared.
+            if payload.get("typ") != "session":
+                logger.debug("Logout with non-session token type; session not revoked")
+            elif user_id:
                 await db.users.update_one(
                     {"_id": ObjectId(user_id)},
                     {"$inc": {"session_version": 1}},
