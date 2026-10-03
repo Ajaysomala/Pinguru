@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 
 BASE_GRAPH_FB = f"https://graph.facebook.com/{settings.INSTAGRAM_GRAPH_API_VERSION}"  # for FB Login / admin
 BASE_GRAPH_IG = "https://graph.instagram.com"  # for IG Business Login — NO version in URL
+
 HTTP_TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
 METADATA_IPS = {
@@ -21,6 +22,12 @@ METADATA_IPS = {
     "fd00:ec2::254",
 }
 CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _bearer(token: str) -> dict[str, str]:
+    """Send the token in a header so it never appears in request URLs (and URL logs)."""
+    return {"Authorization": f"Bearer {token}"}
+
 
 class InstagramTokenExpiredError(Exception):
     """Raised when Instagram Graph API returns error code 190 or 102 indicating expired or revoked token."""
@@ -112,10 +119,7 @@ class InstagramService:
         endpoint_id = ig_user_id or "me"
         url = f"{BASE_GRAPH_IG}/{endpoint_id}/messages"
         recipient_payload = {"comment_id": comment_id} if comment_id else {"id": recipient_ig_id}
-        payload: dict = {
-            "recipient": recipient_payload,
-            "access_token": access_token,
-        }
+        payload: dict = {"recipient": recipient_payload}
         message_payload: dict = {}
         if buttons:
             message_payload["attachment"] = {
@@ -140,7 +144,7 @@ class InstagramService:
         payload["message"] = message_payload
         logger.info("Sending Instagram DM request (has_buttons=%s, comment_id=%s)", bool(buttons), comment_id)
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_bearer(access_token)) as client:
                 resp = await client.post(url, json=payload)
         except httpx.RequestError:
             logger.exception("Instagram DM request failed")
@@ -158,7 +162,7 @@ class InstagramService:
                 logger.info("Retrying DM request via /me/messages fallback")
                 fallback_url = f"{BASE_GRAPH_IG}/me/messages"
                 try:
-                    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_bearer(access_token)) as client:
                         resp_fallback = await client.post(fallback_url, json=payload)
                     if resp_fallback.status_code == 200:
                         try:
@@ -202,12 +206,9 @@ class InstagramService:
             return None
 
         url = f"{BASE_GRAPH_IG}/{ig_account_id}"
-        params = {
-            "fields": "id,username,name",
-            "access_token": token,
-        }
+        params = {"fields": "id,username,name"}
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0), headers=_bearer(token)) as client:
                 resp = await client.get(url, params=params)
             if resp.status_code == 200:
                 data = resp.json() or {}
@@ -229,19 +230,15 @@ class InstagramService:
         url = f"{BASE_GRAPH_IG}/me"
         params = {
             "fields": "id,name,username,user_id,profile_picture_url,account_type,followers_count",
-            "access_token": access_token,
         }
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_bearer(access_token)) as client:
                 resp = await client.get(url, params=params)
                 if resp.status_code == 200:
                     return resp.json() or {}
                 # Fallback to basic fields if extended fields are unsupported on this node
                 logger.info("Extended profile fetch returned %s, falling back to basic fields", resp.status_code)
-                fallback_resp = await client.get(url, params={
-                    "fields": "id,name,username,user_id",
-                    "access_token": access_token,
-                })
+                fallback_resp = await client.get(url, params={"fields": "id,name,username,user_id"})
                 if fallback_resp.status_code == 200:
                     return fallback_resp.json() or {}
                 return {}
@@ -260,14 +257,13 @@ class InstagramService:
         url = f"{BASE_GRAPH_IG}/{instagram_scoped_user_id}"
         params = {
             "fields": "name,username,is_user_follow_business",
-            "access_token": decrypted,
         }
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_bearer(decrypted)) as client:
                 resp = await client.get(url, params=params)
                 if resp.status_code == 400:
                     # Fallback to name,username if is_user_follow_business is not supported on this node
-                    retry_resp = await client.get(url, params={"fields": "name,username", "access_token": decrypted})
+                    retry_resp = await client.get(url, params={"fields": "name,username"})
                     if retry_resp.status_code == 200:
                         return retry_resp.json() or {}
 
@@ -347,10 +343,9 @@ class InstagramService:
         params = {
             "fields": "id,caption,media_type,media_product_type,media_url,thumbnail_url,permalink,timestamp",
             "limit": limit,
-            "access_token": decrypted,
         }
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_bearer(decrypted)) as client:
                 resp = await client.get(url, params=params)
             if resp.status_code != 200:
                 body_sample = resp.text[:300]
@@ -473,11 +468,8 @@ class InstagramService:
             logger.error("Failed to decrypt access token in reply_to_comment: %s", exc)
             return {"success": False, "error": "Invalid or corrupted access token"}
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-                resp = await client.post(url, data={
-                    "message": message,
-                    "access_token": decrypted,
-                })
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_bearer(decrypted)) as client:
+                resp = await client.post(url, data={"message": message})
             return resp.json()
         except httpx.RequestError:
             logger.exception("Instagram comment reply failed")
@@ -501,21 +493,15 @@ class InstagramService:
         fields_with_mentions = "messages,comments,messaging_postbacks,mentions"
         fields_fallback = "messages,comments,messaging_postbacks"
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-                resp = await client.post(url, params={
-                    "subscribed_fields": fields_with_mentions,
-                    "access_token": token,
-                })
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_bearer(token)) as client:
+                resp = await client.post(url, params={"subscribed_fields": fields_with_mentions})
                 if resp.status_code == 200:
                     data = resp.json() or {}
                     return bool(data.get("success") is True or data.get("data") is not None or resp.status_code == 200)
 
                 # Retry without mentions if first call fails (e.g. mentions unsupported on this node)
                 logger.info("Subscribed apps with mentions returned %s: %s; retrying with fallback fields", resp.status_code, summarize_api_error(resp))
-                resp_fallback = await client.post(url, params={
-                    "subscribed_fields": fields_fallback,
-                    "access_token": token,
-                })
+                resp_fallback = await client.post(url, params={"subscribed_fields": fields_fallback})
                 if resp_fallback.status_code == 200:
                     data = resp_fallback.json() or {}
                     return bool(data.get("success") is True or data.get("data") is not None or resp_fallback.status_code == 200)
@@ -537,8 +523,8 @@ class InstagramService:
 
         url = f"{BASE_GRAPH_IG}/me/permissions"
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-                resp = await client.get(url, params={"access_token": token})
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=_bearer(token)) as client:
+                resp = await client.get(url)
             if resp.status_code == 200:
                 payload = resp.json() or {}
                 granted = [

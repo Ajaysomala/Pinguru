@@ -110,6 +110,34 @@ def _normalize_user_plan(user_doc: dict[str, Any]) -> PlanType:
     return get_plan_type(user_doc.get("plan", PlanType.Free))
 
 
+def _pending_subscription_id(user: dict[str, Any]) -> str | None:
+    """Subscription id of an in-flight checkout.
+
+    New checkouts store it in pending_razorpay_subscription_id. Checkouts started
+    before that field existed stored it in razorpay_subscription_id on a Free user.
+    """
+    pending = str(user.get("pending_razorpay_subscription_id") or "").strip()
+    if pending:
+        return pending
+    if user.get("pending_plan") and _normalize_user_plan(user) == PlanType.Free:
+        return str(user.get("razorpay_subscription_id") or "").strip() or None
+    return None
+
+
+def _cleared_pending_fields(user: dict[str, Any], pending_sub_id: str | None) -> dict[str, Any]:
+    """Fields that drop an in-flight checkout without touching the current plan."""
+    fields: dict[str, Any] = {
+        "pending_plan": None,
+        "pending_plan_billing_cycle": None,
+        "pending_razorpay_subscription_id": None,
+        "checkout_initiated_at": None,
+    }
+    # Legacy checkout kept its id in razorpay_subscription_id; clear only that case.
+    if pending_sub_id and str(user.get("razorpay_subscription_id") or "") == pending_sub_id:
+        fields["razorpay_subscription_id"] = None
+    return fields
+
+
 async def _clear_stale_pending_checkout(db, user: dict[str, Any]) -> bool:
     pending_plan = user.get("pending_plan")
     if pending_plan not in {PlanType.Starter.value, PlanType.Pro.value}:
@@ -126,16 +154,10 @@ async def _clear_stale_pending_checkout(db, user: dict[str, Any]) -> bool:
     if age_minutes <= 30:
         return False
 
+    pending_sub_id = _pending_subscription_id(user)
     await db.users.update_one(
-        {"_id": user["_id"], "plan": PlanType.Free.value},
-        {
-            "$set": {
-                "pending_plan": None,
-                "pending_plan_billing_cycle": None,
-                "razorpay_subscription_id": None,
-                "checkout_initiated_at": None,
-            }
-        },
+        {"_id": user["_id"], "pending_plan": pending_plan},
+        {"$set": _cleared_pending_fields(user, pending_sub_id)},
     )
     logger.info("Auto-cleared stale pending checkout for user=%s", str(user.get("_id")))
     return True
@@ -198,7 +220,8 @@ async def create_checkout_session(
         {"_id": user["_id"]},
         {
             "$set": {
-                "razorpay_subscription_id": sub_id,
+                # Current subscription stays in razorpay_subscription_id until this one activates.
+                "pending_razorpay_subscription_id": sub_id,
                 "pending_plan": target_plan.value,
                 "pending_plan_billing_cycle": billing_cycle,
                 "checkout_initiated_at": datetime.now(timezone.utc),
@@ -234,15 +257,11 @@ async def cancel_pending_checkout(
     db=Depends(get_db),
 ):
     pending_plan = user.get("pending_plan")
-    sub_id = user.get("razorpay_subscription_id")
-    current_plan = _normalize_user_plan(user)
-    is_active_paid = current_plan in {PlanType.Starter, PlanType.Pro} and bool(sub_id)
-
     if not pending_plan:
         return {"cancelled": False, "message": "No pending checkout found"}
 
-    if is_active_paid:
-        raise HTTPException(status_code=409, detail="Cannot cancel an active paid subscription")
+    # Only the pending checkout is cancelled; the current plan and subscription stay as they are.
+    sub_id = _pending_subscription_id(user)
 
     # Best effort cancellation on provider side if subscription was already created.
     if sub_id and _is_razorpay_configured():
@@ -259,17 +278,10 @@ async def cancel_pending_checkout(
     result = await db.users.update_one(
         {
             "_id": user["_id"],
-            "plan": PlanType.Free.value,
-            "pending_plan": {"$in": [PlanType.Starter.value, PlanType.Pro.value]},
+            "pending_plan": pending_plan,
+            "pending_razorpay_subscription_id": user.get("pending_razorpay_subscription_id"),
         },
-        {
-            "$set": {
-                "pending_plan": None,
-                "pending_plan_billing_cycle": None,
-                "razorpay_subscription_id": None,
-                "checkout_initiated_at": None,
-            }
-        },
+        {"$set": _cleared_pending_fields(user, sub_id)},
     )
 
     if result.matched_count == 0:
@@ -350,12 +362,13 @@ def _plan_from_subscription(sub_entity: dict[str, Any]) -> tuple[PlanType, str] 
     expected_plan_id = _resolve_razorpay_plan_id(plan_enum, billing_cycle)
     incoming_plan_id = str(sub_entity.get("plan_id") or "").strip()
     if not expected_plan_id or not hmac.compare_digest(incoming_plan_id, expected_plan_id):
-        logger.warning(
-            "Razorpay plan_id mismatch for subscription %s: notes plan=%s cycle=%s incoming plan_id=%s",
+        logger.error(
+            "Ignoring Razorpay event: plan_id missing/unknown for subscription %s (notes plan=%s cycle=%s incoming plan_id=%s, configured=%s)",
             sub_entity.get("id"),
             plan_enum.value,
             billing_cycle,
             incoming_plan_id or None,
+            bool(expected_plan_id),
         )
         return None
     return plan_enum, billing_cycle
@@ -398,20 +411,44 @@ async def _handle_subscription_activated(db, sub_entity: dict[str, Any]) -> dict
         return {"status": "ignored"}
 
     stored_sub_id = str(user_doc.get("razorpay_subscription_id") or "")
-    if stored_sub_id and stored_sub_id != incoming_sub_id:
+    pending_sub_id = str(user_doc.get("pending_razorpay_subscription_id") or "")
+    if incoming_sub_id not in {stored_sub_id, pending_sub_id} and (stored_sub_id or pending_sub_id):
         logger.warning(
-            "Subscription id mismatch user=%s stored=%s incoming=%s",
+            "Subscription id mismatch user=%s stored=%s pending=%s incoming=%s",
             user_id,
             stored_sub_id,
+            pending_sub_id,
             incoming_sub_id,
         )
         return {"status": "ignored"}
 
-    await db.users.update_one(
-        {"_id": user_object_id},
-        {"$set": _paid_plan_fields(plan_enum, billing_cycle, incoming_sub_id)},
-    )
+    await _activate_subscription(db, user_doc, plan_enum, billing_cycle, incoming_sub_id)
     return {"status": "ok"}
+
+
+async def _activate_subscription(
+    db,
+    user_doc: dict[str, Any],
+    plan_enum: PlanType,
+    billing_cycle: str,
+    sub_id: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Make sub_id the user's current subscription (promoting a pending one if needed)."""
+    fields = _paid_plan_fields(plan_enum, billing_cycle, sub_id)
+    fields["pending_razorpay_subscription_id"] = None
+    fields.update(extra or {})
+    previous_sub_id = str(user_doc.get("razorpay_subscription_id") or "")
+    if previous_sub_id and previous_sub_id != sub_id:
+        # Upgrade completed. The old subscription is not cancelled automatically.
+        fields["previous_razorpay_subscription_id"] = previous_sub_id
+        logger.warning(
+            "User %s switched subscription %s -> %s; previous subscription may still be active on Razorpay",
+            user_doc["_id"],
+            previous_sub_id,
+            sub_id,
+        )
+    await db.users.update_one({"_id": user_doc["_id"]}, {"$set": fields})
 
 
 async def _handle_subscription_renewed(db, sub_entity: dict[str, Any], event_type: str) -> dict[str, str]:
@@ -423,6 +460,8 @@ async def _handle_subscription_renewed(db, sub_entity: dict[str, Any], event_typ
         return {"status": "ok"}
 
     user_doc = await db.users.find_one({"razorpay_subscription_id": sub_id})
+    if not user_doc:
+        user_doc = await db.users.find_one({"pending_razorpay_subscription_id": sub_id})
     if not user_doc:
         logger.warning("Razorpay %s for unknown subscription %s", event_type, sub_id)
         return {"status": "ignored"}
@@ -437,10 +476,8 @@ async def _handle_subscription_renewed(db, sub_entity: dict[str, Any], event_typ
         return {"status": "ignored"}
     plan_enum, billing_cycle = resolved
 
-    fields = _paid_plan_fields(plan_enum, billing_cycle, sub_id)
-    if event_type == "subscription.charged":
-        fields["last_charged_at"] = datetime.now(timezone.utc)
-    await db.users.update_one({"_id": user_doc["_id"]}, {"$set": fields})
+    extra = {"last_charged_at": datetime.now(timezone.utc)} if event_type == "subscription.charged" else None
+    await _activate_subscription(db, user_doc, plan_enum, billing_cycle, sub_id, extra)
     return {"status": "ok"}
 
 
@@ -461,6 +498,14 @@ async def _downgrade_subscription(db, sub_id: Any, status: str, keep_subscriptio
     # Fetch user before downgrading to get email + current plan
     user_doc = await db.users.find_one({"razorpay_subscription_id": sub_id})
     if not user_doc:
+        pending_owner = await db.users.find_one({"pending_razorpay_subscription_id": sub_id})
+        if pending_owner:
+            # The pending upgrade ended before activating: current plan is untouched.
+            await db.users.update_one(
+                {"_id": pending_owner["_id"], "pending_razorpay_subscription_id": sub_id},
+                {"$set": _cleared_pending_fields(pending_owner, sub_id)},
+            )
+            logger.info("Pending subscription %s ended (%s); current plan kept", sub_id, status)
         return
     previous_plan = str(user_doc.get("plan") or "paid")
     was_paid = get_plan_type(user_doc.get("plan", PlanType.Free)) in {PlanType.Starter, PlanType.Pro}
@@ -506,7 +551,7 @@ async def get_billing_status(user=Depends(get_current_user)):
         "subscription_id": sub_id,
         "payment_provider": "razorpay",
         "is_active_paid": is_active_paid,
-        "is_checkout_pending": pending_plan is not None and not is_active_paid,
+        "is_checkout_pending": pending_plan is not None,
         "current_billing_cycle": current_billing_cycle,
         "pending_billing_cycle": pending_billing_cycle,
     }

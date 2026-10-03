@@ -27,6 +27,7 @@ async def _create_indexes(db) -> None:
     await _safe_create_index(db.users, "instagram_user_id", sparse=True)
     await _safe_create_index(db.users, "instagram_account_ids", sparse=True)
     await _safe_create_index(db.users, "razorpay_subscription_id", sparse=True)
+    await _safe_create_index(db.users, "pending_razorpay_subscription_id", sparse=True)
     await _safe_create_index(db.users, [("created_at", DESCENDING)])
     # TTL: auto-delete unverified user records when unverified_expires_at is reached
     await _safe_create_index(db.users, "unverified_expires_at", expireAfterSeconds=0)

@@ -339,3 +339,25 @@ def test_dockerignore_excludes_secrets_and_repo_metadata():
 
 def test_update_frontend_media_script_removed():
     assert not (ROOT / "update_frontend_media.py").exists()
+
+
+# ── Admin token refresh query ─────────────────────────────────────────────────
+
+def test_admin_refresh_query_excludes_null_and_empty_tokens():
+    from app.routes.admin import refresh_instagram_tokens
+
+    captured = {}
+
+    class _Cursor:
+        async def to_list(self, _n):
+            return []
+
+    def find(query, projection=None):
+        captured["query"] = query
+        return _Cursor()
+
+    db = SimpleNamespace(users=SimpleNamespace(find=find))
+    asyncio.run(refresh_instagram_tokens(admin={"email": "a@example.com"}, db=db))
+
+    for field in ("instagram_user_id", "instagram_access_token"):
+        assert captured["query"][field] == {"$exists": True, "$nin": [None, ""]}

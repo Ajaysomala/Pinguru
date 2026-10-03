@@ -150,6 +150,7 @@ class UserInDB(BaseModel):
     dm_count_reset_at: Optional[datetime] = None
     dm_limit: Optional[int] = None
     razorpay_subscription_id: Optional[str] = None
+    pending_razorpay_subscription_id: Optional[str] = None
     pending_plan: Optional[str] = None
     billing_cycle: Optional[str] = None
     pending_plan_billing_cycle: Optional[str] = None

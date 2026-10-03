@@ -12,10 +12,12 @@ from app.security import get_cookie, limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 import logging
+from app.log_redaction import install_log_redaction
 
 logging.basicConfig(level=logging.INFO)
-# httpx logs every request URL at INFO; Graph API calls carry access_token in the
-# query string, so keep these loggers at WARNING to keep tokens out of logs.
+install_log_redaction()
+# httpx logs every request URL at INFO. Token exchange/refresh calls still carry
+# tokens in the query string, so keep these loggers at WARNING (redaction is a backstop).
 for _noisy_logger in ("httpx", "httpcore"):
     logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)

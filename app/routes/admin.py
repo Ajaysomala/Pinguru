@@ -591,8 +591,8 @@ async def refresh_instagram_tokens(admin=Depends(get_admin_user), db=Depends(get
 
     cursor = db.users.find(
         {
-            "instagram_user_id": {"$exists": True, "$ne": None, "$ne": ""},
-            "instagram_access_token": {"$exists": True, "$ne": None, "$ne": ""},
+            "instagram_user_id": {"$exists": True, "$nin": [None, ""]},
+            "instagram_access_token": {"$exists": True, "$nin": [None, ""]},
             "$or": [
                 {"ig_token_expires_at": {"$lte": threshold}},
                 {"ig_token_expires_at": {"$exists": False}},
