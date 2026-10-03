@@ -1320,15 +1320,30 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
             if (now - reprompt_at).total_seconds() >= 86400:
                 reprompt_count = 0
 
-        # If Meta explicitly indicates the user is NOT following or status cannot be confirmed
+        # released_unverified: Meta could not confirm follow status after the reprompt
+        # cap, so deliver this rule once without granting a permanent completion.
+        released_unverified = False
         if is_following is not True:
             if reprompt_count >= 2:
+                if is_following is False:
+                    # Meta says not following: stay silent until they follow (no bypass).
+                    logger.info(
+                        "Follow gate reprompt limit reached (%s in 24h) for sender_id=%s and Meta reports not following. Not replying.",
+                        reprompt_count,
+                        sender_id,
+                    )
+                    await db.contacts.update_one(
+                        {"_id": contact["_id"]},
+                        {"$set": update_fields},
+                    )
+                    return
                 logger.info(
-                    "Follow gate reprompt limit reached (%s in 24h) for sender_id=%s. Letting user through.",
+                    "Follow gate reprompt limit reached (%s in 24h) for sender_id=%s and follow status unknown. Releasing rule %s once.",
                     reprompt_count,
                     sender_id,
+                    pending_rule_id,
                 )
-                # Cap reached: let the user through! Fall through to delivery below.
+                released_unverified = True
             else:
                 new_reprompt_count = reprompt_count + 1
                 update_fields["follow_gate_reprompt_count"] = new_reprompt_count
@@ -1384,10 +1399,11 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
                 }
             )
             if pending_rule:
-                await db.automation_rules.update_one(
-                    {"_id": pending_rule["_id"]},
-                    {"$inc": {"follow_gate_completed_count": 1}},
-                )
+                if not released_unverified:
+                    await db.automation_rules.update_one(
+                        {"_id": pending_rule["_id"]},
+                        {"$inc": {"follow_gate_completed_count": 1}},
+                    )
                 await _send_rule_reply(
                     db,
                     user,
@@ -1398,6 +1414,19 @@ async def handle_dm_event(db, ig_account_id: str, messaging: dict):
                 )
 
         now = datetime.now(timezone.utc)
+        if released_unverified:
+            # Not a completion: the next trigger of this rule prompts again.
+            await db.contacts.update_one(
+                {"_id": contact["_id"]},
+                {
+                    "$set": {
+                        "follow_gate_status": "released_unverified",
+                        "follow_gate_released_at": now,
+                        **update_fields,
+                    },
+                },
+            )
+            return
         await db.contacts.update_one(
             {"_id": contact["_id"]},
             {
@@ -1876,4 +1905,4 @@ async def handle_comment_event(db, ig_account_id: str, value: dict):
                         {"$set": {f"comment_dm_history.{media_key}": now}},
                         upsert=True,
                     )
-            break
+            break

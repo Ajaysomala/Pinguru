@@ -1,3 +1,4 @@
+import logging
 import asyncio
 import base64
 import hashlib
@@ -855,6 +856,31 @@ def test_reregister_per_email_limit_3_per_hour(test_setup, monkeypatch):
     r4 = client.post("/auth/register", json=reg_payload)
     assert r4.status_code == 429, r4.text
     assert "too many registration attempts" in r4.json().get("detail", "").lower()
+
+
+def test_meta_callbacks_warn_but_confirm_when_no_user_matches(test_setup, caplog):
+    """Unknown signed_request user_id: log a warning, still return Meta's confirmation."""
+    client, _mock_db = test_setup
+    payload = {
+        "algorithm": "HMAC-SHA256",
+        "user_id": f"unknown_{secrets.token_hex(4)}",
+        "issued_at": int(datetime.now(timezone.utc).timestamp()),
+    }
+    signed_req = _generate_meta_signed_request(payload)
+
+    with caplog.at_level(logging.WARNING, logger="app.routes.auth"):
+        deletion = client.post("/auth/data-deletion-callback", data={"signed_request": signed_req})
+        deauth = client.post("/auth/deauthorize", data={"signed_request": signed_req})
+
+    assert deletion.status_code == 200, deletion.text
+    assert deletion.json()["confirmation_code"]
+    assert deletion.json()["url"]
+    assert deauth.status_code == 200
+    assert deauth.json() == {"success": True}
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("data-deletion callback: no user matched" in m and payload["user_id"] in m for m in warnings)
+    assert any("deauthorize callback: no user matched" in m and payload["user_id"] in m for m in warnings)
 
 
 def test_data_deletion_callback_looks_up_by_app_scoped_id(test_setup):

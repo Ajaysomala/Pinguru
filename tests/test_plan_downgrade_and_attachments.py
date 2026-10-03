@@ -382,6 +382,33 @@ async def test_validate_attachment_url_accepts_valid_image(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_validate_attachment_url_rejects_non_443_port(monkeypatch):
+    head_calls = []
+
+    class MockResp:
+        status_code = 200
+        headers = {"content-type": "image/png", "content-length": "1024"}
+
+    class MockClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def head(self, url):
+            head_calls.append(url)
+            return MockResp()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda *args, **kwargs: MockClient())
+
+    is_valid, err = await InstagramService.validate_attachment_url("https://example.com:8443/image.png")
+    assert is_valid is False
+    assert "443" in err
+    assert head_calls == []
+
+    # Explicit :443 is still allowed.
+    is_valid, err = await InstagramService.validate_attachment_url("https://example.com:443/port-ok.png")
+    assert is_valid is True, err
+
+
+@pytest.mark.anyio
 async def test_validate_attachment_url_rejects_127_0_0_1():
     is_valid, err = await InstagramService.validate_attachment_url("https://127.0.0.1/image.png")
     assert is_valid is False

@@ -1547,6 +1547,13 @@ async def meta_data_deletion_callback(request: Request, db=Depends(get_db)):
             }
         )
 
+    if not matched_user:
+        logger.warning(
+            "Meta data-deletion callback: no user matched signed_request user_id=%s (confirmation_code=%s)",
+            meta_user_id or "<missing>",
+            confirmation_code,
+        )
+
     if matched_user:
         user_id_str = str(matched_user["_id"])
         await db.automation_rules.delete_many({"user_id": user_id_str})
@@ -1663,5 +1670,9 @@ async def meta_deauthorize_callback(request: Request, db=Depends(get_db)):
                 },
             )
             logger.info("Meta deauthorized for user %s (meta_user_id=%s)", user["_id"], meta_user_id)
+        else:
+            logger.warning("Meta deauthorize callback: no user matched signed_request user_id=%s", meta_user_id)
+    else:
+        logger.warning("Meta deauthorize callback: signed_request has no user_id")
 
     return {"success": True}

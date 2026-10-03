@@ -707,8 +707,7 @@ def test_follow_gate_skips_prompt_if_user_already_follows(monkeypatch):
     asyncio.run(_run())
 
 
-def test_follow_gate_reprompts_capped_at_2_per_24h_then_let_through(monkeypatch):
-    """Cap follow gate reprompts at 2 per contact per 24h, then let the user through."""
+def _capped_follow_gate_setup(monkeypatch, follow_status):
     user_id = ObjectId()
     rule_id = ObjectId()
     user = {
@@ -728,8 +727,6 @@ def test_follow_gate_reprompts_capped_at_2_per_24h_then_let_through(monkeypatch)
         "ask_follow_before_dm": True,
         "is_active": True,
     }
-
-    # Contact awaiting follow confirmation
     contact = {
         "_id": ObjectId(),
         "user_id": str(user_id),
@@ -740,19 +737,13 @@ def test_follow_gate_reprompts_capped_at_2_per_24h_then_let_through(monkeypatch)
         "follow_gate_reprompt_count": 0,
         "follow_gate_reprompt_at": None,
     }
-
     contacts_col = _MockCollection([contact])
-    dm_logs_col = _MockCollection()
-    rules_col = _MockCollection([rule])
-    users_col = _MockCollection([user])
-
     db = SimpleNamespace(
         contacts=contacts_col,
-        dm_logs=dm_logs_col,
-        automation_rules=rules_col,
-        users=users_col,
+        dm_logs=_MockCollection(),
+        automation_rules=_MockCollection([rule]),
+        users=_MockCollection([user]),
     )
-
     sent_messages = []
 
     async def fake_send_dm(access_token, recipient_ig_id, message, ig_user_id, attachment_url=None, attachment_type="image", comment_id=None, buttons=None):
@@ -761,39 +752,58 @@ def test_follow_gate_reprompts_capped_at_2_per_24h_then_let_through(monkeypatch)
 
     monkeypatch.setattr(InstagramService, "send_dm", fake_send_dm)
     monkeypatch.setattr(InstagramService, "decrypt_access_token", lambda tok: tok)
-    # Meta Graph API says user is NOT following
-    monkeypatch.setattr(InstagramService, "get_messaging_user_profile", AsyncMock(return_value={"is_user_follow_business": False}))
+    monkeypatch.setattr(
+        InstagramService,
+        "get_messaging_user_profile",
+        AsyncMock(return_value={"is_user_follow_business": follow_status} if follow_status is not None else {}),
+    )
+    messaging = {"sender": {"id": "fan_test"}, "message": {"mid": "m_1", "text": "followed"}}
+    return db, contacts_col, sent_messages, messaging, rule_id
 
-    messaging = {
-        "sender": {"id": "fan_test"},
-        "message": {"mid": "m_1", "text": "followed"},
-    }
+
+async def _two_reprompts(db, contacts_col, sent_messages, messaging):
+    for attempt in (1, 2):
+        await handle_messaging_event(db, "biz_123", messaging)
+        assert len(sent_messages) == attempt
+        assert "not following" in sent_messages[-1]["message"].lower()
+        c = await contacts_col.find_one({"ig_user_id": "fan_test"})
+        assert c["follow_gate_reprompt_count"] == attempt
+        assert c["follow_gate_status"] == "awaiting"
+
+
+def test_follow_gate_cap_with_not_following_stops_replying(monkeypatch):
+    """After 2 reprompts in 24h, Meta saying False means silence: no reward, no completion."""
+    db, contacts_col, sent_messages, messaging, rule_id = _capped_follow_gate_setup(monkeypatch, False)
 
     async def _run():
-        # Attempt 1: reprompt #1 sent
-        await handle_messaging_event(db, "biz_123", messaging)
-        assert len(sent_messages) == 1
-        assert "not following" in sent_messages[-1]["message"].lower()
-        c = await contacts_col.find_one({"ig_user_id": "fan_test"})
-        assert c["follow_gate_reprompt_count"] == 1
-        assert c["follow_gate_status"] == "awaiting"
-
-        # Attempt 2: reprompt #2 sent
-        await handle_messaging_event(db, "biz_123", messaging)
+        await _two_reprompts(db, contacts_col, sent_messages, messaging)
+        for _ in range(3):
+            await handle_messaging_event(db, "biz_123", messaging)
         assert len(sent_messages) == 2
-        assert "not following" in sent_messages[-1]["message"].lower()
+        assert all("exclusive link" not in m["message"] for m in sent_messages)
         c = await contacts_col.find_one({"ig_user_id": "fan_test"})
-        assert c["follow_gate_reprompt_count"] == 2
         assert c["follow_gate_status"] == "awaiting"
+        assert str(rule_id) not in c.get("completed_follow_gate_rule_ids", [])
 
-        # Attempt 3: Cap of 2 reached! Let the user through!
+    asyncio.run(_run())
+
+
+def test_follow_gate_cap_with_unknown_status_releases_rule_once_without_completion(monkeypatch):
+    """After 2 reprompts in 24h, unknown follow status (None) delivers this rule once, never 'completed'."""
+    db, contacts_col, sent_messages, messaging, rule_id = _capped_follow_gate_setup(monkeypatch, None)
+
+    async def _run():
+        await _two_reprompts(db, contacts_col, sent_messages, messaging)
         await handle_messaging_event(db, "biz_123", messaging)
         assert len(sent_messages) == 3
-        # Sent message is the exclusive rule reply!
         assert "Here is your exclusive link!" in sent_messages[-1]["message"]
         c = await contacts_col.find_one({"ig_user_id": "fan_test"})
-        assert c["follow_gate_status"] == "completed"
-        assert str(rule_id) in c.get("completed_follow_gate_rule_ids", [])
+        assert c["follow_gate_status"] == "released_unverified"
+        assert str(rule_id) not in c.get("completed_follow_gate_rule_ids", [])
+
+        # Further confirmations do not re-deliver: the contact is no longer awaiting.
+        await handle_messaging_event(db, "biz_123", messaging)
+        assert len(sent_messages) == 3
 
     asyncio.run(_run())
 
