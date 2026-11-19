@@ -362,7 +362,7 @@ async def admin_forgot_password_request(request: Request, data: AdminForgotPassw
 
         sent = await send_otp_email(recovery_email, otp)
         if not sent:
-            raise HTTPException(status_code=503, detail="Password recovery email is temporarily unavailable")
+            logger.warning("Admin password recovery email could not be sent")
 
     # Keep response generic to avoid exposing account existence. Never return token/url.
     return {"ok": True, "message": "If the account exists, a reset token has been generated."}
