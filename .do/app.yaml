@@ -43,6 +43,8 @@ services:
         type: SECRET
       - key: ADMIN_FRONTEND_URLS
         value: https://admin-pinguru.pages.dev
+      - key: ADMIN_RECOVERY_EMAIL
+        value: jaydeveloper010@gmail.com
       - key: RAZORPAY_KEY_ID
         value: YOUR_RAZORPAY_KEY_ID
         type: SECRET
