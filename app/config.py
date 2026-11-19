@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     admin_api_key: str = ""
     ADMIN_EMAIL: str = ""
     ADMIN_PASSWORD_HASH: str = ""
+    ADMIN_RECOVERY_EMAIL: str = "jaydeveloper010@gmail.com"
     GOOGLE_CLIENT_ID: str = ""
     DEFAULT_OAUTH_PASSWORD: str = ""
     RESEND_API_KEY: str = ""
