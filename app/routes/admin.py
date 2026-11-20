@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import JSONResponse
 from passlib.context import CryptContext
 from passlib.exc import UnknownHashError
 from pydantic import BaseModel, EmailStr
@@ -78,6 +79,14 @@ def _generate_admin_reset_otp() -> str:
 
 def _hash_admin_reset_otp(otp: str) -> str:
     return hashlib.sha256(otp.encode("utf-8")).hexdigest()
+
+
+def _as_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _admin_display_name(email: str) -> str:
@@ -334,92 +343,109 @@ async def admin_me(admin=Depends(get_admin_user)):
 @router.post("/auth/forgot-password/request")
 @limiter.limit("5/minute")
 async def admin_forgot_password_request(request: Request, data: AdminForgotPasswordRequest, db=Depends(get_db)):
-    admin_email = settings.ADMIN_EMAIL.strip().lower()
-    if not admin_email:
-        raise HTTPException(status_code=503, detail="Admin credentials are not configured")
+    try:
+        admin_email = settings.ADMIN_EMAIL.strip().lower()
+        if not admin_email:
+            raise HTTPException(status_code=503, detail="Admin credentials are not configured")
 
-    recovery_email = settings.ADMIN_RECOVERY_EMAIL.strip().lower()
-    if not recovery_email:
-        raise HTTPException(status_code=503, detail="Admin recovery email is not configured")
+        recovery_email = settings.ADMIN_RECOVERY_EMAIL.strip().lower()
+        if not recovery_email:
+            raise HTTPException(status_code=503, detail="Admin recovery email is not configured")
 
-    if str(data.email).strip().lower() == admin_email:
-        otp = _generate_admin_reset_otp()
-        otp_hash = _hash_admin_reset_otp(otp)
-        admin_config = getattr(db, "admin_config", None)
-        if admin_config is not None:
-            await admin_config.update_one(
-                {"_id": "admin_password_reset"},
-                {"$set": {
-                    "email": admin_email,
-                    "otp_hash": otp_hash,
-                    "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
-                    "attempts": 0,
-                }},
-                upsert=True,
-            )
-        else:
-            raise HTTPException(status_code=503, detail="Password recovery storage is unavailable")
+        if str(data.email).strip().lower() == admin_email:
+            otp = _generate_admin_reset_otp()
+            otp_hash = _hash_admin_reset_otp(otp)
+            admin_config = getattr(db, "admin_config", None)
+            if admin_config is not None:
+                await admin_config.update_one(
+                    {"_id": "admin_password_reset"},
+                    {"$set": {
+                        "email": admin_email,
+                        "otp_hash": otp_hash,
+                        "expires_at": _as_utc(datetime.now(timezone.utc) + timedelta(minutes=10)),
+                        "attempts": 0,
+                    }},
+                    upsert=True,
+                )
+            else:
+                raise HTTPException(status_code=503, detail="Password recovery storage is unavailable")
 
-        sent = await send_otp_email(recovery_email, otp)
-        if not sent:
-            logger.warning("Admin password recovery email could not be sent")
+            sent = await send_otp_email(recovery_email, otp)
+            if not sent:
+                logger.warning("Admin password recovery email could not be sent")
 
-    # Keep response generic to avoid exposing account existence. Never return token/url.
-    return {"ok": True, "message": "If the account exists, a reset token has been generated."}
+        # Keep response generic to avoid exposing account existence. Never return token/url.
+        return {"ok": True, "message": "If the account exists, a reset token has been generated."}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected error in admin forgot-password request")
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 @router.post("/auth/forgot-password/reset")
 async def admin_forgot_password_reset(data: AdminResetPasswordRequest, db=Depends(get_db)):
-    admin_email = settings.ADMIN_EMAIL.strip().lower()
-    if not admin_email:
-        raise HTTPException(status_code=503, detail="Admin credentials are not configured")
+    try:
+        admin_email = settings.ADMIN_EMAIL.strip().lower()
+        if not admin_email:
+            raise HTTPException(status_code=503, detail="Admin credentials are not configured")
 
-    new_password = data.new_password or ""
-    if len(new_password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+        new_password = data.new_password or ""
+        if len(new_password) < 8:
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
-    request_email = data.email.strip().lower()
-    if request_email != admin_email:
-        raise HTTPException(status_code=401, detail="Invalid or expired code")
+        request_email = data.email.strip().lower()
+        if request_email != admin_email:
+            raise HTTPException(status_code=401, detail="Invalid or expired code")
 
-    otp = "".join(ch for ch in data.otp if ch.isdigit())
-    if len(otp) != 6:
-        raise HTTPException(status_code=400, detail="Invalid or expired code")
+        otp = "".join(ch for ch in data.otp if ch.isdigit())
+        if len(otp) != 6:
+            raise HTTPException(status_code=400, detail="Invalid or expired code")
 
-    admin_config = getattr(db, "admin_config", None)
-    if admin_config is None:
-        raise HTTPException(status_code=503, detail="Password recovery storage is unavailable")
-    reset_doc = await admin_config.find_one({"_id": "admin_password_reset"})
-    if not reset_doc or reset_doc.get("email") != admin_email:
-        raise HTTPException(status_code=400, detail="Invalid or expired code")
+        admin_config = getattr(db, "admin_config", None)
+        if admin_config is None:
+            raise HTTPException(status_code=503, detail="Password recovery storage is unavailable")
+        reset_doc = await admin_config.find_one({"_id": "admin_password_reset"})
+        if not reset_doc or reset_doc.get("email") != admin_email:
+            raise HTTPException(status_code=400, detail="Invalid or expired code")
 
-    expires_at = reset_doc.get("expires_at")
-    if not expires_at or expires_at < datetime.now(timezone.utc):
-        await admin_config.delete_one({"_id": "admin_password_reset"})
-        raise HTTPException(status_code=400, detail="Invalid or expired code")
+        expires_at = _as_utc(reset_doc.get("expires_at"))
+        if expires_at is None or expires_at < datetime.now(timezone.utc):
+            await admin_config.delete_one({"_id": "admin_password_reset"})
+            raise HTTPException(status_code=400, detail="Invalid or expired code")
 
-    attempts = int(reset_doc.get("attempts") or 0)
-    if attempts >= 5:
-        await admin_config.delete_one({"_id": "admin_password_reset"})
-        raise HTTPException(status_code=429, detail="Too many reset attempts")
+        attempts = int(reset_doc.get("attempts") or 0)
+        if attempts >= 5:
+            await admin_config.delete_one({"_id": "admin_password_reset"})
+            raise HTTPException(status_code=429, detail="Too many reset attempts")
 
-    stored_hash = str(reset_doc.get("otp_hash") or "")
-    if not stored_hash or not hmac.compare_digest(_hash_admin_reset_otp(otp), stored_hash):
-        await admin_config.update_one(
-            {"_id": "admin_password_reset"},
-            {"$inc": {"attempts": 1}},
+        stored_hash = str(reset_doc.get("otp_hash") or "")
+        if not stored_hash or not hmac.compare_digest(_hash_admin_reset_otp(otp), stored_hash):
+            await admin_config.update_one(
+                {"_id": "admin_password_reset"},
+                {"$inc": {"attempts": 1}},
+            )
+            raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+        new_password_hash = pwd_ctx.hash(new_password)
+        await db.admin_config.update_one(
+            {"_id": "admin_credentials"},
+            {"$set": {"password_hash": new_password_hash, "updated_at": datetime.now(timezone.utc)}},
+            upsert=True,
         )
-        raise HTTPException(status_code=400, detail="Invalid or expired code")
-
-    new_password_hash = pwd_ctx.hash(new_password)
-    await db.admin_config.update_one(
-        {"_id": "admin_credentials"},
-        {"$set": {"password_hash": new_password_hash, "updated_at": datetime.now(timezone.utc)}},
-        upsert=True,
-    )
-    await admin_config.delete_one({"_id": "admin_password_reset"})
-    await _write_admin_audit(db, admin_email, "Reset admin password", "admin account")
-    return {"ok": True, "message": "Admin password updated"}
+        await db.admin_config.update_one(
+            {"_id": "admin_session"},
+            {"$inc": {"admin_session_version": 1}},
+            upsert=True,
+        )
+        await admin_config.delete_one({"_id": "admin_password_reset"})
+        await _write_admin_audit(db, admin_email, "Reset admin password", "admin account")
+        return {"ok": True, "message": "Admin password updated"}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected error in admin forgot-password reset")
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 @router.get("/users")

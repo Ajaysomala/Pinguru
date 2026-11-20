@@ -1058,6 +1058,104 @@ def test_user_and_admin_logout_revokes_session(test_setup, monkeypatch):
     assert "Session expired" in denied_resp.json()["detail"]
 
 
+def test_admin_reset_flow_with_naive_mongo_datetimes(test_setup, monkeypatch):
+    client, mock_db = test_setup
+    import app.routes.admin as admin_module
+
+    admin_email = "admin_reset_naive@example.com"
+    monkeypatch.setattr(settings, "ADMIN_EMAIL", admin_email)
+    monkeypatch.setattr(admin_module.settings, "ADMIN_EMAIL", admin_email)
+
+    otp = "123456"
+    old_hash = admin_module.pwd_ctx.hash("OldPassword123!")
+    asyncio.run(mock_db.admin_config.insert_one({
+        "_id": "admin_credentials",
+        "password_hash": old_hash,
+    }))
+    asyncio.run(mock_db.admin_config.insert_one({
+        "_id": "admin_session",
+        "admin_session_version": 3,
+    }))
+    asyncio.run(mock_db.admin_config.insert_one({
+        "_id": "admin_password_reset",
+        "email": admin_email,
+        "otp_hash": admin_module._hash_admin_reset_otp(otp),
+        "expires_at": datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5),
+        "attempts": 0,
+    }))
+
+    response = client.post("/admin/auth/forgot-password/reset", json={
+        "email": admin_email,
+        "otp": otp,
+        "new_password": "NewPassword123!",
+    })
+    assert response.status_code == 200
+
+    credentials = asyncio.run(mock_db.admin_config.find_one({"_id": "admin_credentials"}))
+    new_hash = credentials["password_hash"]
+    assert new_hash != old_hash
+    assert admin_module.pwd_ctx.verify("NewPassword123!", new_hash)
+
+    session = asyncio.run(mock_db.admin_config.find_one({"_id": "admin_session"}))
+    assert session["admin_session_version"] == 4
+
+    second_response = client.post("/admin/auth/forgot-password/reset", json={
+        "email": admin_email,
+        "otp": otp,
+        "new_password": "AnotherPassword123!",
+    })
+    assert second_response.status_code == 400
+
+
+def test_admin_reset_expired_naive_otp_is_rejected(test_setup, monkeypatch):
+    client, mock_db = test_setup
+    import app.routes.admin as admin_module
+
+    admin_email = "admin_reset_expired@example.com"
+    monkeypatch.setattr(settings, "ADMIN_EMAIL", admin_email)
+    monkeypatch.setattr(admin_module.settings, "ADMIN_EMAIL", admin_email)
+    asyncio.run(mock_db.admin_config.insert_one({
+        "_id": "admin_password_reset",
+        "email": admin_email,
+        "otp_hash": admin_module._hash_admin_reset_otp("654321"),
+        "expires_at": datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=1),
+        "attempts": 0,
+    }))
+
+    response = client.post("/admin/auth/forgot-password/reset", json={
+        "email": admin_email,
+        "otp": "654321",
+        "new_password": "NewPassword123!",
+    })
+    assert response.status_code == 400
+    assert asyncio.run(mock_db.admin_config.find_one({"_id": "admin_password_reset"})) is None
+
+
+def test_admin_reset_wrong_naive_otp_increments_attempts(test_setup, monkeypatch):
+    client, mock_db = test_setup
+    import app.routes.admin as admin_module
+
+    admin_email = "admin_reset_wrong@example.com"
+    monkeypatch.setattr(settings, "ADMIN_EMAIL", admin_email)
+    monkeypatch.setattr(admin_module.settings, "ADMIN_EMAIL", admin_email)
+    asyncio.run(mock_db.admin_config.insert_one({
+        "_id": "admin_password_reset",
+        "email": admin_email,
+        "otp_hash": admin_module._hash_admin_reset_otp("111111"),
+        "expires_at": datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5),
+        "attempts": 0,
+    }))
+
+    response = client.post("/admin/auth/forgot-password/reset", json={
+        "email": admin_email,
+        "otp": "222222",
+        "new_password": "NewPassword123!",
+    })
+    assert response.status_code == 400
+    reset_doc = asyncio.run(mock_db.admin_config.find_one({"_id": "admin_password_reset"}))
+    assert reset_doc["attempts"] == 1
+
+
 def test_password_reset_token_single_use(test_setup, monkeypatch):
     """Password reset token must be single-use; second attempt must be rejected."""
     client, mock_db = test_setup
