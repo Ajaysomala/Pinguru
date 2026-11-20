@@ -24,6 +24,17 @@ CSRF_EXEMPT_PATHS = {
     "/auth/deauthorize",
     "/auth/meta/deauthorize",
 }
+PRE_AUTH_USER_PATHS = {
+    "/auth/login",
+    "/auth/forgot-password/request",
+    "/auth/forgot-password/reset",
+}
+PRE_AUTH_ADMIN_PATHS = {
+    "/admin/login",
+    "/admin/auth/login",
+    "/admin/auth/forgot-password/request",
+    "/admin/auth/forgot-password/reset",
+}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -65,22 +76,30 @@ async def add_security_headers(request, call_next):
     has_user_cookie = bool(request.cookies.get("pg_token"))
     has_admin_cookie = bool(request.cookies.get("pg_admin_token"))
     path = request.url.path
+    is_pre_auth_user_route = path in PRE_AUTH_USER_PATHS
+    is_pre_auth_admin_route = path in PRE_AUTH_ADMIN_PATHS
 
-    if request.method.upper() not in SAFE_HTTP_METHODS and (has_user_cookie or has_admin_cookie) and path not in CSRF_EXEMPT_PATHS:
+    if request.method.upper() not in SAFE_HTTP_METHODS:
         origin = (request.headers.get("origin") or "").rstrip("/")
         if origin:
-            allowed_origin_values = {value.rstrip("/") for value in allowed_origins}
-            frontend_origin = (settings.FRONTEND_URL or "").strip().rstrip("/")
-            if frontend_origin:
-                allowed_origin_values.add(frontend_origin)
-            if origin not in allowed_origin_values:
+            if is_pre_auth_admin_route:
+                allowed_origin_values = {value.rstrip("/") for value in allowed_admin_origins}
+            elif is_pre_auth_user_route:
+                allowed_origin_values = {value.rstrip("/") for value in allowed_user_origins}
+            elif (has_user_cookie or has_admin_cookie) and path not in CSRF_EXEMPT_PATHS:
+                allowed_origin_values = {value.rstrip("/") for value in allowed_origins}
+            else:
+                allowed_origin_values = set()
+
+            if allowed_origin_values and origin not in allowed_origin_values:
                 return JSONResponse(status_code=403, content={"detail": "Invalid request origin"})
 
-        csrf_header = request.headers.get("X-CSRF-Token") or ""
-        csrf_cookie_name = "pg_admin_csrf" if has_admin_cookie else "pg_csrf"
-        csrf_cookie = request.cookies.get(csrf_cookie_name) or ""
-        if not csrf_header or not csrf_cookie or not hmac.compare_digest(csrf_header, csrf_cookie):
-            return JSONResponse(status_code=403, content={"detail": "Invalid CSRF token"})
+        if (has_user_cookie or has_admin_cookie) and path not in CSRF_EXEMPT_PATHS and not is_pre_auth_user_route and not is_pre_auth_admin_route:
+            csrf_header = request.headers.get("X-CSRF-Token") or ""
+            csrf_cookie_name = "pg_admin_csrf" if has_admin_cookie else "pg_csrf"
+            csrf_cookie = request.cookies.get(csrf_cookie_name) or ""
+            if not csrf_header or not csrf_cookie or not hmac.compare_digest(csrf_header, csrf_cookie):
+                return JSONResponse(status_code=403, content={"detail": "Invalid CSRF token"})
 
     response = await call_next(request)
     response.headers["X-Frame-Options"] = "DENY"
@@ -124,11 +143,17 @@ if environment == "production" and settings.FRONTEND_URL:
         f"{frontend_scheme}admin.{frontend_non_www}",
         f"{frontend_scheme}admin.{frontend_www}",
     }
-    allowed_origins = list({
+    allowed_user_origins = list({
         f"{frontend_scheme}{frontend_non_www}",
         f"{frontend_scheme}{frontend_www}",
+    })
+    allowed_admin_origins = list({
         *derived_admin_origins,
         *configured_admin_origins,
+    })
+    allowed_origins = list({
+        *allowed_user_origins,
+        *allowed_admin_origins,
     })
 else:
     allowed_origins = [
@@ -137,6 +162,8 @@ else:
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ]
+    allowed_user_origins = list(allowed_origins)
+    allowed_admin_origins = list(allowed_origins)
 
 app.add_middleware(
     CORSMiddleware,

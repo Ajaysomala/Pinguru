@@ -57,6 +57,13 @@ def client(monkeypatch):
 
     monkeypatch.setattr(main_module, "connect_db", _noop)
     monkeypatch.setattr(main_module, "disconnect_db", _noop)
+    monkeypatch.setattr(main_module, "allowed_user_origins", ["https://app.pinguru.me"])
+    monkeypatch.setattr(main_module, "allowed_admin_origins", ["https://admin-pinguru.pages.dev"])
+    monkeypatch.setattr(
+        main_module,
+        "allowed_origins",
+        ["https://app.pinguru.me", "https://admin-pinguru.pages.dev"],
+    )
 
     billing_module.settings.RAZORPAY_WEBHOOK_SECRET = "test_razorpay_secret"
     webhook_module.settings.META_APP_SECRET = "test_meta_secret"
@@ -94,12 +101,41 @@ def test_origin_rejected_for_cookie_post(client):
 def test_cookie_post_allows_valid_origin_and_csrf(client):
     response = client.post(
         "/billing/cancel-pending",
-        headers={"Origin": "http://localhost:5173", "X-CSRF-Token": "csrf_value"},
+        headers={"Origin": "https://app.pinguru.me", "X-CSRF-Token": "csrf_value"},
         cookies={"pg_token": "dummy_token", "pg_csrf": "csrf_value"},
     )
 
     # Auth can still fail for dummy cookie, but middleware should not block with CSRF/origin errors.
     assert response.status_code != 403
+
+
+def test_pre_auth_admin_reset_with_stale_cookie_skips_csrf(client):
+    response = client.post(
+        "/admin/auth/forgot-password/reset",
+        json={"email": "wrong@example.com", "otp": "123456", "new_password": "new-password"},
+        headers={"Origin": "https://admin-pinguru.pages.dev"},
+        cookies={"pg_admin_token": "stale_token"},
+    )
+
+    assert response.status_code != 403
+
+
+def test_pre_auth_admin_routes_reject_untrusted_origin(client):
+    for origin in ("https://evil.example", "https://app.pinguru.me"):
+        for path in (
+            "/admin/auth/login",
+            "/admin/auth/forgot-password/request",
+            "/admin/auth/forgot-password/reset",
+        ):
+            response = client.post(
+                path,
+                json={},
+                headers={"Origin": origin},
+                cookies={"pg_admin_token": "stale_token"},
+            )
+
+            assert response.status_code == 403
+            assert response.json()["detail"] == "Invalid request origin"
 
 
 def test_logout_allowed_without_csrf(client):

@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import socket
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -24,6 +25,15 @@ from app.routes.webhook import (
     handle_comment_event,
 )
 from app.services.instagram import InstagramService
+
+
+def _mock_public_example_resolution(monkeypatch):
+    def getaddrinfo(hostname, port, family=0, type=0, proto=0, flags=0):
+        if hostname == "example.com":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+        raise socket.gaierror(socket.EAI_NONAME, f"Name or service not known: {hostname}")
+
+    monkeypatch.setattr("app.services.instagram.socket.getaddrinfo", getaddrinfo)
 
 
 class MockRulesCollection:
@@ -329,6 +339,7 @@ async def test_validate_attachment_url_rejects_non_https():
 
 @pytest.mark.anyio
 async def test_validate_attachment_url_rejects_non_image(monkeypatch):
+    _mock_public_example_resolution(monkeypatch)
     class MockResp:
         status_code = 200
         headers = {"content-type": "text/html; charset=utf-8", "content-length": "1024"}
@@ -347,6 +358,7 @@ async def test_validate_attachment_url_rejects_non_image(monkeypatch):
 
 @pytest.mark.anyio
 async def test_validate_attachment_url_rejects_oversized_image(monkeypatch):
+    _mock_public_example_resolution(monkeypatch)
     class MockResp:
         status_code = 200
         headers = {"content-type": "image/jpeg", "content-length": str(10 * 1024 * 1024)}  # 10MB > 8MB
@@ -365,6 +377,7 @@ async def test_validate_attachment_url_rejects_oversized_image(monkeypatch):
 
 @pytest.mark.anyio
 async def test_validate_attachment_url_accepts_valid_image(monkeypatch):
+    _mock_public_example_resolution(monkeypatch)
     class MockResp:
         status_code = 200
         headers = {"content-type": "image/png", "content-length": str(2 * 1024 * 1024)}
@@ -408,6 +421,7 @@ async def test_validate_attachment_url_rejects_169_254_169_254():
 
 @pytest.mark.anyio
 async def test_validate_attachment_url_rejects_redirect_to_private_ip(monkeypatch):
+    _mock_public_example_resolution(monkeypatch)
     class MockResp:
         def __init__(self, status_code, location=None):
             self.status_code = status_code
@@ -452,6 +466,7 @@ async def test_validate_attachment_url_rejects_ipv6_forbidden():
 
 @pytest.mark.anyio
 async def test_validate_attachment_url_max_redirects_exceeded(monkeypatch):
+    _mock_public_example_resolution(monkeypatch)
     class MockResp:
         def __init__(self, status_code, location=None):
             self.status_code = status_code
